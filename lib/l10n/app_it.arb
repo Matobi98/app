@@ -74,6 +74,8 @@
   "payBondInvoiceInstruction": "Questo nodo richiede una cauzione anti-abuso. Paga questa hold invoice Lightning per prendere l'ordine. Viene rilasciata quando lo scambio si completa normalmente.",
   "tradeWaitingForBondInvoice": "In attesa della fattura della cauzione...",
   "bondInvoiceQrLabel": "Codice QR della fattura della cauzione anti-abuso",
+  "tradeStatusWaitingBond": "In attesa della cauzione",
+  "tradeHeadlineWaitingBond": "Paga la cauzione anti-abuso per prendere questo ordine.",
   "addInvoiceAmount": "Importo da ricevere: {sats} sats",
   "payInvoiceAmount": "Importo da pagare: {sats} sats",
   "orderIdCopied": "ID ordine copiato",

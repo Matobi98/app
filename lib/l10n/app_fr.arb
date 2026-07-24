@@ -74,6 +74,8 @@
   "payBondInvoiceInstruction": "Ce nœud exige une caution anti-abus. Payez cette facture à retenue Lightning pour prendre l'ordre. Elle est libérée lorsque l'échange se termine normalement.",
   "tradeWaitingForBondInvoice": "En attente de la facture de caution...",
   "bondInvoiceQrLabel": "Code QR de la facture de caution anti-abus",
+  "tradeStatusWaitingBond": "En attente de caution",
+  "tradeHeadlineWaitingBond": "Payez la caution anti-abus pour prendre cet ordre.",
   "addInvoiceAmount": "Montant à recevoir : {sats} sats",
   "payInvoiceAmount": "Montant à payer : {sats} sats",
   "orderIdCopied": "ID d'ordre copié",

@@ -74,6 +74,8 @@
   "payBondInvoiceInstruction": "Este nodo exige una fianza antiabuso. Paga esta hold invoice de Lightning para tomar la orden. Se libera cuando la operación se completa con normalidad.",
   "tradeWaitingForBondInvoice": "Esperando la factura de la fianza...",
   "bondInvoiceQrLabel": "Código QR de la factura de la fianza antiabuso",
+  "tradeStatusWaitingBond": "Esperando fianza",
+  "tradeHeadlineWaitingBond": "Paga la fianza antiabuso para tomar esta orden.",
   "addInvoiceAmount": "Cantidad a recibir: {sats} sats",
   "payInvoiceAmount": "Cantidad a pagar: {sats} sats",
   "orderIdCopied": "ID de orden copiado",

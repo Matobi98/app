@@ -49,6 +49,10 @@ enum TradeStatus {
   waitingInvoice('Waiting Invoice'),
   /// Seller must pay hold invoice (waitingPayment).
   waitingPayment('Waiting Payment'),
+  /// Taker must pay the anti-abuse bond hold invoice (waitingTakerBond).
+  /// Distinct from [waitingPayment]: the current user is the taker and must
+  /// pay the bond, not open the escrow hold-invoice flow.
+  waitingBond('Waiting Bond'),
   active('Active'),
   fiatSent('Fiat Sent'),
   completed('Completed'),
@@ -72,6 +76,7 @@ extension TradeStatusL10n on TradeStatus {
         TradeStatus.pending => l10n.tradeFilterPending,
         TradeStatus.waitingInvoice => l10n.tradeFilterWaitingInvoice,
         TradeStatus.waitingPayment => l10n.tradeFilterWaitingPayment,
+        TradeStatus.waitingBond => l10n.tradeStatusWaitingBond,
         TradeStatus.active => l10n.tradeStatusActive,
         TradeStatus.fiatSent => l10n.tradeStatusFiatSent,
         TradeStatus.completed => l10n.tradeStatusCompleted,
@@ -150,8 +155,8 @@ class _TradeDetailScreenState extends ConsumerState<TradeDetailScreen> {
   static TradeStatus _mapOrderStatus(OrderStatus s) => switch (s) {
     OrderStatus.pending => TradeStatus.pending,
     OrderStatus.waitingBuyerInvoice => TradeStatus.waitingInvoice,
-    OrderStatus.waitingPayment ||
-    OrderStatus.waitingTakerBond => TradeStatus.waitingPayment,
+    OrderStatus.waitingPayment => TradeStatus.waitingPayment,
+    OrderStatus.waitingTakerBond => TradeStatus.waitingBond,
     OrderStatus.active || OrderStatus.inProgress => TradeStatus.active,
     OrderStatus.fiatSent => TradeStatus.fiatSent,
     OrderStatus.settledHoldInvoice ||
@@ -341,6 +346,7 @@ class _TradeDetailScreenState extends ConsumerState<TradeDetailScreen> {
       TradeStatus.waitingPayment => isBuyer
           ? l10n.tradeHeadlineWaitingPaymentBuyer
           : l10n.tradeHeadlineWaitingPaymentSeller,
+      TradeStatus.waitingBond => l10n.tradeHeadlineWaitingBond,
       TradeStatus.active => isBuyer
           ? l10n.tradeHeadlineActiveBuyer(amount)
           : l10n.tradeHeadlineActiveSeller(amount),
@@ -396,7 +402,8 @@ class _TradeDetailScreenState extends ConsumerState<TradeDetailScreen> {
   (Color, Color) _statusPillColors(TradeStatus status) => switch (status) {
         TradeStatus.pending => AppColors.statusPending,
         TradeStatus.waitingInvoice ||
-        TradeStatus.waitingPayment => AppColors.statusWaiting,
+        TradeStatus.waitingPayment ||
+        TradeStatus.waitingBond => AppColors.statusWaiting,
         TradeStatus.active => AppColors.statusActive,
         TradeStatus.fiatSent => AppColors.statusSettled,
         TradeStatus.pendingRating ||
@@ -854,6 +861,17 @@ class _TradeDetailScreenState extends ConsumerState<TradeDetailScreen> {
             icon: Icons.bolt,
             onPressed: () =>
                 context.push(AppRoute.payInvoicePath(widget.orderId)),
+          ),
+        ];
+      // Taker (either role) reopening the trade while the bond is unpaid:
+      // route to the bond payment screen, never the escrow pay-invoice flow.
+      case (TradeStatus.waitingBond, _):
+        return [
+          bigButton(
+            label: l10n.payBondInvoiceTitle,
+            icon: Icons.shield_outlined,
+            onPressed: () =>
+                context.push(AppRoute.payBondInvoicePath(widget.orderId)),
           ),
         ];
       case (TradeStatus.active, true):

@@ -246,6 +246,13 @@ class AppLocalizationsDe extends AppLocalizations {
       'QR-Code der Anti-Missbrauchs-Kautionsrechnung';
 
   @override
+  String get tradeStatusWaitingBond => 'Warten auf Kaution';
+
+  @override
+  String get tradeHeadlineWaitingBond =>
+      'Zahle die Anti-Missbrauchs-Kaution, um diese Order anzunehmen.';
+
+  @override
   String addInvoiceAmount(String sats) {
     return 'Zu erhaltender Betrag: $sats sats';
   }

@@ -247,6 +247,13 @@ class AppLocalizationsEs extends AppLocalizations {
       'Código QR de la factura de la fianza antiabuso';
 
   @override
+  String get tradeStatusWaitingBond => 'Esperando fianza';
+
+  @override
+  String get tradeHeadlineWaitingBond =>
+      'Paga la fianza antiabuso para tomar esta orden.';
+
+  @override
   String addInvoiceAmount(String sats) {
     return 'Cantidad a recibir: $sats sats';
   }

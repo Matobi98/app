@@ -247,6 +247,13 @@ class AppLocalizationsIt extends AppLocalizations {
       'Codice QR della fattura della cauzione anti-abuso';
 
   @override
+  String get tradeStatusWaitingBond => 'In attesa della cauzione';
+
+  @override
+  String get tradeHeadlineWaitingBond =>
+      'Paga la cauzione anti-abuso per prendere questo ordine.';
+
+  @override
   String addInvoiceAmount(String sats) {
     return 'Importo da ricevere: $sats sats';
   }

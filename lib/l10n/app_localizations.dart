@@ -506,6 +506,18 @@ abstract class AppLocalizations {
   /// **'Anti-abuse bond invoice QR code'**
   String get bondInvoiceQrLabel;
 
+  /// Trade status pill label while the taker must still pay the anti-abuse bond
+  ///
+  /// In en, this message translates to:
+  /// **'Waiting Bond'**
+  String get tradeStatusWaitingBond;
+
+  /// Trade detail headline while the taker must pay the anti-abuse bond hold invoice
+  ///
+  /// In en, this message translates to:
+  /// **'Pay the anti-abuse bond to take this order.'**
+  String get tradeHeadlineWaitingBond;
+
   /// Sats amount (calculated by the Mostro daemon) the buyer's invoice must be for, shown on the add-invoice screen
   ///
   /// In en, this message translates to:

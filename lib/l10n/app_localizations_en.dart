@@ -242,6 +242,13 @@ class AppLocalizationsEn extends AppLocalizations {
   String get bondInvoiceQrLabel => 'Anti-abuse bond invoice QR code';
 
   @override
+  String get tradeStatusWaitingBond => 'Waiting Bond';
+
+  @override
+  String get tradeHeadlineWaitingBond =>
+      'Pay the anti-abuse bond to take this order.';
+
+  @override
   String addInvoiceAmount(String sats) {
     return 'Amount to receive: $sats sats';
   }
