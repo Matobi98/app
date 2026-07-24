@@ -130,7 +130,7 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
       },
       data: (trade) {
         final invoice = trade?.bondInvoice ?? '';
-        final amountSats = trade?.order.amountSats?.toInt() ?? 0;
+        final amountSats = trade?.bondAmountSats?.toInt() ?? 0;
 
         if (invoice.isEmpty) {
           // Bond invoice not yet available — waiting for the Mostro daemon.

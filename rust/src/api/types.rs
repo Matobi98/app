@@ -251,6 +251,11 @@ pub struct TradeInfo {
     /// default keeps trade rows persisted before this field deserializable.
     #[serde(default)]
     pub bond_invoice: Option<String>,
+    /// Sat amount of the anti-abuse bond hold invoice. Kept apart from
+    /// `order.amount_sats` (the trade amount) so surfacing the bond figure on
+    /// the payment screen never overwrites the trade's own amount.
+    #[serde(default)]
+    pub bond_amount_sats: Option<u64>,
     pub buyer_invoice: Option<String>,
     pub trade_key_index: u32,
     pub cooperative_cancel_state: Option<CooperativeCancelState>,

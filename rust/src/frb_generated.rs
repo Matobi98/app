@@ -5381,6 +5381,7 @@ impl SseDecode for crate::api::types::TradeInfo {
         let mut var_currentStep = <crate::api::types::TradeStep>::sse_decode(deserializer);
         let mut var_holdInvoice = <Option<String>>::sse_decode(deserializer);
         let mut var_bondInvoice = <Option<String>>::sse_decode(deserializer);
+        let mut var_bondAmountSats = <Option<u64>>::sse_decode(deserializer);
         let mut var_buyerInvoice = <Option<String>>::sse_decode(deserializer);
         let mut var_tradeKeyIndex = <u32>::sse_decode(deserializer);
         let mut var_cooperativeCancelState =
@@ -5397,6 +5398,7 @@ impl SseDecode for crate::api::types::TradeInfo {
             current_step: var_currentStep,
             hold_invoice: var_holdInvoice,
             bond_invoice: var_bondInvoice,
+            bond_amount_sats: var_bondAmountSats,
             buyer_invoice: var_buyerInvoice,
             trade_key_index: var_tradeKeyIndex,
             cooperative_cancel_state: var_cooperativeCancelState,
@@ -6792,6 +6794,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::types::TradeInfo {
             self.current_step.into_into_dart().into_dart(),
             self.hold_invoice.into_into_dart().into_dart(),
             self.bond_invoice.into_into_dart().into_dart(),
+            self.bond_amount_sats.into_into_dart().into_dart(),
             self.buyer_invoice.into_into_dart().into_dart(),
             self.trade_key_index.into_into_dart().into_dart(),
             self.cooperative_cancel_state.into_into_dart().into_dart(),
@@ -8050,6 +8053,7 @@ impl SseEncode for crate::api::types::TradeInfo {
         <crate::api::types::TradeStep>::sse_encode(self.current_step, serializer);
         <Option<String>>::sse_encode(self.hold_invoice, serializer);
         <Option<String>>::sse_encode(self.bond_invoice, serializer);
+        <Option<u64>>::sse_encode(self.bond_amount_sats, serializer);
         <Option<String>>::sse_encode(self.buyer_invoice, serializer);
         <u32>::sse_encode(self.trade_key_index, serializer);
         <Option<crate::api::types::CooperativeCancelState>>::sse_encode(

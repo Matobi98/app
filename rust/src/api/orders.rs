@@ -50,6 +50,9 @@ enum DaemonReply {
         /// carried separately from `hold_invoice` so the bond never collides
         /// with the trade's escrow hold invoice.
         bond_invoice: Option<String>,
+        /// Sat amount of the bond hold invoice, kept apart from `amount_sats`
+        /// (the trade amount) so it never overwrites the order's own amount.
+        bond_amount_sats: Option<u64>,
     },
     /// Daemon acknowledged an add-invoice. The reply doubles as a status
     /// update processed by the per-action arms; the caller only needs the
@@ -281,7 +284,7 @@ fn classify_take_reply(
 
     match payload {
         Some(Payload::PaymentRequest(small_order, invoice, amount)) => {
-            let amount_sats = amount
+            let payment_amount = amount
                 .and_then(|a| u64::try_from(a).ok())
                 .or_else(|| {
                     small_order.as_ref().and_then(|so| {
@@ -290,9 +293,10 @@ fn classify_take_reply(
                 });
             // Bond replies advertise a wire-mapped `Pending` payload status, so
             // the action determines the state; all other PaymentRequest replies
-            // carry the authoritative status in the payload. The bond bolt11
-            // travels in its own slot so it never collides with the trade's
-            // escrow hold invoice when the take resumes after the bond is paid.
+            // carry the authoritative status in the payload. The bond bolt11 and
+            // its amount travel in their own slots so they never collide with
+            // the trade's escrow hold invoice / trade amount when the take
+            // resumes after the bond is paid.
             let is_bond = matches!(action, Action::PayBondInvoice);
             let status = if is_bond {
                 status_for_action(action)
@@ -305,9 +309,10 @@ fn classify_take_reply(
             DaemonReply::TakeAccepted {
                 action: action.clone(),
                 status,
-                amount_sats,
+                amount_sats: if is_bond { None } else { payment_amount },
                 hold_invoice: if is_bond { None } else { Some(invoice.clone()) },
                 bond_invoice: if is_bond { Some(invoice.clone()) } else { None },
+                bond_amount_sats: if is_bond { payment_amount } else { None },
             }
         }
         Some(Payload::Order(small_order)) => DaemonReply::TakeAccepted {
@@ -323,6 +328,7 @@ fn classify_take_reply(
             },
             hold_invoice: None,
             bond_invoice: None,
+            bond_amount_sats: None,
         },
         // Action-only progression reply (payload absent or of another shape):
         // still a genuine acceptance. The take interception consumes the
@@ -336,6 +342,7 @@ fn classify_take_reply(
             amount_sats: None,
             hold_invoice: None,
             bond_invoice: None,
+            bond_amount_sats: None,
         },
     }
 }
@@ -870,6 +877,7 @@ pub async fn create_order(params: NewOrderParams) -> Result<OrderInfo> {
         current_step: maker_step,
         hold_invoice: None,
         bond_invoice: None,
+        bond_amount_sats: None,
         buyer_invoice: None,
         trade_key_index: trade_index,
         cooperative_cancel_state: None,
@@ -1033,18 +1041,19 @@ pub async fn take_order(
         detach_request_waiter(&trade_pk_hex, request_id);
     }
 
-    let (status, amount_sats, hold_invoice, bond_invoice) = match reply {
+    let (status, amount_sats, hold_invoice, bond_invoice, bond_amount_sats) = match reply {
         Ok(Ok(DaemonReply::TakeAccepted {
             action,
             status,
             amount_sats,
             hold_invoice,
             bond_invoice,
+            bond_amount_sats,
         })) => {
             crate::api::logging::blog_info("orders", format!(
                 "take_order confirmed by daemon: order={order_id} reply={action:?}"
             ));
-            (status, amount_sats, hold_invoice, bond_invoice)
+            (status, amount_sats, hold_invoice, bond_invoice, bond_amount_sats)
         }
         Ok(Ok(DaemonReply::Rejected { reason, message })) => {
             crate::api::logging::blog_warn("orders", format!(
@@ -1056,7 +1065,7 @@ pub async fn take_order(
             // Only the create flow sends Confirmed; a take record can never
             // receive it. Treat defensively as an acceptance without data.
             log::warn!("[orders] take_order received a create-style confirmation");
-            (None, None, None, None)
+            (None, None, None, None, None)
         }
         _ => {
             // No daemon response within the timeout. Do not persist or show
@@ -1095,6 +1104,7 @@ pub async fn take_order(
         current_step: initial_step,
         hold_invoice,
         bond_invoice,
+        bond_amount_sats,
         buyer_invoice: None,
         trade_key_index: trade_index,
         cooperative_cancel_state: None,
@@ -3319,13 +3329,17 @@ mod tests {
                 amount_sats,
                 hold_invoice,
                 bond_invoice,
+                bond_amount_sats,
                 ..
             } => {
                 assert_eq!(
                     status,
                     Some(crate::api::types::OrderStatus::WaitingTakerBond)
                 );
-                assert_eq!(amount_sats, Some(1000));
+                // Bond sats land in bond_amount_sats, never amount_sats, so the
+                // trade's own amount is never overwritten with the bond figure.
+                assert!(amount_sats.is_none());
+                assert_eq!(bond_amount_sats, Some(1000));
                 assert!(hold_invoice.is_none());
                 assert_eq!(bond_invoice.as_deref(), Some("lnbc1bond"));
             }
@@ -3338,13 +3352,20 @@ mod tests {
             &Action::PayBondInvoice,
             &Some(Payload::PaymentRequest(None, "lnbc1bond".into(), Some(1000))),
         ) {
-            DaemonReply::TakeAccepted { status, hold_invoice, bond_invoice, .. } => {
+            DaemonReply::TakeAccepted {
+                status,
+                hold_invoice,
+                bond_invoice,
+                bond_amount_sats,
+                ..
+            } => {
                 assert_eq!(
                     status,
                     Some(crate::api::types::OrderStatus::WaitingTakerBond)
                 );
                 assert!(hold_invoice.is_none());
                 assert_eq!(bond_invoice.as_deref(), Some("lnbc1bond"));
+                assert_eq!(bond_amount_sats, Some(1000));
             }
             _ => panic!("expected TakeAccepted"),
         }
