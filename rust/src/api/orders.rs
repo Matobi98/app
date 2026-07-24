@@ -261,9 +261,11 @@ fn take_matching_add_invoice(trade_pubkey_hex: &str, got: Option<u64>) -> Option
 /// `PaymentRequest` payload), or a direct progression message when an invoice
 /// was pre-attached — so classification goes by payload shape rather than by
 /// enumerating actions (the pattern MostriX uses). `pay-bond-invoice` shares
-/// the `PaymentRequest` shape with `pay-invoice`, so its bond bolt11 rides in
-/// the same `hold_invoice` slot; Dart discriminates the bond by the
-/// `WaitingTakerBond` status and routes the taker to the bond payment screen.
+/// the `PaymentRequest` shape with `pay-invoice`, but its bond bolt11 is routed
+/// into the dedicated `bond_invoice` field (never `hold_invoice`), so the bond
+/// and the trade's escrow hold invoice can never collide; Dart discriminates
+/// the bond by the `WaitingTakerBond` status and routes the taker to the bond
+/// payment screen.
 ///
 /// The daemon deliberately stamps the bond message's embedded `SmallOrder`
 /// with the wire-mapped `Pending` status (`WaitingTakerBond` is never exposed
