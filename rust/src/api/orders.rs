@@ -2213,6 +2213,27 @@ fn status_for_action(action: &mostro_core::message::Action) -> Option<OrderStatu
     }
 }
 
+/// Whether a public Kind 38383 status may overwrite the status persisted for a
+/// trade we follow. The daemon publishes fine-grained states as coarse NIP-69
+/// buckets (`WaitingTakerBond` → `Pending`, `WaitingBuyerInvoice` /
+/// `WaitingPayment` → `InProgress`; see `mostro`'s `nip33::create_status_tags`),
+/// so a coarse bucket must never clobber the fine-grained status our gift-wrap
+/// DMs set. Terminal buckets are genuine endpoints and always win.
+fn public_status_supersedes(current: &OrderStatus, incoming: &OrderStatus) -> bool {
+    use OrderStatus as S;
+    match incoming {
+        S::Success
+        | S::Canceled
+        | S::CanceledByAdmin
+        | S::CooperativelyCanceled
+        | S::Expired
+        | S::CompletedByAdmin
+        | S::SettledByAdmin => true,
+        // Coarse buckets apply only before any fine-grained status exists.
+        _ => matches!(current, S::Pending),
+    }
+}
+
 /// Extract the calculated trade sats from an `add-invoice` reply's `Order`
 /// payload. Returns `None` for a non-positive amount or a non-`Order` payload
 /// (the daemon carries the buyer's amount in a `SmallOrder`; anything else is
@@ -2398,19 +2419,40 @@ async fn subscribe_single_order(order_id: &str) {
                                 order.status
                             );
                             last_activity = crate::rt::time::Instant::now();
-                            // Sync trade status in DB so My Trades reflects it.
+                            // Guard the trade row against coarse-bucket
+                            // downgrades (see `public_status_supersedes`); the
+                            // public order-book cache below is left as-is.
                             if let Some(db) = crate::db::app_db::db() {
-                                if let Err(e) = db
-                                    .update_trade_fields(
-                                        &order.id,
-                                        Some(order.status.clone()),
-                                        None,
-                                        order.amount_sats,
-                                    )
+                                let current = db
+                                    .get_trade_by_order_id(&order.id)
                                     .await
-                                {
-                                    log::warn!(
-                                        "[orders] failed to sync d-tag trade status for order={}: {e}",
+                                    .ok()
+                                    .flatten()
+                                    .map(|t| t.order.status);
+                                let apply = match &current {
+                                    Some(cur) => public_status_supersedes(cur, &order.status),
+                                    None => true,
+                                };
+                                if apply {
+                                    if let Err(e) = db
+                                        .update_trade_fields(
+                                            &order.id,
+                                            Some(order.status.clone()),
+                                            None,
+                                            order.amount_sats,
+                                        )
+                                        .await
+                                    {
+                                        log::warn!(
+                                            "[orders] failed to sync d-tag trade status for order={}: {e}",
+                                            order.id
+                                        );
+                                    }
+                                } else {
+                                    log::debug!(
+                                        "[orders] d-tag update: keeping fine-grained {current:?} \
+                                         over coarse {:?} for order={}",
+                                        order.status,
                                         order.id
                                     );
                                 }
@@ -3410,6 +3452,58 @@ mod tests {
             ))),
             None
         );
+    }
+
+    /// A coarse public 38383 bucket must never overwrite a fine-grained trade
+    /// status (regression for the taker-bond flow, PR #213 review).
+    #[test]
+    fn public_status_never_downgrades_fine_grained_state() {
+        use crate::api::types::OrderStatus as S;
+
+        let fine_grained = [
+            S::WaitingTakerBond,
+            S::WaitingBuyerInvoice,
+            S::WaitingPayment,
+            S::Active,
+            S::FiatSent,
+            S::SettledHoldInvoice,
+            S::InProgress,
+            S::Dispute,
+        ];
+        for cur in &fine_grained {
+            assert!(
+                !public_status_supersedes(cur, &S::Pending),
+                "public Pending must not overwrite {cur:?}"
+            );
+            assert!(
+                !public_status_supersedes(cur, &S::InProgress),
+                "public InProgress must not overwrite {cur:?}"
+            );
+        }
+
+        // Coarse buckets apply while still at the initial Pending.
+        assert!(public_status_supersedes(&S::Pending, &S::Pending));
+        assert!(public_status_supersedes(&S::Pending, &S::InProgress));
+
+        // Terminal buckets always win, even over an in-flight status.
+        for term in [
+            S::Canceled,
+            S::CanceledByAdmin,
+            S::CooperativelyCanceled,
+            S::Expired,
+            S::Success,
+            S::CompletedByAdmin,
+            S::SettledByAdmin,
+        ] {
+            assert!(
+                public_status_supersedes(&S::WaitingTakerBond, &term),
+                "terminal {term:?} must supersede WaitingTakerBond"
+            );
+            assert!(
+                public_status_supersedes(&S::Active, &term),
+                "terminal {term:?} must supersede Active"
+            );
+        }
     }
 
     /// Only the pending create's own local UUID may be rebound to an incoming

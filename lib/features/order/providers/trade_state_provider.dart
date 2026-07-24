@@ -25,27 +25,28 @@ final tradeAmountProvider =
   }
 });
 
-/// Live order status for a single trade, polled from the order book every 2 s.
+/// Live protocol status for a single tracked trade, polled every 2 s.
 ///
-/// Starts with an immediate fetch (no initial delay) so the first emission
-/// reflects the real relay status. When the order is no longer in the in-memory
-/// order book (e.g. after cancellation), falls back to the persisted trade DB
-/// so terminal statuses like Canceled are reflected in the UI.
+/// Prefers the persisted trade row over the in-memory order book: the book
+/// carries the daemon's coarse public NIP-69 status (Kind 38383), which
+/// collapses fine-grained states (e.g. `WaitingTakerBond` → `pending`,
+/// `WaitingBuyerInvoice`/`WaitingPayment` → `in-progress`), whereas the trade
+/// row holds the authoritative gift-wrap status. Falls back to the book only
+/// when no local trade row exists.
 final tradeStatusProvider =
     StreamProvider.family.autoDispose<OrderStatus, String>((ref, orderId) async* {
   while (true) {
-    final info = await orders_api.getOrder(orderId: orderId);
-    if (info != null) {
-      yield info.status;
-      if (_isTerminal(info.status)) return;
+    final trades = await orders_api.listTrades();
+    final trade = trades.where((t) => t.order.id == orderId).firstOrNull;
+    if (trade != null) {
+      yield trade.order.status;
+      if (_isTerminal(trade.order.status)) return;
     } else {
-      // Order removed from in-memory book — check the persisted trade DB.
-      final trades = await orders_api.listTrades();
-      final trade = trades.where((t) => t.order.id == orderId).firstOrNull;
-      if (trade != null) {
-        yield trade.order.status;
-        // Terminal status — no need to keep polling.
-        if (_isTerminal(trade.order.status)) return;
+      // No local trade row — fall back to the public order book.
+      final info = await orders_api.getOrder(orderId: orderId);
+      if (info != null) {
+        yield info.status;
+        if (_isTerminal(info.status)) return;
       }
     }
     await Future.delayed(const Duration(seconds: 2));
