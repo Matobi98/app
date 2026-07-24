@@ -3471,6 +3471,120 @@ mod tests {
         }
     }
 
+    /// A taker bond survives the coarse public 38383 buckets and advances for
+    /// both roles, over the real SQLite store (PR #213 review).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn bond_state_survives_coarse_38383_and_advances() {
+        use crate::api::types::{
+            BuyerStep, OrderStatus as S, SellerStep, TradeInfo, TradeRole, TradeStep,
+        };
+        use crate::db::sqlite::SqliteStorage;
+        use crate::db::Storage;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("mostro_bond_test_{unique}.db"));
+        let path_str = path.to_string_lossy().to_string();
+        let db = SqliteStorage::open(&path_str).await.expect("open temp db");
+
+        fn bond_trade(order_id: &str, role: TradeRole) -> TradeInfo {
+            let mut order = dummy_order_info(order_id);
+            order.status = S::WaitingTakerBond;
+            let step = match role {
+                TradeRole::Buyer => TradeStep::Buyer(BuyerStep::OrderTaken),
+                TradeRole::Seller => TradeStep::Seller(SellerStep::TakerFound),
+            };
+            TradeInfo {
+                id: format!("trade-{order_id}"),
+                order,
+                role,
+                counterparty_pubkey: String::new(),
+                current_step: step,
+                hold_invoice: None,
+                bond_invoice: Some("lnbc1bond".to_string()),
+                bond_amount_sats: Some(1000),
+                buyer_invoice: None,
+                trade_key_index: 0,
+                cooperative_cancel_state: None,
+                timeout_at: None,
+                started_at: 0,
+                completed_at: None,
+                outcome: None,
+            }
+        }
+
+        async fn status_of(db: &SqliteStorage, id: &str) -> Option<S> {
+            db.get_trade_by_order_id(id)
+                .await
+                .unwrap()
+                .map(|t| t.order.status)
+        }
+
+        // Mirrors the d-tag sync: apply the public status only when the gate allows.
+        async fn sync_public(db: &SqliteStorage, id: &str, incoming: S, amount: Option<u64>) {
+            let cur = status_of(db, id).await;
+            let apply = cur
+                .as_ref()
+                .is_none_or(|c| public_status_supersedes(c, &incoming));
+            if apply {
+                db.update_trade_fields(id, Some(incoming), None, amount)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        // ── Buyer role
+        let buyer = "order-buyer";
+        db.save_trade(&bond_trade(buyer, TradeRole::Buyer)).await.unwrap();
+        assert_eq!(status_of(&db, buyer).await, Some(S::WaitingTakerBond));
+
+        sync_public(&db, buyer, S::Pending, None).await;
+        assert_eq!(
+            status_of(&db, buyer).await,
+            Some(S::WaitingTakerBond),
+            "coarse Pending must not clobber WaitingTakerBond"
+        );
+
+        // Post-bond advance, then a coarse InProgress that must not clobber it.
+        db.update_trade_fields(buyer, Some(S::WaitingBuyerInvoice), None, Some(9526))
+            .await
+            .unwrap();
+        sync_public(&db, buyer, S::InProgress, None).await;
+        let t = db.get_trade_by_order_id(buyer).await.unwrap().unwrap();
+        assert_eq!(
+            t.order.status,
+            S::WaitingBuyerInvoice,
+            "coarse InProgress must not clobber WaitingBuyerInvoice"
+        );
+        assert_eq!(t.order.amount_sats, Some(9526));
+
+        // ── Seller role
+        let seller = "order-seller";
+        db.save_trade(&bond_trade(seller, TradeRole::Seller)).await.unwrap();
+        sync_public(&db, seller, S::Pending, None).await;
+        assert_eq!(status_of(&db, seller).await, Some(S::WaitingTakerBond));
+
+        db.update_trade_fields(seller, Some(S::WaitingPayment), Some("lnbcescrow".into()), Some(7851))
+            .await
+            .unwrap();
+        sync_public(&db, seller, S::InProgress, None).await;
+        let t = db.get_trade_by_order_id(seller).await.unwrap().unwrap();
+        assert_eq!(t.order.status, S::WaitingPayment);
+        assert_eq!(t.hold_invoice.as_deref(), Some("lnbcescrow"));
+
+        // ── Terminal public status still wins.
+        sync_public(&db, seller, S::Canceled, None).await;
+        assert_eq!(status_of(&db, seller).await, Some(S::Canceled));
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{path_str}-shm"));
+    }
+
     /// Only the pending create's own local UUID may be rebound to an incoming
     /// event's order id; a stored id that is already a daemon's (or belongs to
     /// an earlier life of a reused trade key) must never be rebound.

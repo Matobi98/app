@@ -10,15 +10,18 @@ import 'package:mostro/src/rust/api/types.dart';
 final tradeRoleProvider =
     StateProvider<Map<String, bool>>((ref) => const {});
 
-/// Poll `getOrder()` every 2 s until `amountSats` is non-null, then stop.
+/// Poll every 2 s until the trade's `amountSats` is non-null, then stop.
 ///
-/// Returns `null` while waiting.  Useful for the add-invoice screen which
-/// needs the sats amount before it can submit a Lightning invoice.
+/// Sizes the buyer's add-invoice. Prefers the persisted trade over the order
+/// book, whose amount is the coarse public 38383 figure (the full order amount)
+/// rather than the daemon's calculated per-role sats. See [tradeStatusProvider].
 final tradeAmountProvider =
     StreamProvider.family.autoDispose<BigInt?, String>((ref, orderId) async* {
   while (true) {
-    final info = await orders_api.getOrder(orderId: orderId);
-    final sats = info?.amountSats;
+    final trades = await orders_api.listTrades();
+    final trade = trades.where((t) => t.order.id == orderId).firstOrNull;
+    final sats = trade?.order.amountSats ??
+        (await orders_api.getOrder(orderId: orderId))?.amountSats;
     yield sats;
     if (sats != null) return; // done — no need to keep polling
     await Future.delayed(const Duration(seconds: 2));
