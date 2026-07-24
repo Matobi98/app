@@ -232,6 +232,7 @@ what to listen to. Reference: <https://mostro.network/protocol/seller_pay_hold_i
 |------------------------------------|-----------------------------------------------------|----------------------------------------------------------------------------------|
 | `WaitingBuyerInvoice`              | (status sync)                                       | `status → WaitingBuyerInvoice`                                                   |
 | `PayInvoice`                       | `Payload::PaymentRequest(small_order, bolt11, amt)` | `hold_invoice ← bolt11`, `amount_sats ← amt ?? small_order.amount`, `status → WaitingPayment` |
+| `AddInvoice` (standalone, post-bond only) | `Payload::Order(small_order)`                | Only when the trade is `WaitingTakerBond`: `amount_sats ← small_order.amount`, `status → WaitingBuyerInvoice`. Otherwise a no-op — a payout-retry `AddInvoice` must leave a `SettledHoldInvoice` order untouched |
 | `BuyerTookOrder` / `HoldInvoicePaymentAccepted` | `SmallOrder` with `status = active`      | `status → Active` (routed through `map_core_status` kebab-case)                  |
 | `FiatSentOk`                       | (status sync)                                       | `status → FiatSent`                                                              |
 | `HoldInvoicePaymentSettled` / `Released` / `PurchaseCompleted` | (status sync)             | `status → SettledHoldInvoice`                                                    |
