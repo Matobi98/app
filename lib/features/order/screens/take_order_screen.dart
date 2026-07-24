@@ -132,9 +132,7 @@ class _TakeOrderScreenState extends ConsumerState<TakeOrderScreen> {
             (map) => {...map, widget.orderId: widget.isBuying},
           );
 
-      // Bond-requiring node: the daemon replied with pay-bond-invoice instead
-      // of progressing the trade. Route to the bond payment screen, which
-      // forwards the taker to the normal next step once the bond is paid.
+      // Bond-requiring node replied with pay-bond-invoice: pay the bond first.
       if (trade.order.status == OrderStatus.waitingTakerBond) {
         context.push(AppRoute.payBondInvoicePath(widget.orderId));
       } else if (widget.isBuying) {

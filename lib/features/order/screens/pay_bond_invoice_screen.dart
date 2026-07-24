@@ -16,18 +16,11 @@ import 'package:mostro/shared/widgets/nwc_payment_widget.dart';
 
 /// Pay anti-abuse bond screen — Route `/pay_bond_invoice/:orderId`.
 ///
-/// Shown when the taker takes an order on a bond-requiring node: the daemon
-/// replies with `pay-bond-invoice` (a Lightning hold invoice for the taker's
-/// anti-abuse bond) instead of progressing the trade. The bond bolt11 rides in
-/// the trade's dedicated `bondInvoice` slot (kept apart from `holdInvoice` so
-/// it never collides with the escrow hold invoice) and the order sits at
-/// [OrderStatus.waitingTakerBond] until it is paid.
-///
-/// The taker pays the bond (NWC or externally); once the daemon detects the
-/// locked HTLC it advances the order into the normal take flow. This screen
-/// watches the order status and forwards the taker to the next step — the
-/// add-invoice screen (buyer), the pay-invoice screen (seller) or the trade
-/// detail — mirroring [PayLightningInvoiceScreen].
+/// Shown when a taker takes an order on a bond-requiring node: the order sits
+/// at [OrderStatus.waitingTakerBond] with the bond bolt11 in the trade's
+/// `bondInvoice` slot. Once the daemon confirms the bond payment, this screen
+/// forwards the taker to the next step (add-invoice for a buyer, pay-invoice
+/// for a seller, else trade detail), mirroring [PayLightningInvoiceScreen].
 class PayBondInvoiceScreen extends ConsumerStatefulWidget {
   const PayBondInvoiceScreen({super.key, required this.orderId});
 
@@ -66,30 +59,26 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
     final isWalletConnected = ref.watch(isWalletConnectedProvider);
     final tradeAsync = ref.watch(tradeBondInfoProvider(widget.orderId));
 
-    // Listen to live status updates from mostrod. While the order sits at
-    // waitingTakerBond we stay here; once the bond HTLC is locked the daemon
-    // advances the order and we forward the taker to the matching next step.
+    // Forward the taker to the matching next step once the bond is paid;
+    // stay put while the order is still at waitingTakerBond/pending.
     ref.listen<AsyncValue<OrderStatus>>(
       tradeStatusProvider(widget.orderId),
       (prev, next) {
         final status = next.valueOrNull;
         if (status == null || _navigated || !mounted) return;
         switch (status) {
-          // Bond not yet paid — keep waiting on this screen.
           case OrderStatus.waitingTakerBond:
           case OrderStatus.pending:
             break;
-          // Buyer taker: provide the Lightning invoice next.
-          case OrderStatus.waitingBuyerInvoice:
+          case OrderStatus.waitingBuyerInvoice: // buyer taker
             _navigated = true;
             context.pushReplacement(AppRoute.addInvoicePath(widget.orderId));
             break;
-          // Seller taker: pay the trade hold invoice next.
-          case OrderStatus.waitingPayment:
+          case OrderStatus.waitingPayment: // seller taker
             _navigated = true;
             context.pushReplacement(AppRoute.payInvoicePath(widget.orderId));
             break;
-          // Trade already progressed past the invoice step.
+          // Already progressed past the invoice step.
           case OrderStatus.active:
           case OrderStatus.fiatSent:
           case OrderStatus.inProgress:
@@ -99,7 +88,6 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
             _navigated = true;
             context.go(AppRoute.tradeDetailPath(widget.orderId));
             break;
-          // Order died before the bond advanced the trade.
           case OrderStatus.canceled:
           case OrderStatus.cooperativelyCanceled:
           case OrderStatus.canceledByAdmin:

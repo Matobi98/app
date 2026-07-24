@@ -49,9 +49,8 @@ enum TradeStatus {
   waitingInvoice('Waiting Invoice'),
   /// Seller must pay hold invoice (waitingPayment).
   waitingPayment('Waiting Payment'),
-  /// Taker must pay the anti-abuse bond hold invoice (waitingTakerBond).
-  /// Distinct from [waitingPayment]: the current user is the taker and must
-  /// pay the bond, not open the escrow hold-invoice flow.
+  /// Taker must pay the anti-abuse bond (waitingTakerBond) — distinct from
+  /// [waitingPayment] so it routes to the bond screen, not the escrow flow.
   waitingBond('Waiting Bond'),
   active('Active'),
   fiatSent('Fiat Sent'),
@@ -385,8 +384,8 @@ class _TradeDetailScreenState extends ConsumerState<TradeDetailScreen> {
               : l10n.tradeTimerWaitingPaymentLabelSeller,
           l10n.tradeTimerWaitingInvoiceConsequence,
         ),
-      // Bond window: same "expires → order returns to the book" consequence
-      // as a waiting-invoice/payment timeout (the unpaid bond simply lapses).
+      // Unpaid bond lapses → same "returns to the book" consequence as a
+      // waiting-invoice timeout.
       TradeStatus.waitingBond => (
           l10n.tradeTimerWaitingBondLabel,
           l10n.tradeTimerWaitingInvoiceConsequence,
@@ -872,8 +871,7 @@ class _TradeDetailScreenState extends ConsumerState<TradeDetailScreen> {
                 context.push(AppRoute.payInvoicePath(widget.orderId)),
           ),
         ];
-      // Taker (either role) reopening the trade while the bond is unpaid:
-      // route to the bond payment screen, never the escrow pay-invoice flow.
+      // Bond unpaid (either role) → bond screen, never the escrow flow.
       case (TradeStatus.waitingBond, _):
         return [
           bigButton(

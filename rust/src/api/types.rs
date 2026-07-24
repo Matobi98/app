@@ -35,9 +35,8 @@ pub enum OrderStatus {
     CompletedByAdmin,
     Dispute,
     InProgress,
-    /// The taker has taken a bond-requiring order and must pay the anti-abuse
-    /// bond hold invoice before the trade progresses. Maker-side bonds
-    /// (`WaitingMakerBond`) are out of scope here (see issue #191).
+    /// Taker must pay the anti-abuse bond hold invoice before the trade
+    /// progresses. Maker-side bonds are out of scope (issue #191).
     WaitingTakerBond,
 }
 
@@ -244,16 +243,13 @@ pub struct TradeInfo {
     pub counterparty_pubkey: String,
     pub current_step: TradeStep,
     pub hold_invoice: Option<String>,
-    /// Anti-abuse bond hold invoice the taker must pay on a bond-requiring node
-    /// (order sits at [`OrderStatus::WaitingTakerBond`] until it is paid). Kept
-    /// distinct from `hold_invoice` so the bond and the trade's escrow hold
-    /// invoice never collide as the trade advances past the bond. `serde`
-    /// default keeps trade rows persisted before this field deserializable.
+    /// Taker anti-abuse bond hold invoice, kept distinct from `hold_invoice` so
+    /// it never collides with the trade's escrow hold invoice past the bond.
+    /// `serde` default keeps pre-existing trade rows deserializable.
     #[serde(default)]
     pub bond_invoice: Option<String>,
-    /// Sat amount of the anti-abuse bond hold invoice. Kept apart from
-    /// `order.amount_sats` (the trade amount) so surfacing the bond figure on
-    /// the payment screen never overwrites the trade's own amount.
+    /// Bond amount in sats, kept apart from `order.amount_sats` so the figure
+    /// shown on the bond screen never overwrites the trade amount.
     #[serde(default)]
     pub bond_amount_sats: Option<u64>,
     pub buyer_invoice: Option<String>,

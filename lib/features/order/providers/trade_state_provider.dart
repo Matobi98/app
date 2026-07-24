@@ -131,11 +131,9 @@ final tradeInfoStreamProvider =
 
 /// Poll `listTrades()` every 1 s until `bondInvoice` is non-null, then stop.
 ///
-/// Returns the full [TradeInfo] once the anti-abuse bond hold invoice is
-/// available. Used by [PayBondInvoiceScreen]; kept separate from
-/// [tradeInfoStreamProvider] (which keys on `holdInvoice`) because a taken
-/// bond order carries its invoice in `bondInvoice` and leaves `holdInvoice`
-/// null until the trade advances past the bond.
+/// Used by [PayBondInvoiceScreen]; separate from [tradeInfoStreamProvider]
+/// (which keys on `holdInvoice`) because a taken bond order carries its invoice
+/// in `bondInvoice` and leaves `holdInvoice` null until it advances.
 final tradeBondInfoProvider =
     StreamProvider.family.autoDispose<TradeInfo?, String>((ref, orderId) async* {
   while (true) {
