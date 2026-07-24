@@ -254,6 +254,14 @@ class AppLocalizationsIt extends AppLocalizations {
       'Paga la cauzione anti-abuso per prendere questo ordine.';
 
   @override
+  String get tradeInstructionWaitingBond =>
+      'Paga la hold invoice della cauzione anti-abuso per prendere questo ordine.';
+
+  @override
+  String get tradeTimerWaitingBondLabel =>
+      'Tempo per pagare la cauzione anti-abuso';
+
+  @override
   String addInvoiceAmount(String sats) {
     return 'Importo da ricevere: $sats sats';
   }

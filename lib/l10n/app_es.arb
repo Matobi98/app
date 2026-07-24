@@ -76,6 +76,8 @@
   "bondInvoiceQrLabel": "Código QR de la factura de la fianza antiabuso",
   "tradeStatusWaitingBond": "Esperando fianza",
   "tradeHeadlineWaitingBond": "Paga la fianza antiabuso para tomar esta orden.",
+  "tradeInstructionWaitingBond": "Paga la hold invoice de la fianza antiabuso para tomar esta orden.",
+  "tradeTimerWaitingBondLabel": "Tiempo para pagar la fianza antiabuso",
   "addInvoiceAmount": "Cantidad a recibir: {sats} sats",
   "payInvoiceAmount": "Cantidad a pagar: {sats} sats",
   "orderIdCopied": "ID de orden copiado",

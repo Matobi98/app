@@ -518,6 +518,18 @@ abstract class AppLocalizations {
   /// **'Pay the anti-abuse bond to take this order.'**
   String get tradeHeadlineWaitingBond;
 
+  /// Trade detail instruction while the taker must pay the anti-abuse bond hold invoice
+  ///
+  /// In en, this message translates to:
+  /// **'Pay the anti-abuse bond hold invoice to take this order.'**
+  String get tradeInstructionWaitingBond;
+
+  /// Trade detail timer label for the window in which the taker must pay the anti-abuse bond
+  ///
+  /// In en, this message translates to:
+  /// **'Time to pay the anti-abuse bond'**
+  String get tradeTimerWaitingBondLabel;
+
   /// Sats amount (calculated by the Mostro daemon) the buyer's invoice must be for, shown on the add-invoice screen
   ///
   /// In en, this message translates to:

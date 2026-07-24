@@ -166,6 +166,10 @@
   "@tradeStatusWaitingBond": {"description": "Trade status pill label while the taker must still pay the anti-abuse bond"},
   "tradeHeadlineWaitingBond": "Pay the anti-abuse bond to take this order.",
   "@tradeHeadlineWaitingBond": {"description": "Trade detail headline while the taker must pay the anti-abuse bond hold invoice"},
+  "tradeInstructionWaitingBond": "Pay the anti-abuse bond hold invoice to take this order.",
+  "@tradeInstructionWaitingBond": {"description": "Trade detail instruction while the taker must pay the anti-abuse bond hold invoice"},
+  "tradeTimerWaitingBondLabel": "Time to pay the anti-abuse bond",
+  "@tradeTimerWaitingBondLabel": {"description": "Trade detail timer label for the window in which the taker must pay the anti-abuse bond"},
   "addInvoiceAmount": "Amount to receive: {sats} sats",
   "@addInvoiceAmount": {
     "description": "Sats amount (calculated by the Mostro daemon) the buyer's invoice must be for, shown on the add-invoice screen",

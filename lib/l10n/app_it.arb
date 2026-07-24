@@ -76,6 +76,8 @@
   "bondInvoiceQrLabel": "Codice QR della fattura della cauzione anti-abuso",
   "tradeStatusWaitingBond": "In attesa della cauzione",
   "tradeHeadlineWaitingBond": "Paga la cauzione anti-abuso per prendere questo ordine.",
+  "tradeInstructionWaitingBond": "Paga la hold invoice della cauzione anti-abuso per prendere questo ordine.",
+  "tradeTimerWaitingBondLabel": "Tempo per pagare la cauzione anti-abuso",
   "addInvoiceAmount": "Importo da ricevere: {sats} sats",
   "payInvoiceAmount": "Importo da pagare: {sats} sats",
   "orderIdCopied": "ID ordine copiato",

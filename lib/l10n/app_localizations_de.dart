@@ -253,6 +253,14 @@ class AppLocalizationsDe extends AppLocalizations {
       'Zahle die Anti-Missbrauchs-Kaution, um diese Order anzunehmen.';
 
   @override
+  String get tradeInstructionWaitingBond =>
+      'Zahle die Anti-Missbrauchs-Kautions-Hold-Invoice, um diese Order anzunehmen.';
+
+  @override
+  String get tradeTimerWaitingBondLabel =>
+      'Zeit zum Zahlen der Anti-Missbrauchs-Kaution';
+
+  @override
   String addInvoiceAmount(String sats) {
     return 'Zu erhaltender Betrag: $sats sats';
   }

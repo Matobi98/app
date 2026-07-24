@@ -249,6 +249,13 @@ class AppLocalizationsEn extends AppLocalizations {
       'Pay the anti-abuse bond to take this order.';
 
   @override
+  String get tradeInstructionWaitingBond =>
+      'Pay the anti-abuse bond hold invoice to take this order.';
+
+  @override
+  String get tradeTimerWaitingBondLabel => 'Time to pay the anti-abuse bond';
+
+  @override
   String addInvoiceAmount(String sats) {
     return 'Amount to receive: $sats sats';
   }

@@ -76,6 +76,8 @@
   "bondInvoiceQrLabel": "QR-Code der Anti-Missbrauchs-Kautionsrechnung",
   "tradeStatusWaitingBond": "Warten auf Kaution",
   "tradeHeadlineWaitingBond": "Zahle die Anti-Missbrauchs-Kaution, um diese Order anzunehmen.",
+  "tradeInstructionWaitingBond": "Zahle die Anti-Missbrauchs-Kautions-Hold-Invoice, um diese Order anzunehmen.",
+  "tradeTimerWaitingBondLabel": "Zeit zum Zahlen der Anti-Missbrauchs-Kaution",
   "addInvoiceAmount": "Zu erhaltender Betrag: {sats} sats",
   "payInvoiceAmount": "Zu zahlender Betrag: {sats} sats",
   "orderIdCopied": "Bestell-ID kopiert",

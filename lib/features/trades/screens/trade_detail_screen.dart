@@ -290,6 +290,9 @@ class _TradeDetailScreenState extends ConsumerState<TradeDetailScreen> {
           ? l10n.tradeWaitingPaymentBuyerInstruction
           : l10n.tradeWaitingPaymentSellerInstruction;
     }
+    if (status == TradeStatus.waitingBond) {
+      return l10n.tradeInstructionWaitingBond;
+    }
     if (isBuyer) {
       if (status == TradeStatus.active) {
         return l10n.tradeInstructionActiveBuyer;
@@ -380,6 +383,12 @@ class _TradeDetailScreenState extends ConsumerState<TradeDetailScreen> {
           isBuyer
               ? l10n.tradeTimerWaitingPaymentLabelBuyer
               : l10n.tradeTimerWaitingPaymentLabelSeller,
+          l10n.tradeTimerWaitingInvoiceConsequence,
+        ),
+      // Bond window: same "expires → order returns to the book" consequence
+      // as a waiting-invoice/payment timeout (the unpaid bond simply lapses).
+      TradeStatus.waitingBond => (
+          l10n.tradeTimerWaitingBondLabel,
           l10n.tradeTimerWaitingInvoiceConsequence,
         ),
       TradeStatus.active => (

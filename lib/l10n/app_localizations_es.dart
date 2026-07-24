@@ -254,6 +254,14 @@ class AppLocalizationsEs extends AppLocalizations {
       'Paga la fianza antiabuso para tomar esta orden.';
 
   @override
+  String get tradeInstructionWaitingBond =>
+      'Paga la hold invoice de la fianza antiabuso para tomar esta orden.';
+
+  @override
+  String get tradeTimerWaitingBondLabel =>
+      'Tiempo para pagar la fianza antiabuso';
+
+  @override
   String addInvoiceAmount(String sats) {
     return 'Cantidad a recibir: $sats sats';
   }
