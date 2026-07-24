@@ -1931,11 +1931,18 @@ async fn dispatch_mostro_message(
         // Mostro sends AddInvoice to the buyer (Order payload, calculated sats)
         // asking for their Lightning invoice. In the normal take flow this is
         // the take reply, consumed by the waiting take_order caller; it reaches
-        // the per-action arms only as a standalone message — after a taker bond
-        // is paid (the daemon resumes the take with WaitingBuyerInvoice) or on a
-        // reconnect. Sync the calculated sats and status so the bond payment
-        // screen advances to the add-invoice step with the real trade amount
-        // (not the bond amount) and My Trades reflects the state.
+        // the per-action arms only as a standalone message. We advance the trade
+        // ONLY for the post-bond case (order currently WaitingTakerBond): after
+        // the taker pays the bond the daemon resumes the take with
+        // WaitingBuyerInvoice.
+        //
+        // A standalone AddInvoice also arrives when a buyer's payout exhausts
+        // its retries — there the order MUST stay `SettledHoldInvoice` (the sats
+        // are already locked; see `.specify/v1-reference/ORDER_STATES.md`
+        // §PAYMENT_FAILED). Advancing it to WaitingBuyerInvoice would misrender
+        // the trade as a pre-escrow step with cancellation controls, so any
+        // order that is not WaitingTakerBond is left untouched (pre-bond
+        // behavior).
         Action::AddInvoice => {
             let order_id = match &kind.id {
                 Some(id) => id.to_string(),
@@ -1944,22 +1951,26 @@ async fn dispatch_mostro_message(
                     return;
                 }
             };
-            let amount = match &kind.payload {
-                Some(mostro_core::message::Payload::Order(small_order)) => {
-                    if small_order.amount > 0 {
-                        Some(small_order.amount as u64)
-                    } else {
-                        None
-                    }
-                }
-                _ => {
-                    log::warn!(
-                        "[orders] gift-wrap AddInvoice payload is not an Order"
-                    );
-                    None
-                }
+            let is_post_bond = match crate::db::app_db::db() {
+                Some(db) => matches!(
+                    db.get_trade_by_order_id(&order_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|t| t.order.status),
+                    Some(crate::api::types::OrderStatus::WaitingTakerBond)
+                ),
+                None => false,
             };
-            log::info!("[orders] gift-wrap AddInvoice: order={order_id} amount={amount:?}");
+            if !is_post_bond {
+                log::debug!(
+                    "[orders] gift-wrap AddInvoice: order={order_id} not awaiting a \
+                     taker bond — leaving state untouched"
+                );
+                return;
+            }
+            let amount = add_invoice_amount(&kind.payload);
+            log::info!("[orders] gift-wrap AddInvoice (post-bond): order={order_id} amount={amount:?}");
             // Update the order book amount too (not just status): the take
             // persisted the bond amount there, and the buyer's add-invoice
             // screen reads the sats from the order book, so overwrite it with
@@ -2186,6 +2197,20 @@ fn status_for_action(action: &mostro_core::message::Action) -> Option<OrderStatu
         }
         Action::AdminSettled => Some(OrderStatus::SettledByAdmin),
         Action::AdminCanceled => Some(OrderStatus::CanceledByAdmin),
+        _ => None,
+    }
+}
+
+/// Extract the calculated trade sats from an `add-invoice` reply's `Order`
+/// payload. Returns `None` for a non-positive amount or a non-`Order` payload
+/// (the daemon carries the buyer's amount in a `SmallOrder`; anything else is
+/// not an add-invoice request we can size).
+fn add_invoice_amount(payload: &Option<mostro_core::message::Payload>) -> Option<u64> {
+    use mostro_core::message::Payload;
+    match payload {
+        Some(Payload::Order(small_order)) if small_order.amount > 0 => {
+            Some(small_order.amount as u64)
+        }
         _ => None,
     }
 }
@@ -3333,6 +3358,35 @@ mod tests {
             }
             _ => panic!("expected TakeAccepted"),
         }
+    }
+
+    /// The `add-invoice` amount helper reads the buyer's calculated sats from
+    /// the `Order` payload and rejects anything it can't size.
+    #[test]
+    fn add_invoice_amount_reads_order_payload() {
+        use mostro_core::message::Payload;
+        use mostro_core::order::Status;
+
+        // Valid: positive amount in an Order payload.
+        let so = small_order_with(Status::WaitingBuyerInvoice, 9526);
+        assert_eq!(add_invoice_amount(&Some(Payload::Order(so))), Some(9526));
+
+        // Non-positive amount → None (nothing to size).
+        let so = small_order_with(Status::WaitingBuyerInvoice, 0);
+        assert_eq!(add_invoice_amount(&Some(Payload::Order(so))), None);
+
+        // Missing payload → None.
+        assert_eq!(add_invoice_amount(&None), None);
+
+        // Wrong payload shape (not an Order) → None.
+        assert_eq!(
+            add_invoice_amount(&Some(Payload::PaymentRequest(
+                None,
+                "lnbc1invoice".into(),
+                Some(9526),
+            ))),
+            None
+        );
     }
 
     /// Only the pending create's own local UUID may be rebound to an incoming
