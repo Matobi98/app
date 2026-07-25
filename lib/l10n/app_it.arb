@@ -738,5 +738,8 @@
   "cashuErrorSendFailed": "Non è stato possibile creare il token. Potresti non avere fondi sufficienti.",
   "cashuErrorNoIdentity": "Crea o importa un account prima di usare il portafoglio.",
   "cashuErrorGeneric": "Qualcosa è andato storto con il portafoglio. Riprova.",
-  "settingsEscrowCashuUnavailable": "Cashu non può funzionare senza una mint: impostane una qui sotto."
+  "settingsEscrowCashuUnavailable": "Cashu non può funzionare senza una mint: impostane una qui sotto.",
+  "cashuLastTokenPending": "Hai esportato un token. \u00c8 denaro finch\u00e9 qualcuno non lo riscuote: conservalo finch\u00e9 non sei sicuro che sia arrivato.",
+  "cashuShowLastToken": "Mostralo di nuovo",
+  "cashuLastTokenDone": "L'ho inviato"
 }

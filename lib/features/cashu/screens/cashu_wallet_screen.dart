@@ -6,6 +6,7 @@ import 'package:qr_flutter/qr_flutter.dart';
 
 import 'package:mostro/core/app_routes.dart';
 import 'package:mostro/core/app_theme.dart';
+import 'package:mostro/features/cashu/cashu_error_messages.dart';
 import 'package:mostro/features/cashu/providers/cashu_wallet_provider.dart';
 import 'package:mostro/l10n/app_localizations.dart';
 import 'package:mostro/shared/widgets/platform_aware_qr_scanner.dart';
@@ -33,6 +34,14 @@ class _CashuWalletScreenState extends ConsumerState<CashuWalletScreen> {
   /// concurrent sends would each reserve proofs.
   bool _busy = false;
 
+  /// The last token exported in this session.
+  ///
+  /// Kept so the dialog can be re-opened. A token *is* the money: if the only
+  /// copy is a dialog the user can dismiss, one stray tap loses the funds until
+  /// they find the proof-state check. Cleared when the user says they are done
+  /// with it.
+  String? _lastToken;
+
   @override
   void initState() {
     super.initState();
@@ -49,35 +58,17 @@ class _CashuWalletScreenState extends ConsumerState<CashuWalletScreen> {
     }
   }
 
-  /// Map a Rust marker to a localized message. Rust never returns prose, so
-  /// anything unrecognised falls back to the generic error instead of leaking
-  /// an internal string to the user.
-  String _message(Object error, AppLocalizations l10n) {
-    final text = error.toString();
-    if (text.contains('CashuNotEnabled')) return l10n.cashuErrorNotEnabled;
-    if (text.contains('CashuNotConnected')) return l10n.cashuErrorNotConnected;
-    if (text.contains('CashuMintUnreachable')) {
-      return l10n.cashuErrorMintUnreachable;
-    }
-    if (text.contains('CashuMintUnusable')) return l10n.cashuErrorMintUnusable;
-    if (text.contains('CashuUnsupportedOnWeb')) {
-      return l10n.cashuErrorUnsupportedOnWeb;
-    }
-    if (text.contains('CashuAmountZero')) return l10n.cashuErrorAmountZero;
-    if (text.contains('CashuReceiveFailed')) return l10n.cashuErrorReceiveFailed;
-    if (text.contains('CashuSendFailed')) return l10n.cashuErrorSendFailed;
-    if (text.contains('NoIdentity')) return l10n.cashuErrorNoIdentity;
-    return l10n.cashuErrorGeneric;
-  }
-
   void _showError(Object error) {
     final l10n = AppLocalizations.of(context);
-    ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text(_message(error, l10n))));
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(cashuErrorMessage(error, l10n))));
   }
 
   void _showMessage(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   Future<void> _run(Future<void> Function() action) async {
@@ -93,19 +84,21 @@ class _CashuWalletScreenState extends ConsumerState<CashuWalletScreen> {
   }
 
   Future<void> _receive() async {
+    if (_busy) return;
     final l10n = AppLocalizations.of(context);
     final token = await showModalBottomSheet<String>(
       context: context,
       isScrollControlled: true,
-      builder: (sheetContext) => Padding(
-        padding: EdgeInsets.only(
-          bottom: MediaQuery.of(sheetContext).viewInsets.bottom,
-        ),
-        child: PlatformAwareQrScanner(
-          hint: l10n.cashuReceiveHint,
-          onDetected: (value) => Navigator.of(sheetContext).pop(value),
-        ),
-      ),
+      builder:
+          (sheetContext) => Padding(
+            padding: EdgeInsets.only(
+              bottom: MediaQuery.of(sheetContext).viewInsets.bottom,
+            ),
+            child: PlatformAwareQrScanner(
+              hint: l10n.cashuReceiveHint,
+              onDetected: (value) => Navigator.of(sheetContext).pop(value),
+            ),
+          ),
     );
 
     if (token == null || token.trim().isEmpty || !mounted) return;
@@ -119,6 +112,7 @@ class _CashuWalletScreenState extends ConsumerState<CashuWalletScreen> {
   }
 
   Future<void> _send(int balanceSats) async {
+    if (_busy) return;
     final amount = await showDialog<int>(
       context: context,
       builder: (_) => _AmountDialog(maxSats: balanceSats),
@@ -130,12 +124,20 @@ class _CashuWalletScreenState extends ConsumerState<CashuWalletScreen> {
           .read(cashuWalletControllerProvider)
           .createToken(BigInt.from(amount));
       if (mounted) {
-        await showDialog<void>(
-          context: context,
-          builder: (_) => _TokenDialog(token: token),
-        );
+        setState(() => _lastToken = token);
+        await _showToken(token);
       }
     });
+  }
+
+  Future<void> _showToken(String token) {
+    return showDialog<void>(
+      context: context,
+      // Not dismissible: closing this by tapping outside used to be the fastest
+      // way to lose an exported token.
+      barrierDismissible: false,
+      builder: (_) => _TokenDialog(token: token),
+    );
   }
 
   Future<void> _checkProofs() async {
@@ -144,9 +146,11 @@ class _CashuWalletScreenState extends ConsumerState<CashuWalletScreen> {
       final reclaimed =
           await ref.read(cashuWalletControllerProvider).checkProofsState();
       if (mounted) {
-        _showMessage(reclaimed > BigInt.zero
-            ? l10n.cashuReclaimed(reclaimed.toInt())
-            : l10n.cashuNothingToReclaim);
+        _showMessage(
+          reclaimed > BigInt.zero
+              ? l10n.cashuReclaimed(reclaimed.toInt())
+              : l10n.cashuNothingToReclaim,
+        );
       }
     });
   }
@@ -156,15 +160,20 @@ class _CashuWalletScreenState extends ConsumerState<CashuWalletScreen> {
     final l10n = AppLocalizations.of(context);
     final colors = Theme.of(context).extension<AppColors>()!;
     final status = ref.watch(cashuWalletProvider).valueOrNull;
-    final balance = status?.balanceSats ?? BigInt.zero;
+    // `null` here means "not read yet or unreadable", which is not the same as
+    // an empty wallet — see CashuWalletStatus.balance_sats.
+    final balance = status?.balanceSats;
 
     return Scaffold(
       appBar: AppBar(
         title: Text(l10n.cashuWalletTitle),
         leading: IconButton(
           icon: const Icon(Icons.arrow_back),
-          onPressed: () =>
-              context.canPop() ? context.pop() : context.go(AppRoute.settings),
+          onPressed:
+              () =>
+                  context.canPop()
+                      ? context.pop()
+                      : context.go(AppRoute.settings),
         ),
       ),
       body: ListView(
@@ -186,15 +195,51 @@ class _CashuWalletScreenState extends ConsumerState<CashuWalletScreen> {
                 child: OutlinedButton.icon(
                   // Nothing to send from an empty wallet; disabling says so
                   // before the mint has to.
-                  onPressed: _busy || balance == BigInt.zero
-                      ? null
-                      : () => _send(balance.toInt()),
+                  // Disabled while the balance is unknown as well as when it
+                  // is zero: offering a send we cannot size is worse than
+                  // waiting a frame for the real figure.
+                  onPressed:
+                      _busy || balance == null || balance == BigInt.zero
+                          ? null
+                          : () => _send(balance.toInt()),
                   icon: const Icon(Icons.upload_outlined),
                   label: Text(l10n.cashuSendButton),
                 ),
               ),
             ],
           ),
+          if (_lastToken != null) ...[
+            const SizedBox(height: AppSpacing.lg),
+            Container(
+              padding: const EdgeInsets.all(AppSpacing.md),
+              decoration: BoxDecoration(
+                color: colors.backgroundCard,
+                borderRadius: BorderRadius.circular(AppRadius.card),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    l10n.cashuLastTokenPending,
+                    style: TextStyle(color: colors.textSubtle, fontSize: 13),
+                  ),
+                  const SizedBox(height: AppSpacing.sm),
+                  Row(
+                    children: [
+                      TextButton(
+                        onPressed: () => _showToken(_lastToken!),
+                        child: Text(l10n.cashuShowLastToken),
+                      ),
+                      TextButton(
+                        onPressed: () => setState(() => _lastToken = null),
+                        child: Text(l10n.cashuLastTokenDone),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
           const SizedBox(height: AppSpacing.lg),
           TextButton.icon(
             onPressed: _busy ? null : _checkProofs,
@@ -210,6 +255,17 @@ class _CashuWalletScreenState extends ConsumerState<CashuWalletScreen> {
       ),
     );
   }
+}
+
+/// Group digits so a six-figure balance is readable, matching the About screen.
+String _fmtSats(BigInt sats) {
+  final digits = sats.toString();
+  final buffer = StringBuffer();
+  for (var i = 0; i < digits.length; i++) {
+    if (i > 0 && (digits.length - i) % 3 == 0) buffer.write(',');
+    buffer.write(digits[i]);
+  }
+  return buffer.toString();
 }
 
 /// Balance, mint, and — when the wallet could not bind — that it did not.
@@ -239,11 +295,15 @@ class _BalanceCard extends StatelessWidget {
           ),
           const SizedBox(height: AppSpacing.xs),
           Text(
-            '${status?.balanceSats ?? 0} ${l10n.aboutSatoshisSuffix}',
-            style: Theme.of(context)
-                .textTheme
-                .headlineSmall
-                ?.copyWith(fontWeight: FontWeight.w600),
+            // An unreadable balance renders as "—", never as a number. Showing
+            // "0 Satoshis" for a failed read is the one thing a bearer-money
+            // wallet must not do.
+            status?.balanceSats == null
+                ? '—'
+                : '${_fmtSats(status!.balanceSats!)} ${l10n.aboutSatoshisSuffix}',
+            style: Theme.of(
+              context,
+            ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w600),
           ),
           const SizedBox(height: AppSpacing.md),
           if (connected)
@@ -338,24 +398,34 @@ class _TokenDialog extends StatelessWidget {
     final l10n = AppLocalizations.of(context);
     return AlertDialog(
       title: Text(l10n.cashuTokenTitle),
-      content: SingleChildScrollView(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              padding: const EdgeInsets.all(AppSpacing.sm),
-              color: Colors.white,
-              child: QrImageView(
-                data: token,
-                size: 200,
-                backgroundColor: Colors.white,
+      // Bounded width on purpose: `QrImageView` lays out through a
+      // `LayoutBuilder`, and `AlertDialog` asks its content for intrinsic
+      // dimensions — which a LayoutBuilder cannot answer. Without this the
+      // dialog throws on a narrow screen.
+      content: SizedBox(
+        width: 280,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(AppSpacing.sm),
+                color: Colors.white,
+                child: QrImageView(
+                  data: token,
+                  size: 200,
+                  backgroundColor: Colors.white,
+                ),
               ),
-            ),
-            const SizedBox(height: AppSpacing.md),
-            SelectableText(token, style: const TextStyle(fontSize: 11)),
-            const SizedBox(height: AppSpacing.md),
-            Text(l10n.cashuTokenWarning, style: const TextStyle(fontSize: 12)),
-          ],
+              const SizedBox(height: AppSpacing.md),
+              SelectableText(token, style: const TextStyle(fontSize: 11)),
+              const SizedBox(height: AppSpacing.md),
+              Text(
+                l10n.cashuTokenWarning,
+                style: const TextStyle(fontSize: 12),
+              ),
+            ],
+          ),
         ),
       ),
       actions: [
@@ -363,9 +433,9 @@ class _TokenDialog extends StatelessWidget {
           onPressed: () async {
             await Clipboard.setData(ClipboardData(text: token));
             if (context.mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(content: Text(l10n.cashuTokenCopied)),
-              );
+              ScaffoldMessenger.of(
+                context,
+              ).showSnackBar(SnackBar(content: Text(l10n.cashuTokenCopied)));
             }
           },
           child: Text(l10n.cashuCopyToken),

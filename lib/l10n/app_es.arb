@@ -738,5 +738,8 @@
   "cashuErrorSendFailed": "No se pudo crear el token. Puede que no tengas fondos suficientes.",
   "cashuErrorNoIdentity": "Creá o importá una cuenta antes de usar la billetera.",
   "cashuErrorGeneric": "Algo salió mal con la billetera. Intentá de nuevo.",
-  "settingsEscrowCashuUnavailable": "Cashu no puede funcionar sin un mint: configura uno abajo."
+  "settingsEscrowCashuUnavailable": "Cashu no puede funcionar sin un mint: configura uno abajo.",
+  "cashuLastTokenPending": "Exportaste un token. Es dinero hasta que alguien lo canjee: guardalo hasta estar seguro de que lleg\u00f3.",
+  "cashuShowLastToken": "Mostrarlo de nuevo",
+  "cashuLastTokenDone": "Ya lo envi\u00e9"
 }

@@ -738,5 +738,8 @@
   "cashuErrorSendFailed": "Impossible de créer le token. Vos fonds sont peut-être insuffisants.",
   "cashuErrorNoIdentity": "Créez ou importez un compte avant d'utiliser le portefeuille.",
   "cashuErrorGeneric": "Un problème est survenu avec le portefeuille. Veuillez réessayer.",
-  "settingsEscrowCashuUnavailable": "Cashu ne peut pas fonctionner sans mint : configurez-en un ci-dessous."
+  "settingsEscrowCashuUnavailable": "Cashu ne peut pas fonctionner sans mint : configurez-en un ci-dessous.",
+  "cashuLastTokenPending": "Vous avez export\u00e9 un token. C'est de l'argent jusqu'\u00e0 ce que quelqu'un l'encaisse \u2014 gardez-le jusqu'\u00e0 confirmation.",
+  "cashuShowLastToken": "Le r\u00e9afficher",
+  "cashuLastTokenDone": "Je l'ai envoy\u00e9"
 }

@@ -4399,6 +4399,24 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Cashu cannot run without a mint — set one below.'**
   String get settingsEscrowCashuUnavailable;
+
+  /// Cashu wallet — reminder shown while an exported token has not been marked as handed over
+  ///
+  /// In en, this message translates to:
+  /// **'You exported a token. It is money until someone redeems it — keep it until you are sure it arrived.'**
+  String get cashuLastTokenPending;
+
+  /// Cashu wallet — re-opens the last exported token
+  ///
+  /// In en, this message translates to:
+  /// **'Show it again'**
+  String get cashuShowLastToken;
+
+  /// Cashu wallet — clears the exported-token reminder
+  ///
+  /// In en, this message translates to:
+  /// **'I\'ve sent it'**
+  String get cashuLastTokenDone;
 }
 
 class _AppLocalizationsDelegate

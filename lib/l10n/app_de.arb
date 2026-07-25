@@ -738,5 +738,8 @@
   "cashuErrorSendFailed": "Das Token konnte nicht erstellt werden. Womöglich reicht dein Guthaben nicht.",
   "cashuErrorNoIdentity": "Lege ein Konto an oder importiere eines, bevor du die Wallet nutzt.",
   "cashuErrorGeneric": "Mit der Wallet ist etwas schiefgelaufen. Bitte versuche es erneut.",
-  "settingsEscrowCashuUnavailable": "Cashu funktioniert ohne Mint nicht – unten eine festlegen."
+  "settingsEscrowCashuUnavailable": "Cashu funktioniert ohne Mint nicht – unten eine festlegen.",
+  "cashuLastTokenPending": "Du hast ein Token exportiert. Es ist Geld, bis jemand es einl\u00f6st \u2014 behalte es, bis du sicher bist, dass es angekommen ist.",
+  "cashuShowLastToken": "Erneut anzeigen",
+  "cashuLastTokenDone": "Ich habe es gesendet"
 }

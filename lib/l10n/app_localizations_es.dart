@@ -2490,4 +2490,14 @@ class AppLocalizationsEs extends AppLocalizations {
   @override
   String get settingsEscrowCashuUnavailable =>
       'Cashu no puede funcionar sin un mint: configura uno abajo.';
+
+  @override
+  String get cashuLastTokenPending =>
+      'Exportaste un token. Es dinero hasta que alguien lo canjee: guardalo hasta estar seguro de que llegó.';
+
+  @override
+  String get cashuShowLastToken => 'Mostrarlo de nuevo';
+
+  @override
+  String get cashuLastTokenDone => 'Ya lo envié';
 }

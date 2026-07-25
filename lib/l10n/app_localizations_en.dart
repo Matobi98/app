@@ -2464,4 +2464,14 @@ class AppLocalizationsEn extends AppLocalizations {
   @override
   String get settingsEscrowCashuUnavailable =>
       'Cashu cannot run without a mint — set one below.';
+
+  @override
+  String get cashuLastTokenPending =>
+      'You exported a token. It is money until someone redeems it — keep it until you are sure it arrived.';
+
+  @override
+  String get cashuShowLastToken => 'Show it again';
+
+  @override
+  String get cashuLastTokenDone => 'I\'ve sent it';
 }
