@@ -757,4 +757,11 @@
   "lockEscrowLocktime": "R\u00e9cup\u00e9rable par vous apr\u00e8s {days} jours",
   "cashuLastTokenPending": "Vous avez export\u00e9 un token. C'est de l'argent jusqu'\u00e0 ce que quelqu'un l'encaisse \u2014 gardez-le jusqu'\u00e0 confirmation.",
   "cashuShowLastToken": "Le r\u00e9afficher",
-  "cashuLastTokenDone": "Je l'ai envoy\u00e9"}
+  "cashuLastTokenDone": "Je l'ai envoy\u00e9",
+  "lockEscrowRequestMissing": "Cet \u00e9change n'a pas encore de demande de s\u00e9questre. Attendez que la prise de l'acheteur arrive, puis r\u00e9essayez.",
+  "lockEscrowWrongTradeKey": "Cet appareil ne d\u00e9tient pas la cl\u00e9 avec laquelle cet ordre a \u00e9t\u00e9 pris. Restaurez votre compte sur l'appareil o\u00f9 vous avez commenc\u00e9 l'\u00e9change.",
+  "lockEscrowLocktimeNotReached": "Le s\u00e9questre est encore verrouill\u00e9. Vous pourrez le r\u00e9cup\u00e9rer vous-m\u00eame une fois le verrou expir\u00e9.",
+  "lockEscrowClockInvalid": "L'horloge de votre appareil est incorrecte, le s\u00e9questre ne peut donc pas \u00eatre dat\u00e9 correctement. Corrigez la date et r\u00e9essayez.",
+  "lockEscrowRetry": "R\u00e9essayer l'envoi",
+  "lockEscrowPendingSubmission": "Votre s\u00e9questre est verrouill\u00e9 mais le n\u0153ud ne l'a pas confirm\u00e9. R\u00e9essayer est sans risque : il ne sera pas verrouill\u00e9 une seconde fois."
+}

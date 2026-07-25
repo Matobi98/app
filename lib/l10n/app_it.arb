@@ -757,4 +757,11 @@
   "lockEscrowLocktime": "Recuperabile da te dopo {days} giorni",
   "cashuLastTokenPending": "Hai esportato un token. \u00c8 denaro finch\u00e9 qualcuno non lo riscuote: conservalo finch\u00e9 non sei sicuro che sia arrivato.",
   "cashuShowLastToken": "Mostralo di nuovo",
-  "cashuLastTokenDone": "L'ho inviato"}
+  "cashuLastTokenDone": "L'ho inviato",
+  "lockEscrowRequestMissing": "Questo scambio non ha ancora una richiesta di deposito. Attendi che arrivi la presa dell'acquirente e riprova.",
+  "lockEscrowWrongTradeKey": "Questo dispositivo non ha la chiave con cui \u00e8 stato preso questo ordine. Ripristina il tuo account sul dispositivo da cui hai iniziato lo scambio.",
+  "lockEscrowLocktimeNotReached": "Il deposito \u00e8 ancora bloccato. Potrai recuperarlo tu stesso una volta scaduto il blocco.",
+  "lockEscrowClockInvalid": "L'orologio del tuo dispositivo \u00e8 errato, quindi il deposito non pu\u00f2 essere datato correttamente. Correggi la data e riprova.",
+  "lockEscrowRetry": "Riprova l'invio",
+  "lockEscrowPendingSubmission": "Il tuo deposito \u00e8 bloccato ma il nodo non lo ha confermato. Riprovare \u00e8 sicuro: non verr\u00e0 bloccato una seconda volta."
+}

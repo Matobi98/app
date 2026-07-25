@@ -757,4 +757,11 @@
   "lockEscrowLocktime": "Pod\u00e9s recuperarlo tras {days} d\u00edas",
   "cashuLastTokenPending": "Exportaste un token. Es dinero hasta que alguien lo canjee: guardalo hasta estar seguro de que lleg\u00f3.",
   "cashuShowLastToken": "Mostrarlo de nuevo",
-  "cashuLastTokenDone": "Ya lo envi\u00e9"}
+  "cashuLastTokenDone": "Ya lo envi\u00e9",
+  "lockEscrowRequestMissing": "Esta operaci\u00f3n todav\u00eda no tiene pedido de custodia. Esper\u00e1 a que llegue la toma del comprador e intent\u00e1 de nuevo.",
+  "lockEscrowWrongTradeKey": "Este dispositivo no tiene la clave con la que se tom\u00f3 esta orden. Restaur\u00e1 tu cuenta en el dispositivo donde empezaste la operaci\u00f3n.",
+  "lockEscrowLocktimeNotReached": "La custodia sigue bloqueada. Vas a poder recuperarla vos mismo cuando pase el locktime.",
+  "lockEscrowClockInvalid": "El reloj de tu dispositivo est\u00e1 mal, as\u00ed que la custodia no se puede fechar bien. Correg\u00ed la fecha e intent\u00e1 de nuevo.",
+  "lockEscrowRetry": "Reintentar env\u00edo",
+  "lockEscrowPendingSubmission": "Tu custodia est\u00e1 bloqueada pero el nodo no la confirm\u00f3. Reintentar es seguro: no se bloquea una segunda vez."
+}

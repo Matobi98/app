@@ -2560,4 +2560,27 @@ class AppLocalizationsIt extends AppLocalizations {
 
   @override
   String get cashuLastTokenDone => 'L\'ho inviato';
+
+  @override
+  String get lockEscrowRequestMissing =>
+      'Questo scambio non ha ancora una richiesta di deposito. Attendi che arrivi la presa dell\'acquirente e riprova.';
+
+  @override
+  String get lockEscrowWrongTradeKey =>
+      'Questo dispositivo non ha la chiave con cui è stato preso questo ordine. Ripristina il tuo account sul dispositivo da cui hai iniziato lo scambio.';
+
+  @override
+  String get lockEscrowLocktimeNotReached =>
+      'Il deposito è ancora bloccato. Potrai recuperarlo tu stesso una volta scaduto il blocco.';
+
+  @override
+  String get lockEscrowClockInvalid =>
+      'L\'orologio del tuo dispositivo è errato, quindi il deposito non può essere datato correttamente. Correggi la data e riprova.';
+
+  @override
+  String get lockEscrowRetry => 'Riprova l\'invio';
+
+  @override
+  String get lockEscrowPendingSubmission =>
+      'Il tuo deposito è bloccato ma il nodo non lo ha confermato. Riprovare è sicuro: non verrà bloccato una seconda volta.';
 }

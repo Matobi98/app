@@ -2568,4 +2568,27 @@ class AppLocalizationsFr extends AppLocalizations {
 
   @override
   String get cashuLastTokenDone => 'Je l\'ai envoyé';
+
+  @override
+  String get lockEscrowRequestMissing =>
+      'Cet échange n\'a pas encore de demande de séquestre. Attendez que la prise de l\'acheteur arrive, puis réessayez.';
+
+  @override
+  String get lockEscrowWrongTradeKey =>
+      'Cet appareil ne détient pas la clé avec laquelle cet ordre a été pris. Restaurez votre compte sur l\'appareil où vous avez commencé l\'échange.';
+
+  @override
+  String get lockEscrowLocktimeNotReached =>
+      'Le séquestre est encore verrouillé. Vous pourrez le récupérer vous-même une fois le verrou expiré.';
+
+  @override
+  String get lockEscrowClockInvalid =>
+      'L\'horloge de votre appareil est incorrecte, le séquestre ne peut donc pas être daté correctement. Corrigez la date et réessayez.';
+
+  @override
+  String get lockEscrowRetry => 'Réessayer l\'envoi';
+
+  @override
+  String get lockEscrowPendingSubmission =>
+      'Votre séquestre est verrouillé mais le nœud ne l\'a pas confirmé. Réessayer est sans risque : il ne sera pas verrouillé une seconde fois.';
 }

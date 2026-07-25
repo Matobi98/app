@@ -48,7 +48,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.11.1";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 367219669;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1169277549;
 
 // Section: executor
 
@@ -4702,6 +4702,39 @@ fn wire__crate__api__orders__take_order_impl(
         },
     )
 }
+fn wire__crate__api__orders__trade_pubkeys_default_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "trade_pubkeys_default",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, ()>((move || {
+                    let output_ok =
+                        Result::<_, ()>::Ok(crate::api::orders::TradePubkeys::default())?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
 
 // Section: related_funcs
 
@@ -6138,6 +6171,8 @@ impl SseDecode for crate::api::types::TradeInfo {
         let mut var_startedAt = <i64>::sse_decode(deserializer);
         let mut var_completedAt = <Option<i64>>::sse_decode(deserializer);
         let mut var_outcome = <Option<crate::api::types::TradeOutcome>>::sse_decode(deserializer);
+        let mut var_buyerTradePubkey = <Option<String>>::sse_decode(deserializer);
+        let mut var_sellerTradePubkey = <Option<String>>::sse_decode(deserializer);
         let mut var_cashuMintUrl = <Option<String>>::sse_decode(deserializer);
         let mut var_cashuEscrowToken = <Option<String>>::sse_decode(deserializer);
         let mut var_cashuLockedAt = <Option<i64>>::sse_decode(deserializer);
@@ -6155,6 +6190,8 @@ impl SseDecode for crate::api::types::TradeInfo {
             started_at: var_startedAt,
             completed_at: var_completedAt,
             outcome: var_outcome,
+            buyer_trade_pubkey: var_buyerTradePubkey,
+            seller_trade_pubkey: var_sellerTradePubkey,
             cashu_mint_url: var_cashuMintUrl,
             cashu_escrow_token: var_cashuEscrowToken,
             cashu_locked_at: var_cashuLockedAt,
@@ -6185,6 +6222,18 @@ impl SseDecode for crate::api::types::TradeOutcome {
             3 => crate::api::types::TradeOutcome::DisputeWon,
             4 => crate::api::types::TradeOutcome::DisputeLost,
             _ => unreachable!("Invalid variant for TradeOutcome: {}", inner),
+        };
+    }
+}
+
+impl SseDecode for crate::api::orders::TradePubkeys {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_buyer = <Option<String>>::sse_decode(deserializer);
+        let mut var_seller = <Option<String>>::sse_decode(deserializer);
+        return crate::api::orders::TradePubkeys {
+            buyer: var_buyer,
+            seller: var_seller,
         };
     }
 }
@@ -6571,6 +6620,9 @@ fn pde_ffi_dispatcher_primary_impl(
         114 => wire__crate__api__reputation__submit_rating_impl(port, ptr, rust_vec_len, data_len),
         115 => wire__crate__api__orders__subscribe_orders_impl(port, ptr, rust_vec_len, data_len),
         116 => wire__crate__api__orders__take_order_impl(port, ptr, rust_vec_len, data_len),
+        117 => {
+            wire__crate__api__orders__trade_pubkeys_default_impl(port, ptr, rust_vec_len, data_len)
+        }
         _ => unreachable!(),
     }
 }
@@ -7702,6 +7754,8 @@ impl flutter_rust_bridge::IntoDart for crate::api::types::TradeInfo {
             self.started_at.into_into_dart().into_dart(),
             self.completed_at.into_into_dart().into_dart(),
             self.outcome.into_into_dart().into_dart(),
+            self.buyer_trade_pubkey.into_into_dart().into_dart(),
+            self.seller_trade_pubkey.into_into_dart().into_dart(),
             self.cashu_mint_url.into_into_dart().into_dart(),
             self.cashu_escrow_token.into_into_dart().into_dart(),
             self.cashu_locked_at.into_into_dart().into_dart(),
@@ -7759,6 +7813,27 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::types::TradeOutcome>
     for crate::api::types::TradeOutcome
 {
     fn into_into_dart(self) -> crate::api::types::TradeOutcome {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::orders::TradePubkeys {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.buyer.into_into_dart().into_dart(),
+            self.seller.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::orders::TradePubkeys
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::orders::TradePubkeys>
+    for crate::api::orders::TradePubkeys
+{
+    fn into_into_dart(self) -> crate::api::orders::TradePubkeys {
         self
     }
 }
@@ -9037,6 +9112,8 @@ impl SseEncode for crate::api::types::TradeInfo {
         <i64>::sse_encode(self.started_at, serializer);
         <Option<i64>>::sse_encode(self.completed_at, serializer);
         <Option<crate::api::types::TradeOutcome>>::sse_encode(self.outcome, serializer);
+        <Option<String>>::sse_encode(self.buyer_trade_pubkey, serializer);
+        <Option<String>>::sse_encode(self.seller_trade_pubkey, serializer);
         <Option<String>>::sse_encode(self.cashu_mint_url, serializer);
         <Option<String>>::sse_encode(self.cashu_escrow_token, serializer);
         <Option<i64>>::sse_encode(self.cashu_locked_at, serializer);
@@ -9067,6 +9144,14 @@ impl SseEncode for crate::api::types::TradeOutcome {
             },
             serializer,
         );
+    }
+}
+
+impl SseEncode for crate::api::orders::TradePubkeys {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <Option<String>>::sse_encode(self.buyer, serializer);
+        <Option<String>>::sse_encode(self.seller, serializer);
     }
 }
 

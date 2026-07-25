@@ -2531,4 +2531,27 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get cashuLastTokenDone => 'I\'ve sent it';
+
+  @override
+  String get lockEscrowRequestMissing =>
+      'This trade has no escrow request yet. Wait for the buyer\'s take to arrive, then try again.';
+
+  @override
+  String get lockEscrowWrongTradeKey =>
+      'This device does not hold the key this order was taken with. Restore your account on the device you started the trade on.';
+
+  @override
+  String get lockEscrowLocktimeNotReached =>
+      'The escrow is still locked. You can reclaim it yourself once the locktime passes.';
+
+  @override
+  String get lockEscrowClockInvalid =>
+      'Your device\'s clock is wrong, so the escrow cannot be timed correctly. Fix the date and try again.';
+
+  @override
+  String get lockEscrowRetry => 'Retry sending';
+
+  @override
+  String get lockEscrowPendingSubmission =>
+      'Your escrow is locked but the node has not confirmed it. Retrying is safe — it will not lock a second time.';
 }

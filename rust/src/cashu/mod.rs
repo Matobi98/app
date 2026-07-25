@@ -113,7 +113,7 @@ impl CashuWallet {
     pub async fn build_fee_token(
         &self,
         _amount_sats: u64,
-        _mostro: escrow::CashuPublicKey,
+        _mostro: &escrow::CashuPublicKey,
     ) -> anyhow::Result<String> {
         anyhow::bail!("CashuUnsupportedOnWeb")
     }

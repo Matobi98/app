@@ -267,11 +267,21 @@ pub async fn cashu_escrow_quote(order_id: String) -> Result<crate::api::types::C
     let fee_sats = crate::mostro::node_fee::total_fee_sats(amount_sats, fraction);
 
     let resolved = escrow_mode::get_resolved();
+
+    // Connect before reading the balance. An unconnected wallet reports zero,
+    // and a quote that reports zero turns into "insufficient funds" on a wallet
+    // that is fully funded — the screen connects first, but a retry from
+    // anywhere else would not.
+    cashu_connect().await?;
+
     let balance = {
         let guard = wallet_lock().read().await;
         match guard.as_ref() {
-            Some(wallet) => wallet.balance().await.unwrap_or(0),
-            None => 0,
+            Some(wallet) => wallet
+                .balance()
+                .await
+                .map_err(|e| anyhow::anyhow!("CashuBalanceUnknown: {e}"))?,
+            None => bail!("CashuNotConnected"),
         }
     };
 
@@ -337,7 +347,25 @@ pub async fn lock_escrow(order_id: String) -> Result<crate::api::types::CashuEsc
     let mostro_pubkey = nostr_sdk::PublicKey::from_hex(&mostro_hex)?;
 
     let seller_hex = seller_keys.public_key().to_hex();
-    let buyer_hex = trade.counterparty_pubkey.clone();
+
+    // The daemon re-derives {P_B, P_S, P_M} from the order and rejects a proof
+    // that names any others, so these must be the per-order **trade** keys it
+    // stated in the escrow request. `counterparty_pubkey` is not that: it holds
+    // the maker's order-book key for a taker, and nothing at all for a maker.
+    let buyer_hex = trade
+        .buyer_trade_pubkey
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("CashuEscrowRequestMissing"))?;
+
+    // The daemon also checks the seller key against the order. If the trade key
+    // this device would sign with is not the one it recorded, the escrow would
+    // be locked to a key nobody here holds — worse than a rejection, because
+    // the swap happens first.
+    if let Some(expected) = trade.seller_trade_pubkey.as_deref() {
+        if expected != seller_hex {
+            bail!("CashuWrongTradeKey: order expects {expected}, this device holds {seller_hex}");
+        }
+    }
 
     let parties = crate::cashu::escrow::EscrowParties::from_xonly_hex(
         &buyer_hex,
@@ -345,18 +373,29 @@ pub async fn lock_escrow(order_id: String) -> Result<crate::api::types::CashuEsc
         &mostro_hex,
     )?;
 
-    // The daemon enforces a floor of `now + escrow_locktime_days` and accepts
-    // anything longer. Matching the floor exactly is the shortest lock it will
-    // take, which is also the soonest the seller can recover funds if Mostro
-    // disappears — so it is the right default rather than a conservative one.
-    let locktime = now_secs()
-        .saturating_add(u64::from(quote.locktime_days).saturating_mul(SECONDS_PER_DAY));
+    // The daemon's floor is `now + escrow_locktime_days` evaluated when it
+    // *validates* the submission, which is strictly later than our `now` by the
+    // publish and propagation delay. Matching the floor exactly would make every
+    // lock a race against the network, with the funds already swapped by the
+    // time it is lost.
+    let locktime = now_secs()?
+        .saturating_add(u64::from(quote.locktime_days).saturating_mul(SECONDS_PER_DAY))
+        .saturating_add(LOCKTIME_SUBMISSION_MARGIN_SECS);
 
     let (escrow_token, fee_token) = {
         let guard = wallet_lock().read().await;
         let wallet = guard
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("CashuNotConnected"))?;
+
+        // Fee first. Both tokens are irreversible once built, and the fee is the
+        // smaller of the two: if the wallet cannot cover both after mint-side
+        // fees, failing here strands a few satoshis instead of the whole escrow.
+        let fee = if quote.fee_sats > 0 {
+            Some(wallet.build_fee_token(quote.fee_sats, &parties.mostro).await?)
+        } else {
+            None
+        };
 
         let escrow = wallet
             .build_escrow_token(quote.amount_sats, &parties, locktime)
@@ -369,11 +408,6 @@ pub async fn lock_escrow(order_id: String) -> Result<crate::api::types::CashuEsc
             .verify_escrow_token(&escrow, &parties, quote.amount_sats, locktime)
             .await?;
 
-        let fee = if quote.fee_sats > 0 {
-            Some(wallet.build_fee_token(quote.fee_sats, parties.mostro).await?)
-        } else {
-            None
-        };
         (escrow, fee)
     };
 
@@ -406,7 +440,7 @@ pub async fn lock_escrow(order_id: String) -> Result<crate::api::types::CashuEsc
         let mut updated = trade.clone();
         updated.cashu_mint_url = Some(quote.mint_url.clone());
         updated.cashu_escrow_token = Some(escrow_token);
-        updated.cashu_locked_at = Some(now_secs() as i64);
+        updated.cashu_locked_at = now_secs().ok().map(|t| t as i64);
         if let Err(e) = db.save_trade(&updated).await {
             log::error!("[cashu] escrow locked but not persisted for {order_id}: {e}");
         }
@@ -421,11 +455,21 @@ pub async fn lock_escrow(order_id: String) -> Result<crate::api::types::CashuEsc
 
 const SECONDS_PER_DAY: u64 = 86_400;
 
-fn now_secs() -> u64 {
+/// Added on top of the daemon's locktime floor to absorb the delay between
+/// building the token and the daemon validating it. An hour is invisible to a
+/// seller and orders of magnitude larger than relay propagation.
+const LOCKTIME_SUBMISSION_MARGIN_SECS: u64 = 3_600;
+
+/// Seconds since the unix epoch.
+///
+/// A clock before the epoch is an error rather than `0`: substituting zero
+/// would build a locktime in 1970 and surface much later as an unexplained
+/// `InvalidEscrowConditions`.
+fn now_secs() -> Result<u64> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_err(|_| anyhow::anyhow!("DeviceClockInvalid: system time is before 1970"))
 }
 
 async fn load_trade(order_id: &str) -> Result<crate::api::types::TradeInfo> {
@@ -532,6 +576,96 @@ mod tests {
         // Assert
         let status = stream.next().await.unwrap();
         assert!(!status.connected);
+    }
+
+    /// A trade as the app stores it, with the two fields that decide whether an
+    /// escrow can be built at all.
+    fn seller_trade(
+        order_id: &str,
+        buyer_trade_pubkey: Option<&str>,
+        counterparty_pubkey: &str,
+    ) -> crate::api::types::TradeInfo {
+        use crate::api::types::*;
+        TradeInfo {
+            id: order_id.to_string(),
+            order: OrderInfo {
+                id: order_id.to_string(),
+                kind: OrderKind::Buy,
+                status: OrderStatus::WaitingPayment,
+                amount_sats: Some(10_000),
+                fiat_amount: None,
+                fiat_amount_min: None,
+                fiat_amount_max: None,
+                fiat_code: "USD".to_string(),
+                payment_method: "cash".to_string(),
+                premium: 0.0,
+                creator_pubkey: counterparty_pubkey.to_string(),
+                created_at: 0,
+                expires_at: None,
+                is_mine: false,
+            },
+            role: TradeRole::Seller,
+            counterparty_pubkey: counterparty_pubkey.to_string(),
+            current_step: TradeStep::Seller(SellerStep::TakerFound),
+            hold_invoice: None,
+            buyer_invoice: None,
+            trade_key_index: 1,
+            cooperative_cancel_state: None,
+            timeout_at: None,
+            started_at: 0,
+            completed_at: None,
+            outcome: None,
+            buyer_trade_pubkey: buyer_trade_pubkey.map(str::to_string),
+            seller_trade_pubkey: None,
+            cashu_mint_url: None,
+            cashu_escrow_token: None,
+            cashu_locked_at: None,
+        }
+    }
+
+    #[test]
+    fn the_buyer_key_comes_from_the_escrow_request_not_the_order_book() {
+        // Arrange — a maker seller has no counterparty pubkey at all, and a
+        // taker seller's is the maker's *order-book* key. Neither is the
+        // per-order trade key the daemon locks the escrow to, and building an
+        // escrow from either produces a token the buyer cannot spend.
+        let order_book_key =
+            "82fa8cb978b43c79b2156585bac2c011176a21d2aead6d9f7c575c005be88390";
+        let trade_key = "0000000000000000000000000000000000000000000000000000000000000001";
+
+        let maker = seller_trade("order-1", None, "");
+        let taker = seller_trade("order-2", None, order_book_key);
+        let ready = seller_trade("order-3", Some(trade_key), order_book_key);
+
+        // Assert — the field the escrow must be built from is populated only by
+        // the daemon's escrow request.
+        assert_eq!(maker.buyer_trade_pubkey, None);
+        assert_eq!(taker.buyer_trade_pubkey, None);
+        assert_eq!(ready.buyer_trade_pubkey.as_deref(), Some(trade_key));
+
+        // And it is not the order-book key, which is what the first version of
+        // this flow used.
+        assert_ne!(ready.buyer_trade_pubkey.as_deref(), Some(order_book_key));
+    }
+
+    #[test]
+    fn the_locktime_clears_the_daemons_floor() {
+        // Arrange — the daemon's floor is `now + locktime_days`, evaluated when
+        // it validates, which is later than ours by the publish delay.
+        let days = 15u32;
+        let ours = now_secs().unwrap()
+            + u64::from(days) * SECONDS_PER_DAY
+            + LOCKTIME_SUBMISSION_MARGIN_SECS;
+
+        // Act — the daemon evaluates its floor some time later.
+        let daemon_floor_later = now_secs().unwrap() + 60 + u64::from(days) * SECONDS_PER_DAY;
+
+        // Assert — still above it. Matching the floor exactly made every lock a
+        // race against the network, lost with the funds already swapped.
+        assert!(
+            ours > daemon_floor_later,
+            "locktime {ours} must clear a floor evaluated a minute later ({daemon_floor_later})"
+        );
     }
 
     #[test]

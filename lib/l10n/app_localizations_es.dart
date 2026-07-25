@@ -2557,4 +2557,27 @@ class AppLocalizationsEs extends AppLocalizations {
 
   @override
   String get cashuLastTokenDone => 'Ya lo envié';
+
+  @override
+  String get lockEscrowRequestMissing =>
+      'Esta operación todavía no tiene pedido de custodia. Esperá a que llegue la toma del comprador e intentá de nuevo.';
+
+  @override
+  String get lockEscrowWrongTradeKey =>
+      'Este dispositivo no tiene la clave con la que se tomó esta orden. Restaurá tu cuenta en el dispositivo donde empezaste la operación.';
+
+  @override
+  String get lockEscrowLocktimeNotReached =>
+      'La custodia sigue bloqueada. Vas a poder recuperarla vos mismo cuando pase el locktime.';
+
+  @override
+  String get lockEscrowClockInvalid =>
+      'El reloj de tu dispositivo está mal, así que la custodia no se puede fechar bien. Corregí la fecha e intentá de nuevo.';
+
+  @override
+  String get lockEscrowRetry => 'Reintentar envío';
+
+  @override
+  String get lockEscrowPendingSubmission =>
+      'Tu custodia está bloqueada pero el nodo no la confirmó. Reintentar es seguro: no se bloquea una segunda vez.';
 }

@@ -2566,4 +2566,27 @@ class AppLocalizationsDe extends AppLocalizations {
 
   @override
   String get cashuLastTokenDone => 'Ich habe es gesendet';
+
+  @override
+  String get lockEscrowRequestMissing =>
+      'Für diesen Handel gibt es noch keine Treuhand-Anfrage. Warte, bis die Annahme des Käufers eintrifft, und versuche es erneut.';
+
+  @override
+  String get lockEscrowWrongTradeKey =>
+      'Dieses Gerät hat nicht den Schlüssel, mit dem diese Order angenommen wurde. Stelle dein Konto auf dem Gerät wieder her, auf dem du den Handel begonnen hast.';
+
+  @override
+  String get lockEscrowLocktimeNotReached =>
+      'Die Treuhand ist noch gesperrt. Nach Ablauf der Sperrfrist kannst du sie selbst zurückholen.';
+
+  @override
+  String get lockEscrowClockInvalid =>
+      'Die Uhr deines Geräts geht falsch, daher lässt sich die Treuhand nicht korrekt datieren. Korrigiere das Datum und versuche es erneut.';
+
+  @override
+  String get lockEscrowRetry => 'Senden erneut versuchen';
+
+  @override
+  String get lockEscrowPendingSubmission =>
+      'Deine Treuhand ist gesperrt, aber der Node hat sie nicht bestätigt. Ein erneuter Versuch ist sicher — es wird kein zweites Mal gesperrt.';
 }

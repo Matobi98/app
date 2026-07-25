@@ -4513,6 +4513,42 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'I\'ve sent it'**
   String get cashuLastTokenDone;
+
+  /// Escrow error — the daemon has not sent the escrow request, so the buyer trade key is unknown
+  ///
+  /// In en, this message translates to:
+  /// **'This trade has no escrow request yet. Wait for the buyer\'s take to arrive, then try again.'**
+  String get lockEscrowRequestMissing;
+
+  /// Escrow error — the stored seller trade key does not match this device
+  ///
+  /// In en, this message translates to:
+  /// **'This device does not hold the key this order was taken with. Restore your account on the device you started the trade on.'**
+  String get lockEscrowWrongTradeKey;
+
+  /// Escrow error — a refund was attempted before the locktime expired
+  ///
+  /// In en, this message translates to:
+  /// **'The escrow is still locked. You can reclaim it yourself once the locktime passes.'**
+  String get lockEscrowLocktimeNotReached;
+
+  /// Escrow error — the system clock is before 1970
+  ///
+  /// In en, this message translates to:
+  /// **'Your device\'s clock is wrong, so the escrow cannot be timed correctly. Fix the date and try again.'**
+  String get lockEscrowClockInvalid;
+
+  /// Escrow screen — resubmits an escrow that was locked but whose message did not reach the node
+  ///
+  /// In en, this message translates to:
+  /// **'Retry sending'**
+  String get lockEscrowRetry;
+
+  /// Escrow screen — shown when a token exists locally but the submission may not have arrived
+  ///
+  /// In en, this message translates to:
+  /// **'Your escrow is locked but the node has not confirmed it. Retrying is safe — it will not lock a second time.'**
+  String get lockEscrowPendingSubmission;
 }
 
 class _AppLocalizationsDelegate

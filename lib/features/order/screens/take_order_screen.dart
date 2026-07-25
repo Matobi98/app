@@ -135,9 +135,14 @@ class _TakeOrderScreenState extends ConsumerState<TakeOrderScreen> {
 
       // In Cashu mode the flow after a take differs on both sides: there is no
       // buyer invoice step at all, and the seller locks an escrow instead of
-      // paying a hold invoice. `isCashuAvailable` is false on every Lightning
-      // node, so this branch simply does not exist there.
-      if (ref.read(isCashuAvailableProvider)) {
+      // paying a hold invoice.
+      //
+      // Awaited, not `read`: the provider is `AsyncLoading` for the first
+      // moments after launch, and a plain read would answer "not Cashu" and
+      // route a seller to a hold invoice that is never coming.
+      final escrowMode = await ref.read(escrowModeProvider.future);
+      if (!mounted) return;
+      if (escrowMode.isCashuAvailable) {
         if (widget.isBuying) {
           context.go(AppRoute.tradeDetailPath(widget.orderId));
         } else {

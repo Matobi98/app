@@ -15,13 +15,19 @@ use std::sync::RwLock;
 /// before the first successful fetch.
 static FEE: RwLock<Option<f64>> = RwLock::new(None);
 
+/// Anything above this is a malformed tag, not a business decision.
+const MAX_FEE_FRACTION: f64 = 1.0;
+
 /// Record the fee fraction the node advertises.
 ///
 /// Anything not finite or negative is discarded rather than stored: a garbage
 /// fee would silently produce a fee token the daemon rejects, and the seller
 /// would see a lock failure with no clue why.
 pub fn set_fee(fraction: f64) {
-    if !fraction.is_finite() || fraction < 0.0 {
+    // Upper bound as well as lower: a malformed tag of `2.0` would be read as
+    // 200% and produce a fee token larger than the escrow it accompanies.
+    // No plausible node charges more than the whole amount.
+    if !fraction.is_finite() || !(0.0..=MAX_FEE_FRACTION).contains(&fraction) {
         log::warn!("[node-fee] ignoring malformed fee fraction: {fraction}");
         return;
     }
@@ -98,7 +104,8 @@ mod tests {
         set_fee(0.006);
 
         // Act / Assert — each bad value leaves the last good one in place.
-        for bad in [f64::NAN, f64::INFINITY, -0.01] {
+        // `2.0` is 200%: a fee token twice the escrow, which no node charges.
+        for bad in [f64::NAN, f64::INFINITY, -0.01, 2.0] {
             set_fee(bad);
             assert_eq!(get_fee(), Some(0.006), "{bad} must not be stored");
         }

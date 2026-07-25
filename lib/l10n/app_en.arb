@@ -1659,4 +1659,17 @@
   "cashuShowLastToken": "Show it again",
   "@cashuShowLastToken": {"description": "Cashu wallet \u2014 re-opens the last exported token"},
   "cashuLastTokenDone": "I've sent it",
-  "@cashuLastTokenDone": {"description": "Cashu wallet \u2014 clears the exported-token reminder"}}
+  "@cashuLastTokenDone": {"description": "Cashu wallet \u2014 clears the exported-token reminder"},
+  "lockEscrowRequestMissing": "This trade has no escrow request yet. Wait for the buyer's take to arrive, then try again.",
+  "@lockEscrowRequestMissing": {"description": "Escrow error \u2014 the daemon has not sent the escrow request, so the buyer trade key is unknown"},
+  "lockEscrowWrongTradeKey": "This device does not hold the key this order was taken with. Restore your account on the device you started the trade on.",
+  "@lockEscrowWrongTradeKey": {"description": "Escrow error \u2014 the stored seller trade key does not match this device"},
+  "lockEscrowLocktimeNotReached": "The escrow is still locked. You can reclaim it yourself once the locktime passes.",
+  "@lockEscrowLocktimeNotReached": {"description": "Escrow error \u2014 a refund was attempted before the locktime expired"},
+  "lockEscrowClockInvalid": "Your device's clock is wrong, so the escrow cannot be timed correctly. Fix the date and try again.",
+  "@lockEscrowClockInvalid": {"description": "Escrow error \u2014 the system clock is before 1970"},
+  "lockEscrowRetry": "Retry sending",
+  "@lockEscrowRetry": {"description": "Escrow screen \u2014 resubmits an escrow that was locked but whose message did not reach the node"},
+  "lockEscrowPendingSubmission": "Your escrow is locked but the node has not confirmed it. Retrying is safe \u2014 it will not lock a second time.",
+  "@lockEscrowPendingSubmission": {"description": "Escrow screen \u2014 shown when a token exists locally but the submission may not have arrived"}
+}

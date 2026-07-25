@@ -4,6 +4,7 @@ import 'package:go_router/go_router.dart';
 
 import 'package:mostro/core/app_routes.dart';
 import 'package:mostro/core/app_theme.dart';
+import 'package:mostro/features/cashu/cashu_error_messages.dart';
 import 'package:mostro/features/cashu/providers/cashu_wallet_provider.dart';
 import 'package:mostro/l10n/app_localizations.dart';
 import 'package:mostro/src/rust/api/types.dart';
@@ -30,6 +31,15 @@ class _LockEscrowScreenState extends ConsumerState<LockEscrowScreen> {
   CashuEscrowQuote? _quote;
   String? _error;
   bool _locking = false;
+
+  /// True once a lock attempt has swapped funds at the mint but the submission
+  /// may not have reached the node.
+  ///
+  /// The token is persisted before the publish result is checked, and the
+  /// daemon's handler is idempotent on a re-submission — so retrying is both
+  /// safe and the only way out of a lost publish. Without this the seller is
+  /// left with locked funds and a trade that looks stuck.
+  bool _needsRetry = false;
 
   @override
   void initState() {
@@ -66,32 +76,26 @@ class _LockEscrowScreenState extends ConsumerState<LockEscrowScreen> {
         setState(() {
           _locking = false;
           _error = e.toString();
+          // Anything past the mint swap leaves a token behind. The markers
+          // below are raised *before* it, so those are clean failures.
+          _needsRetry = !_isPreLockFailure(e.toString());
         });
       }
     }
   }
 
-  /// Rust markers → localized text. An unknown marker falls back to the generic
-  /// message, so an internal string never reaches the user.
-  String _message(String raw, AppLocalizations l10n) {
-    if (raw.contains('CashuInsufficientFunds')) {
-      return l10n.lockEscrowInsufficientFunds;
-    }
-    if (raw.contains('CashuNodeFeeUnknown')) return l10n.lockEscrowFeeUnknown;
-    if (raw.contains('CashuNotEnabled')) return l10n.cashuErrorNotEnabled;
-    if (raw.contains('CashuNotConnected')) return l10n.cashuErrorNotConnected;
-    if (raw.contains('CashuMintUnreachable')) {
-      return l10n.cashuErrorMintUnreachable;
-    }
-    if (raw.contains('CashuMintUnusable')) return l10n.cashuErrorMintUnusable;
-    if (raw.contains('CashuUnsupportedOnWeb')) {
-      return l10n.cashuErrorUnsupportedOnWeb;
-    }
-    if (raw.contains('NotTheSeller')) return l10n.lockEscrowNotTheSeller;
-    if (raw.contains('InvalidEscrowToken')) return l10n.lockEscrowInvalidToken;
-    if (raw.contains('CashuLockFailed')) return l10n.lockEscrowFailed;
-    return l10n.cashuErrorGeneric;
-  }
+  /// Failures raised before any funds move, so there is nothing to retry.
+  bool _isPreLockFailure(String raw) => const [
+        'CashuInsufficientFunds',
+        'CashuNodeFeeUnknown',
+        'CashuEscrowRequestMissing',
+        'CashuWrongTradeKey',
+        'CashuNotEnabled',
+        'CashuNotConnected',
+        'NotTheSeller',
+        'DeviceClockInvalid',
+        'InvalidEscrowParties',
+      ].any(raw.contains);
 
   @override
   Widget build(BuildContext context) {
@@ -140,10 +144,17 @@ class _LockEscrowScreenState extends ConsumerState<LockEscrowScreen> {
               style: TextStyle(color: colors.textSubtle, fontSize: 13),
             ),
           ],
+          if (_needsRetry) ...[
+            const SizedBox(height: AppSpacing.md),
+            Text(
+              l10n.lockEscrowPendingSubmission,
+              style: TextStyle(color: colors.textSubtle, fontSize: 13),
+            ),
+          ],
           if (_error != null) ...[
             const SizedBox(height: AppSpacing.md),
             Text(
-              _message(_error!, l10n),
+              cashuErrorMessage(_error!, l10n),
               style: TextStyle(color: colors.destructiveRed),
             ),
           ],
@@ -163,7 +174,9 @@ class _LockEscrowScreenState extends ConsumerState<LockEscrowScreen> {
                       width: 18,
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
-                  : Text(l10n.lockEscrowConfirm),
+                  : Text(_needsRetry
+                      ? l10n.lockEscrowRetry
+                      : l10n.lockEscrowConfirm),
             ),
         ],
       ),

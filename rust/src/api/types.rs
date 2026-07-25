@@ -248,6 +248,21 @@ pub struct TradeInfo {
     pub completed_at: Option<i64>,
     pub outcome: Option<TradeOutcome>,
 
+    /// The buyer's **per-order trade pubkey**, as the daemon stated it.
+    ///
+    /// Not the same as [`Self::counterparty_pubkey`], which holds the maker's
+    /// order-book key for a taker and nothing at all for a maker. The Cashu
+    /// escrow is locked to these keys, and the daemon re-derives them from the
+    /// order and rejects a proof that names any others — so this is the only
+    /// value that can be used to build one.
+    ///
+    /// `None` until the daemon sends a reply carrying an order payload.
+    #[serde(default)]
+    pub buyer_trade_pubkey: Option<String>,
+    /// The seller's per-order trade pubkey. See [`Self::buyer_trade_pubkey`].
+    #[serde(default)]
+    pub seller_trade_pubkey: Option<String>,
+
     // ── Cashu escrow (phase C5) ──────────────────────────────────────────────
     //
     // All `None` on a Lightning trade, and on every trade that predates this
