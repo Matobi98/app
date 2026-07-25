@@ -4220,6 +4220,180 @@ abstract class AppLocalizations {
   /// **'Effective mint: {mint}'**
   String settingsEscrowEffectiveMint(String mint);
 
+  /// Title of the embedded Cashu ecash wallet screen
+  ///
+  /// In en, this message translates to:
+  /// **'Cashu wallet'**
+  String get cashuWalletTitle;
+
+  /// Settings — subtitle of the Cashu wallet entry
+  ///
+  /// In en, this message translates to:
+  /// **'Hold ecash for trades on this node'**
+  String get cashuWalletSubtitle;
+
+  /// Cashu wallet — balance label
+  ///
+  /// In en, this message translates to:
+  /// **'Balance'**
+  String get cashuBalanceLabel;
+
+  /// Cashu wallet — the mint the wallet is connected to
+  ///
+  /// In en, this message translates to:
+  /// **'Mint: {mint}'**
+  String cashuMintLabel(String mint);
+
+  /// Cashu wallet — shown when the wallet could not bind to a mint
+  ///
+  /// In en, this message translates to:
+  /// **'Not connected to a mint'**
+  String get cashuNotConnected;
+
+  /// Cashu wallet — button that scans or pastes a token to redeem
+  ///
+  /// In en, this message translates to:
+  /// **'Receive'**
+  String get cashuReceiveButton;
+
+  /// Cashu wallet — button that exports ecash as a token
+  ///
+  /// In en, this message translates to:
+  /// **'Send'**
+  String get cashuSendButton;
+
+  /// Cashu wallet — placeholder in the token scanner
+  ///
+  /// In en, this message translates to:
+  /// **'Paste or scan a Cashu token'**
+  String get cashuReceiveHint;
+
+  /// Cashu wallet — amount field when exporting a token
+  ///
+  /// In en, this message translates to:
+  /// **'Amount in sats'**
+  String get cashuAmountLabel;
+
+  /// Cashu wallet — confirmation after redeeming a token
+  ///
+  /// In en, this message translates to:
+  /// **'Received {sats} sats'**
+  String cashuReceived(int sats);
+
+  /// Cashu wallet — confirmation after recovering proofs from an unredeemed token
+  ///
+  /// In en, this message translates to:
+  /// **'Reclaimed {sats} sats'**
+  String cashuReclaimed(int sats);
+
+  /// Cashu wallet — shown when the proof check found no funds to recover
+  ///
+  /// In en, this message translates to:
+  /// **'Nothing to reclaim'**
+  String get cashuNothingToReclaim;
+
+  /// Cashu wallet — button that reconciles proofs with the mint
+  ///
+  /// In en, this message translates to:
+  /// **'Check for unredeemed tokens'**
+  String get cashuCheckProofsButton;
+
+  /// Cashu wallet — title of the dialog showing an exported token
+  ///
+  /// In en, this message translates to:
+  /// **'Your token'**
+  String get cashuTokenTitle;
+
+  /// Cashu wallet — warning that an exported token is bearer money
+  ///
+  /// In en, this message translates to:
+  /// **'Anyone who redeems this token keeps the funds. Treat it like cash: send it once, to one person.'**
+  String get cashuTokenWarning;
+
+  /// Cashu wallet — copies the exported token to the clipboard
+  ///
+  /// In en, this message translates to:
+  /// **'Copy'**
+  String get cashuCopyToken;
+
+  /// Cashu wallet — confirmation after copying a token
+  ///
+  /// In en, this message translates to:
+  /// **'Token copied'**
+  String get cashuTokenCopied;
+
+  /// Cashu wallet — explanation of what the wallet is for
+  ///
+  /// In en, this message translates to:
+  /// **'This wallet holds ecash issued by the mint your Mostro node uses. It exists to fund and receive trades on that node — it is not a general-purpose wallet.'**
+  String get cashuWalletExplanation;
+
+  /// Cashu error — the active node is not a Cashu node
+  ///
+  /// In en, this message translates to:
+  /// **'This Mostro node does not settle trades with Cashu.'**
+  String get cashuErrorNotEnabled;
+
+  /// Cashu error — an operation was attempted before connecting
+  ///
+  /// In en, this message translates to:
+  /// **'The wallet is not connected to a mint yet.'**
+  String get cashuErrorNotConnected;
+
+  /// Cashu error — the mint did not answer
+  ///
+  /// In en, this message translates to:
+  /// **'Could not reach the mint. Check your connection and try again.'**
+  String get cashuErrorMintUnreachable;
+
+  /// Cashu error — the mint answered but lacks a required NUT or keyset
+  ///
+  /// In en, this message translates to:
+  /// **'This node\'s mint is missing features the escrow needs, so trading is not possible here.'**
+  String get cashuErrorMintUnusable;
+
+  /// Cashu error — the web build has no proof storage
+  ///
+  /// In en, this message translates to:
+  /// **'The Cashu wallet is not available on the web version yet.'**
+  String get cashuErrorUnsupportedOnWeb;
+
+  /// Cashu error — a zero or missing amount
+  ///
+  /// In en, this message translates to:
+  /// **'Enter an amount greater than zero.'**
+  String get cashuErrorAmountZero;
+
+  /// Cashu error — the requested amount exceeds the balance
+  ///
+  /// In en, this message translates to:
+  /// **'You only have {sats} sats.'**
+  String cashuErrorAmountTooLarge(int sats);
+
+  /// Cashu error — redeeming a token failed
+  ///
+  /// In en, this message translates to:
+  /// **'That token could not be redeemed. It may be from another mint, or already spent.'**
+  String get cashuErrorReceiveFailed;
+
+  /// Cashu error — exporting a token failed
+  ///
+  /// In en, this message translates to:
+  /// **'Could not create the token. You may not have enough funds.'**
+  String get cashuErrorSendFailed;
+
+  /// Cashu error — no identity is loaded, so no wallet seed exists
+  ///
+  /// In en, this message translates to:
+  /// **'Create or import an account before using the wallet.'**
+  String get cashuErrorNoIdentity;
+
+  /// Cashu error — fallback for an unrecognised failure
+  ///
+  /// In en, this message translates to:
+  /// **'Something went wrong with the wallet. Please try again.'**
+  String get cashuErrorGeneric;
+
   /// Settings — warning shown when Cashu mode is on but no mint is available, so no Cashu path can run
   ///
   /// In en, this message translates to:
