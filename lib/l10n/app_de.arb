@@ -213,6 +213,7 @@
 
   "cancelTradeDialogTitle": "Handel abbrechen?",
   "cancelTradeDialogContent": "Kooperativen Abbruch angefragt. Die andere Partei muss ebenfalls zustimmen, damit der Handel vollständig abgebrochen wird.",
+  "cancelBondBackoutDialogContent": "Abbrechen und Auftrag zurück ins Orderbuch legen? Es wurde keine Kaution gezahlt, die Gegenpartei ist daher nicht betroffen.",
   "noButtonLabel": "Nein",
   "yesButtonLabel": "Ja",
   "yesCancelButtonLabel": "Ja, abbrechen",

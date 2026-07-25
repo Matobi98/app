@@ -171,11 +171,18 @@ class _TradeDetailScreenState extends ConsumerState<TradeDetailScreen> {
 
   Future<void> _cancelOrder() async {
     final l10n = AppLocalizations.of(context);
+    // A back-out before the bond is paid is a unilateral cancel that returns the
+    // order to the book — not a cooperative cancel — so message it accordingly.
+    final isBondBackout =
+        ref.read(tradeStatusProvider(widget.orderId)).valueOrNull ==
+            OrderStatus.waitingTakerBond;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: Text(l10n.cancelTradeDialogTitle),
-        content: Text(l10n.cancelTradeDialogContent),
+        content: Text(isBondBackout
+            ? l10n.cancelBondBackoutDialogContent
+            : l10n.cancelTradeDialogContent),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
@@ -197,7 +204,11 @@ class _TradeDetailScreenState extends ConsumerState<TradeDetailScreen> {
       ref.invalidate(rawTradesProvider);
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(l10n.cancelRequestSent)),
+        SnackBar(
+          content: Text(isBondBackout
+              ? l10n.orderCancelledSuccess
+              : l10n.cancelRequestSent),
+        ),
       );
     } catch (e, st) {
       debugPrint('[TradeDetailScreen] cancelOrder error: $e\n$st');

@@ -58,7 +58,7 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: Text(l10n.cancelTradeDialogTitle),
-        content: Text(l10n.cancelTradeDialogContent),
+        content: Text(l10n.cancelBondBackoutDialogContent),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
@@ -76,7 +76,7 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
       await orders_api.cancelOrder(orderId: widget.orderId);
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(l10n.cancelRequestSent)),
+        SnackBar(content: Text(l10n.orderCancelledSuccess)),
       );
       context.go(AppRoute.home);
     } catch (e, st) {

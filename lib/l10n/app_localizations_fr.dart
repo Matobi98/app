@@ -664,6 +664,10 @@ class AppLocalizationsFr extends AppLocalizations {
       'Annulation coopérative demandée. L\'autre partie doit également accepter pour que l\'échange soit entièrement annulé.';
 
   @override
+  String get cancelBondBackoutDialogContent =>
+      'Annuler et remettre l\'ordre au carnet ? Aucune caution n\'a été payée, donc l\'autre partie n\'est pas affectée.';
+
+  @override
   String get noButtonLabel => 'Non';
 
   @override

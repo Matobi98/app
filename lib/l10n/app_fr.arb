@@ -213,6 +213,7 @@
 
   "cancelTradeDialogTitle": "Annuler l'échange ?",
   "cancelTradeDialogContent": "Annulation coopérative demandée. L'autre partie doit également accepter pour que l'échange soit entièrement annulé.",
+  "cancelBondBackoutDialogContent": "Annuler et remettre l'ordre au carnet ? Aucune caution n'a été payée, donc l'autre partie n'est pas affectée.",
   "noButtonLabel": "Non",
   "yesButtonLabel": "Oui",
   "yesCancelButtonLabel": "Oui, annuler",

@@ -661,6 +661,10 @@ class AppLocalizationsEs extends AppLocalizations {
       'Se solicita una cancelación cooperativa. La otra parte también debe aceptar para que el intercambio quede cancelado.';
 
   @override
+  String get cancelBondBackoutDialogContent =>
+      '¿Cancelar y devolver la orden al libro? No se pagó ninguna fianza, así que la otra parte no se ve afectada.';
+
+  @override
   String get noButtonLabel => 'No';
 
   @override

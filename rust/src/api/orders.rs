@@ -1300,11 +1300,21 @@ pub async fn release_order(order_id: String) -> Result<()> {
     Ok(())
 }
 
-/// Cancel an active trade cooperatively.
+/// Cancel a trade the local user is party to.
 ///
 /// Sends a `Cancel` MostroMessage signed with the trade key used when the order
-/// was taken.  Both parties must cancel for it to take effect; the Mostro daemon
-/// handles the cooperative-cancel state machine.
+/// was taken. The effect depends on how far the order has progressed:
+///
+/// - **Active / FiatSent** — a cooperative cancel: both parties must cancel for
+///   it to take effect and the Mostro daemon runs the cooperative-cancel state
+///   machine. The order is dropped from the local book optimistically.
+/// - **WaitingTakerBond / Pending** — a unilateral back-out before the taker has
+///   committed (no bond paid). The order is still `Pending` on the daemon, which
+///   simply returns it to the book without involving the counterparty. Because
+///   the public NIP-69 bucket never changed, no fresh Kind 38383 arrives to
+///   re-add the order during the session, so we reset its local book entry to
+///   `Pending` (available again) instead of removing it — otherwise it would
+///   only reappear after an app restart.
 pub async fn cancel_order(order_id: String) -> Result<()> {
     let trade_index = get_trade_key_index(&order_id)
         .await
@@ -1323,10 +1333,36 @@ pub async fn cancel_order(order_id: String) -> Result<()> {
     .await?;
     publish_event_json(&event_json).await?;
 
+    // Classify the cancel: a pre-commit back-out (taker has not paid a bond,
+    // order still Pending on the daemon) returns the order to the book, whereas
+    // a cooperative cancel of a committed trade drops it. The two need different
+    // optimistic book handling (see the fn doc).
+    let is_precommit = match crate::db::app_db::db() {
+        Some(db) => matches!(
+            db.get_trade_by_order_id(&order_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|t| t.order.status),
+            Some(OrderStatus::WaitingTakerBond) | Some(OrderStatus::Pending)
+        ),
+        None => false,
+    };
+
     // Optimistic update: mark the trade as Canceled in the local DB immediately
     // so the UI reflects the change without waiting for the daemon's gift-wrap
-    // response. Also remove the order from the in-memory order book.
-    order_book().remove_order(&order_id).await;
+    // response.
+    if is_precommit {
+        // Back-out before commitment: reset the book entry to Pending so the
+        // order shows as available again this session (no fresh Kind 38383 will
+        // re-add it — the public bucket was already Pending).
+        order_book()
+            .update_order_status(&order_id, OrderStatus::Pending)
+            .await;
+    } else {
+        // Cooperative cancel of a committed trade: drop it from the book.
+        order_book().remove_order(&order_id).await;
+    }
     if let Some(db) = crate::db::app_db::db() {
         if let Err(e) = db
             .update_trade_fields(
@@ -1341,7 +1377,9 @@ pub async fn cancel_order(order_id: String) -> Result<()> {
         }
     }
 
-    log::info!("[orders] cancel published for order={order_id} trade_index={trade_index}");
+    log::info!(
+        "[orders] cancel published for order={order_id} trade_index={trade_index} precommit={is_precommit}"
+    );
     Ok(())
 }
 

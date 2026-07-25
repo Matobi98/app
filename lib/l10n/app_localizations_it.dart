@@ -661,6 +661,10 @@ class AppLocalizationsIt extends AppLocalizations {
       'Annullamento cooperativo richiesto. Anche l\'altra parte deve accettare affinché lo scambio venga annullato.';
 
   @override
+  String get cancelBondBackoutDialogContent =>
+      'Annullare e rimettere l\'ordine nel book? Nessuna cauzione è stata pagata, quindi l\'altra parte non è interessata.';
+
+  @override
   String get noButtonLabel => 'No';
 
   @override

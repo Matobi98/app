@@ -650,6 +650,10 @@ class AppLocalizationsEn extends AppLocalizations {
       'Requesting a cooperative cancel. The other party must also agree for the trade to be fully cancelled.';
 
   @override
+  String get cancelBondBackoutDialogContent =>
+      'Cancel and return the order to the book? No bond has been paid, so the other party is not affected.';
+
+  @override
   String get noButtonLabel => 'No';
 
   @override

@@ -1286,6 +1286,12 @@ abstract class AppLocalizations {
   /// **'Requesting a cooperative cancel. The other party must also agree for the trade to be fully cancelled.'**
   String get cancelTradeDialogContent;
 
+  /// Body text for the cancel dialog when a taker backs out before paying the anti-abuse bond — a unilateral cancel that returns the order to the book
+  ///
+  /// In en, this message translates to:
+  /// **'Cancel and return the order to the book? No bond has been paid, so the other party is not affected.'**
+  String get cancelBondBackoutDialogContent;
+
   /// Negative button label in a confirmation dialog
   ///
   /// In en, this message translates to:

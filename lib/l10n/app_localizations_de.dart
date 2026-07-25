@@ -660,6 +660,10 @@ class AppLocalizationsDe extends AppLocalizations {
       'Kooperativen Abbruch angefragt. Die andere Partei muss ebenfalls zustimmen, damit der Handel vollständig abgebrochen wird.';
 
   @override
+  String get cancelBondBackoutDialogContent =>
+      'Abbrechen und Auftrag zurück ins Orderbuch legen? Es wurde keine Kaution gezahlt, die Gegenpartei ist daher nicht betroffen.';
+
+  @override
   String get noButtonLabel => 'Nein';
 
   @override

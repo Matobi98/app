@@ -449,6 +449,8 @@
   "@cancelTradeDialogTitle": {"description": "Title for the cancel-trade confirmation dialog"},
   "cancelTradeDialogContent": "Requesting a cooperative cancel. The other party must also agree for the trade to be fully cancelled.",
   "@cancelTradeDialogContent": {"description": "Body text for the cancel-trade confirmation dialog"},
+  "cancelBondBackoutDialogContent": "Cancel and return the order to the book? No bond has been paid, so the other party is not affected.",
+  "@cancelBondBackoutDialogContent": {"description": "Body text for the cancel dialog when a taker backs out before paying the anti-abuse bond — a unilateral cancel that returns the order to the book"},
   "noButtonLabel": "No",
   "yesButtonLabel": "Yes",
   "@noButtonLabel": {"description": "Negative button label in a confirmation dialog"},

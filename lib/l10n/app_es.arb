@@ -213,6 +213,7 @@
 
   "cancelTradeDialogTitle": "¿Cancelar intercambio?",
   "cancelTradeDialogContent": "Se solicita una cancelación cooperativa. La otra parte también debe aceptar para que el intercambio quede cancelado.",
+  "cancelBondBackoutDialogContent": "¿Cancelar y devolver la orden al libro? No se pagó ninguna fianza, así que la otra parte no se ve afectada.",
   "noButtonLabel": "No",
   "yesButtonLabel": "Sí",
   "yesCancelButtonLabel": "Sí, cancelar",
