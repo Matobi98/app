@@ -11,6 +11,7 @@ import 'package:mostro/core/app_theme.dart';
 import 'package:mostro/features/order/providers/trade_state_provider.dart';
 import 'package:mostro/features/settings/providers/nwc_provider.dart';
 import 'package:mostro/l10n/app_localizations.dart';
+import 'package:mostro/src/rust/api/orders.dart' as orders_api;
 import 'package:mostro/src/rust/api/types.dart' show OrderStatus;
 import 'package:mostro/shared/widgets/nwc_payment_widget.dart';
 
@@ -46,6 +47,45 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
   void _onPaymentDetected() {
     if (!mounted) return;
     setState(() => _waiting = true);
+  }
+
+  /// Back out of the take while the bond is unpaid. Sends a real cancel so the
+  /// daemon releases the bond (no slash) and returns the order to the book —
+  /// unlike a bare pop, which would strand the order at WaitingTakerBond.
+  Future<void> _confirmAndCancel() async {
+    final l10n = AppLocalizations.of(context);
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(l10n.cancelTradeDialogTitle),
+        content: Text(l10n.cancelTradeDialogContent),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text(l10n.noButtonLabel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text(l10n.yesCancelButtonLabel),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    try {
+      await orders_api.cancelOrder(orderId: widget.orderId);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(l10n.cancelRequestSent)),
+      );
+      context.go(AppRoute.home);
+    } catch (e, st) {
+      debugPrint('[PayBondInvoiceScreen] cancelOrder error: $e\n$st');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(l10n.cancelRequestFailed)),
+      );
+    }
   }
 
   @override
@@ -341,7 +381,7 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
                   SizedBox(
                     width: double.infinity,
                     child: OutlinedButton(
-                      onPressed: () => context.pop(),
+                      onPressed: _confirmAndCancel,
                       style: OutlinedButton.styleFrom(
                         foregroundColor:
                             colors?.destructiveRed ?? const Color(0xFFD84D4D),

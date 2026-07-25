@@ -616,6 +616,9 @@ class _TradeDetailScreenState extends ConsumerState<TradeDetailScreen> {
       TradeStatus.pending,
       TradeStatus.waitingInvoice,
       TradeStatus.waitingPayment,
+      // The taker can back out while the bond is unpaid; the daemon releases
+      // the bond (no slash) and returns the order to the book.
+      TradeStatus.waitingBond,
       TradeStatus.active,
       TradeStatus.fiatSent,
     }.contains(status) ||
