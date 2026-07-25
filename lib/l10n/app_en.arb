@@ -1653,5 +1653,10 @@
   "lockEscrowMint": "Mint: {mint}",
   "@lockEscrowMint": {"description": "Escrow screen \u2014 the mint the escrow is locked at", "placeholders": {"mint": {"type": "String"}}},
   "lockEscrowLocktime": "Reclaimable by you after {days} days",
-  "@lockEscrowLocktime": {"description": "Escrow screen \u2014 when the seller can unilaterally reclaim", "placeholders": {"days": {"type": "int"}}}
-}
+  "@lockEscrowLocktime": {"description": "Escrow screen \u2014 when the seller can unilaterally reclaim", "placeholders": {"days": {"type": "int"}}},
+  "cashuLastTokenPending": "You exported a token. It is money until someone redeems it \u2014 keep it until you are sure it arrived.",
+  "@cashuLastTokenPending": {"description": "Cashu wallet \u2014 reminder shown while an exported token has not been marked as handed over"},
+  "cashuShowLastToken": "Show it again",
+  "@cashuShowLastToken": {"description": "Cashu wallet \u2014 re-opens the last exported token"},
+  "cashuLastTokenDone": "I've sent it",
+  "@cashuLastTokenDone": {"description": "Cashu wallet \u2014 clears the exported-token reminder"}}

@@ -754,5 +754,7 @@
   "lockEscrowInvalidToken": "No se pudo construir la custodia correctamente. No se envi\u00f3 nada.",
   "lockEscrowFailed": "El mint no pudo bloquear la custodia. Tus fondos no se movieron.",
   "lockEscrowMint": "Mint: {mint}",
-  "lockEscrowLocktime": "Pod\u00e9s recuperarlo tras {days} d\u00edas"
-}
+  "lockEscrowLocktime": "Pod\u00e9s recuperarlo tras {days} d\u00edas",
+  "cashuLastTokenPending": "Exportaste un token. Es dinero hasta que alguien lo canjee: guardalo hasta estar seguro de que lleg\u00f3.",
+  "cashuShowLastToken": "Mostrarlo de nuevo",
+  "cashuLastTokenDone": "Ya lo envi\u00e9"}

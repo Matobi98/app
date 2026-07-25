@@ -2521,4 +2521,14 @@ class AppLocalizationsEn extends AppLocalizations {
   String lockEscrowLocktime(int days) {
     return 'Reclaimable by you after $days days';
   }
+
+  @override
+  String get cashuLastTokenPending =>
+      'You exported a token. It is money until someone redeems it — keep it until you are sure it arrived.';
+
+  @override
+  String get cashuShowLastToken => 'Show it again';
+
+  @override
+  String get cashuLastTokenDone => 'I\'ve sent it';
 }

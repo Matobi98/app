@@ -754,5 +754,7 @@
   "lockEscrowInvalidToken": "Le s\u00e9questre n'a pas pu \u00eatre construit correctement. Rien n'a \u00e9t\u00e9 envoy\u00e9.",
   "lockEscrowFailed": "Le mint n'a pas pu verrouiller le s\u00e9questre. Vos fonds n'ont pas boug\u00e9.",
   "lockEscrowMint": "Mint : {mint}",
-  "lockEscrowLocktime": "R\u00e9cup\u00e9rable par vous apr\u00e8s {days} jours"
-}
+  "lockEscrowLocktime": "R\u00e9cup\u00e9rable par vous apr\u00e8s {days} jours",
+  "cashuLastTokenPending": "Vous avez export\u00e9 un token. C'est de l'argent jusqu'\u00e0 ce que quelqu'un l'encaisse \u2014 gardez-le jusqu'\u00e0 confirmation.",
+  "cashuShowLastToken": "Le r\u00e9afficher",
+  "cashuLastTokenDone": "Je l'ai envoy\u00e9"}

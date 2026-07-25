@@ -35,11 +35,13 @@ class _FakeController extends CashuWalletController {
   Future<BigInt> checkProofsState() async => BigInt.zero;
 }
 
-CashuWalletStatus _status({required bool connected, required int balance}) {
+/// `balance: null` models an unreadable balance, which the screen must not
+/// render as zero.
+CashuWalletStatus _status({required bool connected, required int? balance}) {
   return CashuWalletStatus(
     connected: connected,
     mintUrl: connected ? 'https://mint.example.com' : null,
-    balanceSats: BigInt.from(balance),
+    balanceSats: balance == null ? null : BigInt.from(balance),
     missingCapabilities: const [],
   );
 }
@@ -82,7 +84,7 @@ void main() {
     testWidgets('a connected wallet shows its balance and mint', (tester) async {
       await _pump(tester, status: _status(connected: true, balance: 1234));
 
-      expect(find.text('1234 Satoshis'), findsOneWidget);
+      expect(find.text('1,234 Satoshis'), findsOneWidget);
       expect(find.text('Mint: https://mint.example.com'), findsOneWidget);
       expect(find.text('Not connected to a mint'), findsNothing);
     });
@@ -92,6 +94,53 @@ void main() {
 
       expect(find.text('Not connected to a mint'), findsOneWidget);
       expect(find.text('0 Satoshis'), findsOneWidget);
+    });
+
+    testWidgets('an unreadable balance renders as unknown, never as zero',
+        (tester) async {
+      // Ecash is bearer money: showing "0 Satoshis" for a failed read is the
+      // one number this screen must never invent.
+      await _pump(tester, status: _status(connected: true, balance: null));
+
+      expect(find.text('—'), findsOneWidget);
+      expect(find.text('0 Satoshis'), findsNothing);
+    });
+
+    testWidgets('sending is disabled while the balance is unknown',
+        (tester) async {
+      await _pump(tester, status: _status(connected: true, balance: null));
+
+      final send = tester.widget<OutlinedButton>(
+        find.ancestor(
+          of: find.text('Send'),
+          matching: find.byType(OutlinedButton),
+        ),
+      );
+      expect(send.onPressed, isNull);
+    });
+
+    testWidgets('an exported token stays retrievable until dismissed',
+        (tester) async {
+      // The dialog is not dismissible and the token survives it: losing the
+      // only copy of a token loses the funds.
+      await _pump(tester, status: _status(connected: true, balance: 100));
+
+      await tester.tap(find.text('Send'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField), '10');
+      await tester.tap(find.text('Confirm'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('cashuBtesttoken'), findsOneWidget);
+
+      // Close the dialog — the reminder and a way back to the token remain.
+      await tester.tap(find.text('Done'));
+      await tester.pumpAndSettle();
+      expect(find.text('Show it again'), findsOneWidget);
+
+      await tester.tap(find.text('Show it again'));
+      await tester.pumpAndSettle();
+      expect(find.text('cashuBtesttoken'), findsOneWidget);
     });
 
     testWidgets('sending is disabled with an empty wallet', (tester) async {

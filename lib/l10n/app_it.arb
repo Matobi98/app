@@ -754,5 +754,7 @@
   "lockEscrowInvalidToken": "Non \u00e8 stato possibile costruire il deposito correttamente. Non \u00e8 stato inviato nulla.",
   "lockEscrowFailed": "La mint non ha potuto bloccare il deposito. I tuoi fondi non si sono mossi.",
   "lockEscrowMint": "Mint: {mint}",
-  "lockEscrowLocktime": "Recuperabile da te dopo {days} giorni"
-}
+  "lockEscrowLocktime": "Recuperabile da te dopo {days} giorni",
+  "cashuLastTokenPending": "Hai esportato un token. \u00c8 denaro finch\u00e9 qualcuno non lo riscuote: conservalo finch\u00e9 non sei sicuro che sia arrivato.",
+  "cashuShowLastToken": "Mostralo di nuovo",
+  "cashuLastTokenDone": "L'ho inviato"}

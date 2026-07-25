@@ -2558,4 +2558,14 @@ class AppLocalizationsFr extends AppLocalizations {
   String lockEscrowLocktime(int days) {
     return 'Récupérable par vous après $days jours';
   }
+
+  @override
+  String get cashuLastTokenPending =>
+      'Vous avez exporté un token. C\'est de l\'argent jusqu\'à ce que quelqu\'un l\'encaisse — gardez-le jusqu\'à confirmation.';
+
+  @override
+  String get cashuShowLastToken => 'Le réafficher';
+
+  @override
+  String get cashuLastTokenDone => 'Je l\'ai envoyé';
 }

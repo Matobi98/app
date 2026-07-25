@@ -754,5 +754,7 @@
   "lockEscrowInvalidToken": "Die Treuhand konnte nicht korrekt erstellt werden. Es wurde nichts gesendet.",
   "lockEscrowFailed": "Die Mint konnte die Treuhand nicht sperren. Dein Geld wurde nicht bewegt.",
   "lockEscrowMint": "Mint: {mint}",
-  "lockEscrowLocktime": "Von dir r\u00fcckholbar nach {days} Tagen"
-}
+  "lockEscrowLocktime": "Von dir r\u00fcckholbar nach {days} Tagen",
+  "cashuLastTokenPending": "Du hast ein Token exportiert. Es ist Geld, bis jemand es einl\u00f6st \u2014 behalte es, bis du sicher bist, dass es angekommen ist.",
+  "cashuShowLastToken": "Erneut anzeigen",
+  "cashuLastTokenDone": "Ich habe es gesendet"}
