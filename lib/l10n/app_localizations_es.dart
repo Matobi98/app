@@ -2490,4 +2490,61 @@ class AppLocalizationsEs extends AppLocalizations {
   @override
   String get settingsEscrowCashuUnavailable =>
       'Cashu no puede funcionar sin un mint: configura uno abajo.';
+
+  @override
+  String get lockEscrowTitle => 'Bloquear la custodia';
+
+  @override
+  String get lockEscrowExplanation =>
+      'Bloqueá tu ecash en una custodia 2-de-3 en el mint de este nodo. Ni vos ni el comprador pueden moverlo solos, y si el nodo desaparece podés recuperarlo vos mismo cuando pase el locktime.';
+
+  @override
+  String get lockEscrowAmount => 'Custodia';
+
+  @override
+  String get lockEscrowFee => 'Comisión de Mostro';
+
+  @override
+  String get lockEscrowTotal => 'Total';
+
+  @override
+  String get lockEscrowBalance => 'Tu saldo';
+
+  @override
+  String get lockEscrowConfirm => 'Bloquear custodia';
+
+  @override
+  String get lockEscrowFundWallet => 'Cargá tu billetera';
+
+  @override
+  String get lockEscrowSubmitted => 'Custodia bloqueada y enviada';
+
+  @override
+  String get lockEscrowInsufficientFunds =>
+      'Tu billetera no alcanza para la custodia más la comisión.';
+
+  @override
+  String get lockEscrowFeeUnknown =>
+      'Este nodo todavía no publicó su comisión. Probá de nuevo en un momento.';
+
+  @override
+  String get lockEscrowNotTheSeller => 'Solo el vendedor financia la custodia.';
+
+  @override
+  String get lockEscrowInvalidToken =>
+      'No se pudo construir la custodia correctamente. No se envió nada.';
+
+  @override
+  String get lockEscrowFailed =>
+      'El mint no pudo bloquear la custodia. Tus fondos no se movieron.';
+
+  @override
+  String lockEscrowMint(String mint) {
+    return 'Mint: $mint';
+  }
+
+  @override
+  String lockEscrowLocktime(int days) {
+    return 'Podés recuperarlo tras $days días';
+  }
 }

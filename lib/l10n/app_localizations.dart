@@ -4399,6 +4399,102 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Cashu cannot run without a mint — set one below.'**
   String get settingsEscrowCashuUnavailable;
+
+  /// Title of the seller's Cashu escrow funding screen
+  ///
+  /// In en, this message translates to:
+  /// **'Lock the escrow'**
+  String get lockEscrowTitle;
+
+  /// Explanation shown on the escrow funding screen
+  ///
+  /// In en, this message translates to:
+  /// **'Lock your ecash in a 2-of-3 escrow at this node\'s mint. Neither you nor the buyer can move it alone — and if the node disappears, you can reclaim it yourself once the locktime passes.'**
+  String get lockEscrowExplanation;
+
+  /// Escrow screen — the order amount to be locked
+  ///
+  /// In en, this message translates to:
+  /// **'Escrow'**
+  String get lockEscrowAmount;
+
+  /// Escrow screen — the separate fee token amount
+  ///
+  /// In en, this message translates to:
+  /// **'Mostro fee'**
+  String get lockEscrowFee;
+
+  /// Escrow screen — escrow plus fee
+  ///
+  /// In en, this message translates to:
+  /// **'Total'**
+  String get lockEscrowTotal;
+
+  /// Escrow screen — the Cashu wallet balance
+  ///
+  /// In en, this message translates to:
+  /// **'Your balance'**
+  String get lockEscrowBalance;
+
+  /// Escrow screen — button that funds and submits the escrow
+  ///
+  /// In en, this message translates to:
+  /// **'Lock escrow'**
+  String get lockEscrowConfirm;
+
+  /// Escrow screen — button shown when the balance is short, opening the wallet
+  ///
+  /// In en, this message translates to:
+  /// **'Fund your wallet'**
+  String get lockEscrowFundWallet;
+
+  /// Escrow screen — confirmation after a successful lock
+  ///
+  /// In en, this message translates to:
+  /// **'Escrow locked and sent'**
+  String get lockEscrowSubmitted;
+
+  /// Escrow error — balance below amount plus fee
+  ///
+  /// In en, this message translates to:
+  /// **'Your wallet does not hold enough for the escrow and the fee.'**
+  String get lockEscrowInsufficientFunds;
+
+  /// Escrow error — the node fee is not known, so the fee token cannot be built
+  ///
+  /// In en, this message translates to:
+  /// **'This node has not published its fee yet. Try again in a moment.'**
+  String get lockEscrowFeeUnknown;
+
+  /// Escrow error — the lock was attempted from the buyer side
+  ///
+  /// In en, this message translates to:
+  /// **'Only the seller funds the escrow.'**
+  String get lockEscrowNotTheSeller;
+
+  /// Escrow error — the locally built token failed its own verification
+  ///
+  /// In en, this message translates to:
+  /// **'The escrow could not be built correctly. Nothing was sent.'**
+  String get lockEscrowInvalidToken;
+
+  /// Escrow error — the mint refused the swap
+  ///
+  /// In en, this message translates to:
+  /// **'The mint could not lock the escrow. Your funds have not moved.'**
+  String get lockEscrowFailed;
+
+  /// Escrow screen — the mint the escrow is locked at
+  ///
+  /// In en, this message translates to:
+  /// **'Mint: {mint}'**
+  String lockEscrowMint(String mint);
+
+  /// Escrow screen — when the seller can unilaterally reclaim
+  ///
+  /// In en, this message translates to:
+  /// **'Reclaimable by you after {days} days'**
+  String lockEscrowLocktime(int days);
 }
 
 class _AppLocalizationsDelegate

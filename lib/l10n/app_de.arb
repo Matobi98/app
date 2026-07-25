@@ -738,5 +738,21 @@
   "cashuErrorSendFailed": "Das Token konnte nicht erstellt werden. Womöglich reicht dein Guthaben nicht.",
   "cashuErrorNoIdentity": "Lege ein Konto an oder importiere eines, bevor du die Wallet nutzt.",
   "cashuErrorGeneric": "Mit der Wallet ist etwas schiefgelaufen. Bitte versuche es erneut.",
-  "settingsEscrowCashuUnavailable": "Cashu funktioniert ohne Mint nicht – unten eine festlegen."
+  "settingsEscrowCashuUnavailable": "Cashu funktioniert ohne Mint nicht – unten eine festlegen.",
+  "lockEscrowTitle": "Treuhand sperren",
+  "lockEscrowExplanation": "Sperre dein E-Cash in einer 2-von-3-Treuhand bei der Mint dieses Nodes. Weder du noch der K\u00e4ufer k\u00f6nnt es allein bewegen \u2014 und verschwindet der Node, holst du es nach Ablauf der Sperrfrist selbst zur\u00fcck.",
+  "lockEscrowAmount": "Treuhand",
+  "lockEscrowFee": "Mostro-Geb\u00fchr",
+  "lockEscrowTotal": "Gesamt",
+  "lockEscrowBalance": "Dein Guthaben",
+  "lockEscrowConfirm": "Treuhand sperren",
+  "lockEscrowFundWallet": "Wallet aufladen",
+  "lockEscrowSubmitted": "Treuhand gesperrt und gesendet",
+  "lockEscrowInsufficientFunds": "Dein Guthaben deckt Treuhand und Geb\u00fchr nicht.",
+  "lockEscrowFeeUnknown": "Dieser Node hat seine Geb\u00fchr noch nicht ver\u00f6ffentlicht. Versuche es gleich erneut.",
+  "lockEscrowNotTheSeller": "Nur der Verk\u00e4ufer finanziert die Treuhand.",
+  "lockEscrowInvalidToken": "Die Treuhand konnte nicht korrekt erstellt werden. Es wurde nichts gesendet.",
+  "lockEscrowFailed": "Die Mint konnte die Treuhand nicht sperren. Dein Geld wurde nicht bewegt.",
+  "lockEscrowMint": "Mint: {mint}",
+  "lockEscrowLocktime": "Von dir r\u00fcckholbar nach {days} Tagen"
 }

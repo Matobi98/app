@@ -738,5 +738,21 @@
   "cashuErrorSendFailed": "Non è stato possibile creare il token. Potresti non avere fondi sufficienti.",
   "cashuErrorNoIdentity": "Crea o importa un account prima di usare il portafoglio.",
   "cashuErrorGeneric": "Qualcosa è andato storto con il portafoglio. Riprova.",
-  "settingsEscrowCashuUnavailable": "Cashu non può funzionare senza una mint: impostane una qui sotto."
+  "settingsEscrowCashuUnavailable": "Cashu non può funzionare senza una mint: impostane una qui sotto.",
+  "lockEscrowTitle": "Blocca il deposito",
+  "lockEscrowExplanation": "Blocca il tuo ecash in un deposito 2-su-3 presso la mint di questo nodo. N\u00e9 tu n\u00e9 l'acquirente potete muoverlo da soli \u2014 e se il nodo sparisce potrai recuperarlo tu stesso una volta scaduto il blocco.",
+  "lockEscrowAmount": "Deposito",
+  "lockEscrowFee": "Commissione Mostro",
+  "lockEscrowTotal": "Totale",
+  "lockEscrowBalance": "Il tuo saldo",
+  "lockEscrowConfirm": "Blocca il deposito",
+  "lockEscrowFundWallet": "Ricarica il portafoglio",
+  "lockEscrowSubmitted": "Deposito bloccato e inviato",
+  "lockEscrowInsufficientFunds": "Il tuo portafoglio non copre deposito e commissione.",
+  "lockEscrowFeeUnknown": "Questo nodo non ha ancora pubblicato la sua commissione. Riprova tra poco.",
+  "lockEscrowNotTheSeller": "Solo il venditore finanzia il deposito.",
+  "lockEscrowInvalidToken": "Non \u00e8 stato possibile costruire il deposito correttamente. Non \u00e8 stato inviato nulla.",
+  "lockEscrowFailed": "La mint non ha potuto bloccare il deposito. I tuoi fondi non si sono mossi.",
+  "lockEscrowMint": "Mint: {mint}",
+  "lockEscrowLocktime": "Recuperabile da te dopo {days} giorni"
 }

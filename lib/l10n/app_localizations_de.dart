@@ -2498,4 +2498,62 @@ class AppLocalizationsDe extends AppLocalizations {
   @override
   String get settingsEscrowCashuUnavailable =>
       'Cashu funktioniert ohne Mint nicht – unten eine festlegen.';
+
+  @override
+  String get lockEscrowTitle => 'Treuhand sperren';
+
+  @override
+  String get lockEscrowExplanation =>
+      'Sperre dein E-Cash in einer 2-von-3-Treuhand bei der Mint dieses Nodes. Weder du noch der Käufer könnt es allein bewegen — und verschwindet der Node, holst du es nach Ablauf der Sperrfrist selbst zurück.';
+
+  @override
+  String get lockEscrowAmount => 'Treuhand';
+
+  @override
+  String get lockEscrowFee => 'Mostro-Gebühr';
+
+  @override
+  String get lockEscrowTotal => 'Gesamt';
+
+  @override
+  String get lockEscrowBalance => 'Dein Guthaben';
+
+  @override
+  String get lockEscrowConfirm => 'Treuhand sperren';
+
+  @override
+  String get lockEscrowFundWallet => 'Wallet aufladen';
+
+  @override
+  String get lockEscrowSubmitted => 'Treuhand gesperrt und gesendet';
+
+  @override
+  String get lockEscrowInsufficientFunds =>
+      'Dein Guthaben deckt Treuhand und Gebühr nicht.';
+
+  @override
+  String get lockEscrowFeeUnknown =>
+      'Dieser Node hat seine Gebühr noch nicht veröffentlicht. Versuche es gleich erneut.';
+
+  @override
+  String get lockEscrowNotTheSeller =>
+      'Nur der Verkäufer finanziert die Treuhand.';
+
+  @override
+  String get lockEscrowInvalidToken =>
+      'Die Treuhand konnte nicht korrekt erstellt werden. Es wurde nichts gesendet.';
+
+  @override
+  String get lockEscrowFailed =>
+      'Die Mint konnte die Treuhand nicht sperren. Dein Geld wurde nicht bewegt.';
+
+  @override
+  String lockEscrowMint(String mint) {
+    return 'Mint: $mint';
+  }
+
+  @override
+  String lockEscrowLocktime(int days) {
+    return 'Von dir rückholbar nach $days Tagen';
+  }
 }

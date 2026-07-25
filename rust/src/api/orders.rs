@@ -386,7 +386,7 @@ async fn store_trade_key_index(order_id: &str, index: u32) {
 /// Returns `None` when neither source has a record for the order.
 /// Callers must treat `None` as an error rather than silently using index 0,
 /// which would cause signature verification failures on the daemon side.
-async fn get_trade_key_index(order_id: &str) -> Option<u32> {
+pub(crate) async fn get_trade_key_index(order_id: &str) -> Option<u32> {
     // Fast path: in-memory cache.
     if let Some(idx) = trade_key_map()
         .read()
@@ -851,6 +851,10 @@ pub async fn create_order(params: NewOrderParams) -> Result<OrderInfo> {
         started_at: now,
         completed_at: None,
         outcome: None,
+        // Populated only once a Cashu escrow is actually locked (C5).
+        cashu_mint_url: None,
+        cashu_escrow_token: None,
+        cashu_locked_at: None,
     };
     if let Some(db) = crate::db::app_db::db() {
         if let Err(e) = db.save_trade(&trade).await {
@@ -1071,6 +1075,10 @@ pub async fn take_order(
         started_at: now,
         completed_at: None,
         outcome: None,
+        // Populated only once a Cashu escrow is actually locked (C5).
+        cashu_mint_url: None,
+        cashu_escrow_token: None,
+        cashu_locked_at: None,
     };
 
     store_trade_key_index(&order_id, trade_index).await;
@@ -2298,7 +2306,7 @@ async fn subscribe_single_order(order_id: &str) {
 ///
 /// Returns an error if the pool is not initialised, the JSON is malformed,
 /// or the relay client reports a publish error.
-async fn publish_event_json(event_json: &str) -> Result<()> {
+pub(crate) async fn publish_event_json(event_json: &str) -> Result<()> {
     let pool =
         crate::api::nostr::get_pool().map_err(|_| anyhow::anyhow!("RelayPoolNotInitialized"))?;
     let event: nostr_sdk::Event =
@@ -2472,6 +2480,16 @@ pub(crate) async fn refresh_subscriptions_for_active_node() {
     // read as Unknown — which keeps Cashu shut — instead of carrying one
     // node's Cashu mode onto another.
     crate::mostro::escrow_mode::clear();
+
+    // Same for the fee: it funds a Cashu escrow's fee token, and one node's
+    // rate applied to another's order is a lock the daemon rejects.
+    crate::mostro::node_fee::clear();
+
+    // And the wallet, which is bound to the old node's mint. Proofs stay on
+    // disk; only the binding is dropped.
+    if let Err(e) = crate::api::cashu::cashu_disconnect().await {
+        log::warn!("[orders] failed to disconnect the Cashu wallet on node switch: {e}");
+    }
 
     let Ok(pool) = crate::api::nostr::get_pool() else {
         log::warn!(
