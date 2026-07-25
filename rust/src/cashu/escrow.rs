@@ -50,11 +50,26 @@ pub struct EscrowParties {
 impl EscrowParties {
     /// Build from the x-only hex keys the protocol carries.
     pub fn from_xonly_hex(buyer: &str, seller: &str, mostro: &str) -> Result<Self> {
-        Ok(Self {
+        let parties = Self {
             buyer: xonly_to_cashu_pubkey(buyer)?,
             seller: xonly_to_cashu_pubkey(seller)?,
             mostro: xonly_to_cashu_pubkey(mostro)?,
-        })
+        };
+        parties.ensure_distinct()?;
+        Ok(parties)
+    }
+
+    /// Three different keys, or it is not a 2-of-3.
+    ///
+    /// A duplicate collapses the threshold: whether one signature can satisfy
+    /// `n_sigs = 2` under a repeated key is mint-implementation-defined, which
+    /// is precisely the thing not to leave to the mint. Rejected on the way in
+    /// and on the way out.
+    pub fn ensure_distinct(&self) -> Result<()> {
+        if self.buyer == self.seller || self.buyer == self.mostro || self.seller == self.mostro {
+            bail!("InvalidEscrowParties: buyer, seller and Mostro must be three different keys");
+        }
+        Ok(())
     }
 }
 
@@ -92,6 +107,8 @@ pub fn xonly_to_cashu_pubkey(xonly_hex: &str) -> Result<PublicKey> {
 /// a caller that miscomputes it fails here rather than minting an escrow that
 /// is already refundable.
 pub fn escrow_conditions(parties: &EscrowParties, locktime: u64) -> Result<SpendingConditions> {
+    parties.ensure_distinct()?;
+
     let conditions = Conditions::new(
         Some(locktime),
         // `data` carries the seller, so the extra pubkeys are the other two.
@@ -131,6 +148,8 @@ pub fn verify_conditions(
     parties: &EscrowParties,
     min_locktime: u64,
 ) -> Result<()> {
+    parties.ensure_distinct()?;
+
     let SpendingConditions::P2PKConditions { data, conditions } = conditions else {
         bail!("InvalidEscrowToken: not a P2PK secret");
     };
@@ -147,6 +166,18 @@ pub fn verify_conditions(
         .pubkeys
         .as_ref()
         .ok_or_else(|| anyhow!("InvalidEscrowToken: no additional pubkeys"))?;
+
+    // Exactly two, and exactly these two. Checking only that the buyer and
+    // Mostro are *present* would accept `[P_B, P_M, P_attacker]`: with
+    // `n_sigs = 2` and `data = P_S`, the seller plus a key they also control
+    // satisfies the condition, and they can drain the escrow the moment it is
+    // funded. Every other field here is matched exactly; so is this one.
+    if pubkeys.len() != 2 {
+        bail!(
+            "InvalidEscrowToken: expected exactly 2 additional pubkeys, got {}",
+            pubkeys.len()
+        );
+    }
     if !pubkeys.contains(&parties.buyer) || !pubkeys.contains(&parties.mostro) {
         bail!("InvalidEscrowToken: buyer or Mostro key missing");
     }
@@ -220,10 +251,17 @@ impl CashuWallet {
             .await
             .map_err(|e| anyhow!("CashuLockFailed: {e}"))?;
 
-        let token = prepared
-            .confirm(None::<SendMemo>)
-            .await
-            .map_err(|e| anyhow!("CashuLockFailed: {e}"))?;
+        let token = match prepared.confirm(None::<SendMemo>).await {
+            Ok(token) => token,
+            Err(e) => {
+                // The whole escrow amount is reserved at this point and
+                // `confirm` consumed the handle, so nothing else can release
+                // it. C5 would then report the wallet as short by exactly the
+                // amount it just tried to lock.
+                let reclaimed = self.check_proofs_state().await.unwrap_or(0);
+                bail!("CashuLockFailed: {e} (reclaimed {reclaimed} sat)");
+            }
+        };
 
         Ok(token.to_string())
     }
@@ -252,6 +290,14 @@ impl CashuWallet {
             .to_string();
         if token_mint.trim_end_matches('/') != self.mint_url().trim_end_matches('/') {
             bail!("InvalidEscrowToken: wrong mint ({token_mint})");
+        }
+
+        // Unit before amount: `value()` sums proof amounts irrespective of
+        // denomination, so a token in another unit with the right numeric total
+        // would pass the amount check unnoticed.
+        match token.unit() {
+            Some(cdk::nuts::CurrencyUnit::Sat) => {}
+            other => bail!("InvalidEscrowToken: expected sat, got {other:?}"),
         }
 
         let value = u64::from(
@@ -323,11 +369,18 @@ impl CashuWallet {
         let proofs = self.proofs_of(&token).await?;
         let mut signed = Vec::with_capacity(proofs.len());
 
+        // Indexed once rather than scanned per proof: linear in the number of
+        // signatures instead of quadratic, and it makes a duplicate secret in
+        // the peer's list a visible collision rather than a silent first-wins.
+        let by_secret: std::collections::HashMap<&str, &ProofSignature> = peer_signatures
+            .iter()
+            .map(|s| (s.secret.as_str(), s))
+            .collect();
+
         for mut proof in proofs {
             let secret = proof.secret.to_string();
-            let peer = peer_signatures
-                .iter()
-                .find(|s| s.secret == secret)
+            let peer = by_secret
+                .get(secret.as_str())
                 .ok_or_else(|| anyhow!("MissingPeerSignature: none for proof {secret}"))?;
 
             proof
@@ -370,6 +423,25 @@ impl CashuWallet {
         let mut signed = Vec::with_capacity(proofs.len());
 
         for mut proof in proofs {
+            // The locktime is right there in the secret. Checking it locally
+            // turns "the mint rejected your swap" into "the refund path opens
+            // in N days", which is the difference between a user waiting and a
+            // user filing a bug.
+            if let Ok(SpendingConditions::P2PKConditions {
+                conditions: Some(c), ..
+            }) = SpendingConditions::try_from(&proof.secret)
+            {
+                if let Some(locktime) = c.locktime {
+                    let now = now_unix();
+                    if locktime > now {
+                        bail!(
+                            "CashuLocktimeNotReached: {} seconds remain",
+                            locktime - now
+                        );
+                    }
+                }
+            }
+
             proof
                 .sign_p2pk(seller_key.clone())
                 .map_err(|e| anyhow!("CashuSignFailed: {e}"))?;
@@ -384,6 +456,15 @@ impl CashuWallet {
 
         Ok(u64::from(amount))
     }
+}
+
+/// Seconds since the unix epoch, or 0 if the clock is before it — in which
+/// case every locktime reads as "not reached", which is the safe direction.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// The signature `sign_p2pk` just appended.
@@ -606,6 +687,29 @@ mod tests {
                 "bare P2PK",
                 "no spending conditions",
             ),
+            (
+                // The one that matters most: an *extra* key the seller also
+                // controls. Every required key is present, so a
+                // presence-only check passes it — and then seller + extra is
+                // two of four, and the escrow is spendable unilaterally the
+                // moment it is funded.
+                SpendingConditions::P2PKConditions {
+                    data: parties.seller,
+                    conditions: Some(
+                        Conditions::new(
+                            Some(locktime),
+                            Some(vec![parties.buyer, parties.mostro, other]),
+                            Some(vec![parties.seller]),
+                            Some(2),
+                            Some(SigFlag::SigInputs),
+                            Some(1),
+                        )
+                        .unwrap(),
+                    ),
+                },
+                "extra pubkey",
+                "expected exactly 2 additional pubkeys",
+            ),
         ];
 
         // Act / Assert
@@ -657,6 +761,10 @@ mod tests {
         std::env::temp_dir().join(format!("mostro_escrow_test_{}_{n}.db", std::process::id()))
     }
 
+    fn wallet_seed(byte: u8) -> zeroize::Zeroizing<[u8; 64]> {
+        zeroize::Zeroizing::new([byte; 64])
+    }
+
     /// A party: its secret key, and the x-only hex the protocol carries.
     fn party() -> (SecretKey, String) {
         let sk = SecretKey::generate();
@@ -672,10 +780,10 @@ mod tests {
         let seller_db = temp_db_path();
         let buyer_db = temp_db_path();
 
-        let seller = CashuWallet::connect(&mint, [11u8; 64], seller_db.to_str().unwrap())
+        let seller = CashuWallet::connect(&mint, wallet_seed(11), seller_db.to_str().unwrap())
             .await
             .unwrap();
-        let buyer = CashuWallet::connect(&mint, [12u8; 64], buyer_db.to_str().unwrap())
+        let buyer = CashuWallet::connect(&mint, wallet_seed(12), buyer_db.to_str().unwrap())
             .await
             .unwrap();
 
@@ -724,7 +832,7 @@ mod tests {
         // alone can take the funds.
         let mint = test_mint_url();
         let seller_db = temp_db_path();
-        let seller = CashuWallet::connect(&mint, [13u8; 64], seller_db.to_str().unwrap())
+        let seller = CashuWallet::connect(&mint, wallet_seed(13), seller_db.to_str().unwrap())
             .await
             .unwrap();
         assert!(seller.balance().await.unwrap() >= 8, "fund the seller first");
@@ -758,10 +866,10 @@ mod tests {
         let mint = test_mint_url();
         let seller_db = temp_db_path();
         let buyer_db = temp_db_path();
-        let seller = CashuWallet::connect(&mint, [14u8; 64], seller_db.to_str().unwrap())
+        let seller = CashuWallet::connect(&mint, wallet_seed(14), seller_db.to_str().unwrap())
             .await
             .unwrap();
-        let buyer = CashuWallet::connect(&mint, [15u8; 64], buyer_db.to_str().unwrap())
+        let buyer = CashuWallet::connect(&mint, wallet_seed(15), buyer_db.to_str().unwrap())
             .await
             .unwrap();
         assert!(seller.balance().await.unwrap() >= 8, "fund the seller first");
@@ -796,7 +904,7 @@ mod tests {
         // Arrange — a seller who locks less than the order calls for.
         let mint = test_mint_url();
         let seller_db = temp_db_path();
-        let seller = CashuWallet::connect(&mint, [16u8; 64], seller_db.to_str().unwrap())
+        let seller = CashuWallet::connect(&mint, wallet_seed(16), seller_db.to_str().unwrap())
             .await
             .unwrap();
         assert!(seller.balance().await.unwrap() >= 8, "fund the seller first");
@@ -827,6 +935,28 @@ mod tests {
     }
 
     #[test]
+    fn three_parties_must_be_three_different_keys() {
+        // Arrange — a duplicate collapses the 2-of-3 into something weaker, and
+        // whether one signature then satisfies n_sigs=2 is up to the mint.
+        let shared = xonly();
+        let third = xonly();
+
+        // Act / Assert — rejected at construction, so a degenerate set never
+        // reaches the condition builder.
+        for (buyer, seller, mostro, label) in [
+            (shared.clone(), shared.clone(), third.clone(), "buyer == seller"),
+            (shared.clone(), third.clone(), shared.clone(), "buyer == mostro"),
+            (third.clone(), shared.clone(), shared.clone(), "seller == mostro"),
+        ] {
+            let err = EscrowParties::from_xonly_hex(&buyer, &seller, &mostro).unwrap_err();
+            assert!(
+                err.to_string().contains("InvalidEscrowParties"),
+                "{label}: got {err}"
+            );
+        }
+    }
+
+    #[test]
     fn a_missing_counterparty_key_is_refused() {
         // Arrange — Mostro left out, so buyer and seller could settle without
         // the arbitrator ever being able to intervene.
@@ -847,8 +977,31 @@ mod tests {
             ),
         };
 
-        // Act / Assert
+        // Act / Assert — the exact-count check catches this first, which is
+        // fine: both messages say the key set is not the one this trade needs.
         let err = verify_conditions(&conditions, &parties, locktime).unwrap_err();
+        assert!(
+            err.to_string().contains("expected exactly 2 additional pubkeys"),
+            "got {err}"
+        );
+
+        // And with the right *count* but the wrong key, the membership check
+        // is the one that fires.
+        let wrong_key = SpendingConditions::P2PKConditions {
+            data: parties.seller,
+            conditions: Some(
+                Conditions::new(
+                    Some(locktime),
+                    Some(vec![parties.buyer, SecretKey::generate().public_key()]),
+                    Some(vec![parties.seller]),
+                    Some(2),
+                    Some(SigFlag::SigInputs),
+                    Some(1),
+                )
+                .unwrap(),
+            ),
+        };
+        let err = verify_conditions(&wrong_key, &parties, locktime).unwrap_err();
         assert!(
             err.to_string().contains("buyer or Mostro key missing"),
             "got {err}"
