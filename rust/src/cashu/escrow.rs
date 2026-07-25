@@ -763,14 +763,9 @@ mod tests {
         std::env::temp_dir().join(format!("mostro_escrow_test_{}_{n}.db", std::process::id()))
     }
 
-    /// A seed unique to this process *and* this call.
-    ///
-    /// cdk derives blinding secrets deterministically from the seed and a
-    /// counter kept in the wallet DB (NUT-13). These tests create a fresh DB
-    /// each time, so a fixed seed replays the same blinded messages and the
-    /// mint answers "already signed" on the second run. Unique seeds make the
-    /// suite re-runnable, which is the whole point of a reviewer being able to
-    /// run it.
+    /// A seed unique to this process *and* this call — see the note on the
+    /// wallet's `unique_seed`: a fixed seed with a fresh DB replays NUT-13
+    /// blinding secrets and the mint refuses them on the second run.
     fn unique_seed() -> zeroize::Zeroizing<[u8; 64]> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -833,6 +828,12 @@ mod tests {
             .verify_escrow_token(&token, &parties, 16, locktime)
             .await
             .unwrap();
+        // A mint that charges a swap fee (nutshell's default keyset does) makes
+        // locking cost the seller slightly more than the face value.
+        assert!(
+            seller.balance().await.unwrap() <= funded - 16,
+            "locking 16 sat must cost the seller at least the face value"
+        );
 
         // Act — seller signs (release), buyer combines and redeems.
         let seller_sigs = seller.sign_proofs(&token, seller_sk).await.unwrap();
@@ -841,20 +842,14 @@ mod tests {
             .await
             .unwrap();
 
-        // Assert — the escrow's face value is what the daemon validates, but a
-        // mint that charges a swap fee (nutshell's default keyset does) leaves
-        // the redeemer with slightly less, and costs the seller slightly more
-        // than the face value to lock. Both are properties of the mint, not of
-        // this code, so the assertions bound rather than pin them.
+        // Assert — the face value is what a validator checks; the redeemer
+        // receives that minus the mint's swap fee, which is the mint's
+        // property, not this code's. Bounded rather than pinned.
         assert!(
             received > 0 && received <= 16,
             "received {received} sat for a 16 sat escrow"
         );
         assert_eq!(buyer.balance().await.unwrap(), received);
-        assert!(
-            seller.balance().await.unwrap() <= funded - 16,
-            "locking 16 sat must cost the seller at least the face value"
-        );
 
         let _ = std::fs::remove_file(&seller_db);
         let _ = std::fs::remove_file(&buyer_db);
@@ -889,10 +884,9 @@ mod tests {
             .await
             .unwrap_err();
 
-        // Assert — refused before the mint is even contacted: the locktime is
-        // in the secret, so the client can say how long is left instead of
-        // relaying an opaque mint error. Either refusal proves the property;
-        // this one is just the more useful message.
+        // Assert — refused before the mint is even contacted: the locktime is in
+        // the secret, so the client can say how long is left instead of
+        // relaying an opaque mint error. Either refusal proves the property.
         assert!(
             err.to_string().contains("CashuLocktimeNotReached")
                 || err.to_string().contains("CashuReclaimFailed"),

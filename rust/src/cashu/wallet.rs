@@ -252,7 +252,12 @@ impl CashuWallet {
 
         let quote = self
             .inner
-            .mint_quote(PaymentMethod::BOLT11, Some(Amount::from(amount_sats)), None, None)
+            .mint_quote(
+                PaymentMethod::BOLT11,
+                Some(Amount::from(amount_sats)),
+                None,
+                None,
+            )
             .await
             .map_err(|e| anyhow!("CashuMintQuoteFailed: {e}"))?;
 
@@ -473,9 +478,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a local nutshell mint (MOSTRO_TEST_MINT_URL)"]
     async fn a_token_round_trips_between_two_wallets() {
-        // Arrange — two wallets at the same mint. The sender must already hold
-        // at least 8 sat; funding is out of band (nutshell fakewallet), which
-        // is why this stays behind --ignored.
+        // Arrange — two wallets at the same mint, funded from the mint itself.
         let sender_path = temp_db_path();
         let receiver_path = temp_db_path();
         let mint = test_mint_url();
