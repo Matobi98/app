@@ -88,6 +88,20 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
     }
   }
 
+  Widget _waitingIndicator(AppColors? colors, Color green,
+          AppLocalizations l10n) =>
+      Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          CircularProgressIndicator(color: green),
+          const SizedBox(height: AppSpacing.sm),
+          Text(
+            l10n.waitingForPaymentConfirmation,
+            style: TextStyle(color: colors?.textSecondary),
+          ),
+        ],
+      );
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -187,12 +201,15 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
             body: Padding(
               padding: const EdgeInsets.all(AppSpacing.lg),
               child: Center(
-                child: NwcPaymentWidget(
-                  bolt11: invoice,
-                  amountSats: amountSats,
-                  onPaymentSuccess: _onPaymentDetected,
-                  onFallbackToManual: () => setState(() => _manualMode = true),
-                ),
+                child: _waiting
+                    ? _waitingIndicator(colors, green, l10n)
+                    : NwcPaymentWidget(
+                        bolt11: invoice,
+                        amountSats: amountSats,
+                        onPaymentSuccess: _onPaymentDetected,
+                        onFallbackToManual: () =>
+                            setState(() => _manualMode = true),
+                      ),
               ),
             ),
           );
@@ -365,18 +382,8 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
                 ),
                 const SizedBox(height: AppSpacing.lg),
 
-                // Waiting indicator or Cancel button
                 if (_waiting)
-                  Column(
-                    children: [
-                      CircularProgressIndicator(color: green),
-                      const SizedBox(height: AppSpacing.sm),
-                      Text(
-                        l10n.waitingForPaymentConfirmation,
-                        style: TextStyle(color: colors?.textSecondary),
-                      ),
-                    ],
-                  )
+                  _waitingIndicator(colors, green, l10n)
                 else
                   SizedBox(
                     width: double.infinity,
