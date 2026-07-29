@@ -18,12 +18,16 @@ final tradeRoleProvider =
 final tradeAmountProvider =
     StreamProvider.family.autoDispose<BigInt?, String>((ref, orderId) async* {
   while (true) {
-    final trades = await orders_api.listTrades();
-    final trade = trades.where((t) => t.order.id == orderId).firstOrNull;
-    final sats = trade?.order.amountSats ??
-        (await orders_api.getOrder(orderId: orderId))?.amountSats;
-    yield sats;
-    if (sats != null) return; // done — no need to keep polling
+    try {
+      final trades = await orders_api.listTrades();
+      final trade = trades.where((t) => t.order.id == orderId).firstOrNull;
+      final sats = trade?.order.amountSats ??
+          (await orders_api.getOrder(orderId: orderId))?.amountSats;
+      yield sats;
+      if (sats != null) return; // done — no need to keep polling
+    } catch (e, st) {
+      debugPrint('[tradeAmountProvider] poll failed: $e\n$st');
+    }
     await Future.delayed(const Duration(seconds: 2));
   }
 });
@@ -39,18 +43,22 @@ final tradeAmountProvider =
 final tradeStatusProvider =
     StreamProvider.family.autoDispose<OrderStatus, String>((ref, orderId) async* {
   while (true) {
-    final trades = await orders_api.listTrades();
-    final trade = trades.where((t) => t.order.id == orderId).firstOrNull;
-    if (trade != null) {
-      yield trade.order.status;
-      if (_isTerminal(trade.order.status)) return;
-    } else {
-      // No local trade row — fall back to the public order book.
-      final info = await orders_api.getOrder(orderId: orderId);
-      if (info != null) {
-        yield info.status;
-        if (_isTerminal(info.status)) return;
+    try {
+      final trades = await orders_api.listTrades();
+      final trade = trades.where((t) => t.order.id == orderId).firstOrNull;
+      if (trade != null) {
+        yield trade.order.status;
+        if (_isTerminal(trade.order.status)) return;
+      } else {
+        // No local trade row — fall back to the public order book.
+        final info = await orders_api.getOrder(orderId: orderId);
+        if (info != null) {
+          yield info.status;
+          if (_isTerminal(info.status)) return;
+        }
       }
+    } catch (e, st) {
+      debugPrint('[tradeStatusProvider] poll failed: $e\n$st');
     }
     await Future.delayed(const Duration(seconds: 2));
   }
