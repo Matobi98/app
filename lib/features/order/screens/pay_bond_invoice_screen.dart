@@ -102,6 +102,25 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
         ],
       );
 
+  Widget _cancelButton(AppColors? colors, AppLocalizations l10n) {
+    final red = colors?.destructiveRed ?? const Color(0xFFD84D4D);
+    return SizedBox(
+      width: double.infinity,
+      child: OutlinedButton(
+        onPressed: _confirmAndCancel,
+        style: OutlinedButton.styleFrom(
+          foregroundColor: red,
+          side: BorderSide(color: red),
+          minimumSize: const Size(0, 48),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(AppRadius.button),
+          ),
+        ),
+        child: Text(l10n.cancel),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -194,22 +213,28 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
           );
         }
 
-        // If NWC wallet is connected and payment hasn't failed yet, auto-pay.
+        // NWC wallet connected and payment hasn't failed yet: pay from it.
         if (isWalletConnected && !_manualMode) {
           return Scaffold(
             appBar: AppBar(title: Text(l10n.payBondInvoiceTitle)),
             body: Padding(
               padding: const EdgeInsets.all(AppSpacing.lg),
-              child: Center(
-                child: _waiting
-                    ? _waitingIndicator(colors, green, l10n)
-                    : NwcPaymentWidget(
-                        bolt11: invoice,
-                        amountSats: amountSats,
-                        onPaymentSuccess: _onPaymentDetected,
-                        onFallbackToManual: () =>
-                            setState(() => _manualMode = true),
-                      ),
+              child: Column(
+                children: [
+                  const Spacer(),
+                  if (_waiting)
+                    _waitingIndicator(colors, green, l10n)
+                  else
+                    NwcPaymentWidget(
+                      bolt11: invoice,
+                      amountSats: amountSats,
+                      onPaymentSuccess: _onPaymentDetected,
+                      onFallbackToManual: () =>
+                          setState(() => _manualMode = true),
+                    ),
+                  const Spacer(),
+                  if (!_waiting) _cancelButton(colors, l10n),
+                ],
               ),
             ),
           );
@@ -385,25 +410,7 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
                 if (_waiting)
                   _waitingIndicator(colors, green, l10n)
                 else
-                  SizedBox(
-                    width: double.infinity,
-                    child: OutlinedButton(
-                      onPressed: _confirmAndCancel,
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor:
-                            colors?.destructiveRed ?? const Color(0xFFD84D4D),
-                        side: BorderSide(
-                          color:
-                              colors?.destructiveRed ?? const Color(0xFFD84D4D),
-                        ),
-                        minimumSize: const Size(0, 48),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(AppRadius.button),
-                        ),
-                      ),
-                      child: Text(l10n.cancel),
-                    ),
-                  ),
+                  _cancelButton(colors, l10n),
               ],
             ),
           ),
