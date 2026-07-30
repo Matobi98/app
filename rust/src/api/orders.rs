@@ -1305,16 +1305,20 @@ pub async fn release_order(order_id: String) -> Result<()> {
 /// Sends a `Cancel` MostroMessage signed with the trade key used when the order
 /// was taken. The effect depends on how far the order has progressed:
 ///
+/// - **Taker, WaitingTakerBond / Pending** — a unilateral back-out before the
+///   taker committed (no bond paid). The order stays `Pending` on the daemon,
+///   which returns it to the book without involving the maker. Because the
+///   public NIP-69 bucket never changed, no fresh Kind 38383 need arrive during
+///   the session, so we reset the local book entry to `Pending` (available
+///   again) instead of removing it.
+/// - **Maker, Pending** — the maker withdraws an order nobody committed to. The
+///   listing dies, so it is dropped from the book.
 /// - **Active / FiatSent** — a cooperative cancel: both parties must cancel for
 ///   it to take effect and the Mostro daemon runs the cooperative-cancel state
 ///   machine. The order is dropped from the local book optimistically.
-/// - **WaitingTakerBond / Pending** — a unilateral back-out before the taker has
-///   committed (no bond paid). The order is still `Pending` on the daemon, which
-///   simply returns it to the book without involving the counterparty. Because
-///   the public NIP-69 bucket never changed, no fresh Kind 38383 arrives to
-///   re-add the order during the session, so we reset its local book entry to
-///   `Pending` (available again) instead of removing it — otherwise it would
-///   only reappear after an app restart.
+///
+/// Status alone cannot tell the first two apart: maker-created orders are also
+/// persisted as `Pending`, so the classification goes by ownership as well.
 pub async fn cancel_order(order_id: String) -> Result<()> {
     let trade_index = get_trade_key_index(&order_id)
         .await
@@ -1333,34 +1337,32 @@ pub async fn cancel_order(order_id: String) -> Result<()> {
     .await?;
     publish_event_json(&event_json).await?;
 
-    // Classify the cancel: a pre-commit back-out (taker has not paid a bond,
-    // order still Pending on the daemon) returns the order to the book, whereas
-    // a cooperative cancel of a committed trade drops it. The two need different
-    // optimistic book handling (see the fn doc).
-    let is_precommit = match crate::db::app_db::db() {
-        Some(db) => matches!(
-            db.get_trade_by_order_id(&order_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|t| t.order.status),
-            Some(OrderStatus::WaitingTakerBond) | Some(OrderStatus::Pending)
-        ),
+    // Classify the cancel by ownership and status (see the fn doc): only a
+    // taker's pre-commit back-out returns the order to the book.
+    let is_taker_backout = match crate::db::app_db::db() {
+        Some(db) => db
+            .get_trade_by_order_id(&order_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|t| {
+                !t.order.is_mine
+                    && matches!(
+                        t.order.status,
+                        OrderStatus::WaitingTakerBond | OrderStatus::Pending
+                    )
+            }),
         None => false,
     };
 
     // Optimistic update: mark the trade as Canceled in the local DB immediately
     // so the UI reflects the change without waiting for the daemon's gift-wrap
     // response.
-    if is_precommit {
-        // Back-out before commitment: reset the book entry to Pending so the
-        // order shows as available again this session (no fresh Kind 38383 will
-        // re-add it — the public bucket was already Pending).
+    if is_taker_backout {
         order_book()
             .update_order_status(&order_id, OrderStatus::Pending)
             .await;
     } else {
-        // Cooperative cancel of a committed trade: drop it from the book.
         order_book().remove_order(&order_id).await;
     }
     if let Some(db) = crate::db::app_db::db() {
@@ -1378,7 +1380,7 @@ pub async fn cancel_order(order_id: String) -> Result<()> {
     }
 
     log::info!(
-        "[orders] cancel published for order={order_id} trade_index={trade_index} precommit={is_precommit}"
+        "[orders] cancel published for order={order_id} trade_index={trade_index} taker_backout={is_taker_backout}"
     );
     Ok(())
 }
@@ -1813,7 +1815,22 @@ async fn dispatch_mostro_message(
             log::info!("[orders] gift-wrap Canceled for trade={trade_pubkey_hex}");
             if let Some(order_id) = &kind.id {
                 let oid = order_id.to_string();
-                order_book().remove_order(&oid).await;
+                // Our trade is over, but someone else's order can outlive it: a
+                // taker back-out leaves the listing available, and the daemon
+                // republishes it as Pending. Only drop orders we own; for the
+                // rest let the public 38383 event decide.
+                let owned = match crate::db::app_db::db() {
+                    Some(db) => db
+                        .get_trade_by_order_id(&oid)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|t| t.order.is_mine),
+                    None => true,
+                };
+                if owned {
+                    order_book().remove_order(&oid).await;
+                }
                 // Sync the Canceled status into the trade DB so My Trades
                 // reflects the cancellation immediately.
                 if let Some(db) = crate::db::app_db::db() {
@@ -2254,14 +2271,32 @@ async fn followed_trade_state(order_id: &str) -> Option<(OrderStatus, Option<u64
     Some((trade.order.status, trade.order.amount_sats))
 }
 
+/// Whether a trade status still describes a live trade.
+///
+/// Once our trade ends the order can outlive it — a taker back-out leaves the
+/// order `Pending` for everyone else — so the listing regains authority.
+fn trade_status_is_live(status: &OrderStatus) -> bool {
+    use OrderStatus as S;
+    !matches!(
+        status,
+        S::Success
+            | S::Canceled
+            | S::CooperativelyCanceled
+            | S::CanceledByAdmin
+            | S::Expired
+            | S::SettledByAdmin
+            | S::CompletedByAdmin
+    )
+}
+
 /// Overlay the authoritative trade state onto an incoming public order, so the
-/// book cache behind `getOrder` never contradicts the trade row.
+/// book cache behind `getOrder` never contradicts a live trade row.
 fn merge_followed_state(
     mut incoming: OrderInfo,
     followed: Option<&(OrderStatus, Option<u64>)>,
 ) -> OrderInfo {
     if let Some((status, amount_sats)) = followed {
-        if !public_status_supersedes(status, &incoming.status) {
+        if trade_status_is_live(status) && !public_status_supersedes(status, &incoming.status) {
             incoming.status = status.clone();
             // Public `amt` is the coarse listing figure, not the per-role amount.
             if amount_sats.is_some() {
