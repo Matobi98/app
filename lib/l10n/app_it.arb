@@ -86,6 +86,8 @@
   "tradeHeadlineWaitingBond": "Paga la cauzione anti-abuso per prendere questo ordine.",
   "tradeInstructionWaitingBond": "Paga la hold invoice della cauzione anti-abuso per prendere questo ordine.",
   "tradeTimerWaitingBondLabel": "Tempo per pagare la cauzione anti-abuso",
+  "nodeProtocolUnsupported": "Questo nodo Mostro usa una versione del protocollo che questa app non supporta. Scegli un altro nodo nelle Impostazioni o verifica se è disponibile un aggiornamento dell'app",
+  "nodeCapabilitiesUnknown": "Stiamo ancora verificando cosa supporta il nodo Mostro selezionato. Riprova tra un istante",
   "storageUnavailable": "L'app non può creare né prendere ordini finché il suo database locale non è disponibile. Riavvia l'app e riprova",
   "addInvoiceAmount": "Importo da ricevere: {sats} sats",
   "payInvoiceAmount": "Importo da pagare: {sats} sats",

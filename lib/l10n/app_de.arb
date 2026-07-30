@@ -86,6 +86,8 @@
   "tradeHeadlineWaitingBond": "Zahle die Anti-Missbrauchs-Kaution, um diese Order anzunehmen.",
   "tradeInstructionWaitingBond": "Zahle die Anti-Missbrauchs-Kautions-Hold-Invoice, um diese Order anzunehmen.",
   "tradeTimerWaitingBondLabel": "Zeit zum Zahlen der Anti-Missbrauchs-Kaution",
+  "nodeProtocolUnsupported": "Dieser Mostro-Node nutzt eine Protokollversion, die diese App nicht unterstützt. Wähle in den Einstellungen einen anderen Node oder prüfe, ob ein App-Update verfügbar ist",
+  "nodeCapabilitiesUnknown": "Es wird noch geprüft, was der ausgewählte Mostro-Node unterstützt. Versuche es gleich noch einmal",
   "storageUnavailable": "Die App kann keine Orders erstellen oder annehmen, solange ihre lokale Datenbank nicht verfügbar ist. Starte die App neu und versuche es erneut",
   "addInvoiceAmount": "Zu erhaltender Betrag: {sats} sats",
   "payInvoiceAmount": "Zu zahlender Betrag: {sats} sats",

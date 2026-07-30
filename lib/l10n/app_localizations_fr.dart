@@ -289,6 +289,14 @@ class AppLocalizationsFr extends AppLocalizations {
       'Temps pour payer la caution anti-abus';
 
   @override
+  String get nodeProtocolUnsupported =>
+      'Ce nœud Mostro utilise une version du protocole que cette application ne prend pas en charge. Choisissez un autre nœud dans les Paramètres ou vérifiez si une mise à jour de l\'application est disponible';
+
+  @override
+  String get nodeCapabilitiesUnknown =>
+      'Vérification en cours des capacités du nœud Mostro sélectionné. Réessayez dans un instant';
+
+  @override
   String get storageUnavailable =>
       'L\'application ne peut pas créer ni prendre d\'ordres tant que sa base de données locale est indisponible. Redémarrez l\'application et réessayez';
 

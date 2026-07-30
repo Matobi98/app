@@ -7,6 +7,7 @@ import 'package:go_router/go_router.dart';
 
 import 'package:mostro/core/app_routes.dart';
 import 'package:mostro/core/app_theme.dart';
+import 'package:mostro/core/daemon_errors.dart';
 import 'package:mostro/l10n/app_localizations.dart';
 import 'package:mostro/features/account/providers/privacy_mode_provider.dart';
 import 'package:mostro/features/home/providers/home_order_providers.dart';
@@ -164,13 +165,10 @@ class _TakeOrderScreenState extends ConsumerState<TakeOrderScreen> {
         );
         context.go(AppRoute.home);
       } else {
-        final display = msg.contains('NoDaemonResponse')
-            ? l10n.sessionTimeoutMessage
-            // No durable storage means the trade-key counter cannot be
-            // recorded, so no key is derived and the take never happens.
-            : msg.contains('StorageUnavailable')
-                ? l10n.storageUnavailable
-                : msg;
+        // Every shared daemon marker (timeout, storage, node capability and
+        // protocol) maps centrally. BondRequired is gone: a bond-requiring
+        // node now replies pay-bond-invoice instead of rejecting the take.
+        final display = localizedDaemonError(l10n, msg, fallback: msg);
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text(display)),
         );
