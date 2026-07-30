@@ -255,8 +255,11 @@ class AppLocalizationsEn extends AppLocalizations {
   String get releaseOrderButton => 'Release';
 
   @override
-  String get bondPaymentInFlight =>
-      'Waiting for the payment result — you can\'t cancel until it resolves.';
+  String get leaveBondPaymentWaitingContent =>
+      'The bond payment is still resolving, so the order can\'t be returned to the book yet. You can leave — the trade stays in My Trades and you can come back to it.';
+
+  @override
+  String get keepWaitingButton => 'Keep waiting';
 
   @override
   String get bondPaymentNotPaidYet => 'I haven\'t paid yet';

@@ -258,8 +258,11 @@ class AppLocalizationsDe extends AppLocalizations {
   String get releaseOrderButton => 'Freigeben';
 
   @override
-  String get bondPaymentInFlight =>
-      'Warten auf das Zahlungsergebnis — Abbrechen ist erst nach der Klärung möglich.';
+  String get leaveBondPaymentWaitingContent =>
+      'Die Kautionszahlung wird noch geklärt, daher kann die Order noch nicht ins Orderbuch zurückgegeben werden. Du kannst verlassen — der Handel bleibt in Meine Trades und du kannst zurückkehren.';
+
+  @override
+  String get keepWaitingButton => 'Weiter warten';
 
   @override
   String get bondPaymentNotPaidYet => 'Ich habe noch nicht bezahlt';

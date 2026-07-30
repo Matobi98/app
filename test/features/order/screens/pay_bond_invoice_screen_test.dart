@@ -163,7 +163,7 @@ void main() {
       expect(find.text(l10n.bondPaymentNotPaidYet), findsOneWidget);
     });
 
-    testWidgets('back is blocked while the payment outcome is unknown',
+    testWidgets('back offers leaving but never releasing while unresolved',
         (tester) async {
       await _pumpBondScreen(tester);
       await tester.tap(find.text(l10n.copyButtonLabel));
@@ -175,9 +175,26 @@ void main() {
       await _settle(tester);
 
       expect(find.text('start-route'), findsNothing,
-          reason: 'the screen must not pop while the bond may be settling');
-      expect(find.text(l10n.leaveBondPaymentTitle), findsNothing,
-          reason: 'leaving is not on offer until the outcome resolves');
+          reason: 'the pop goes through the policy, not straight out');
+      expect(find.text(l10n.releaseOrderButton), findsNothing,
+          reason: 'releasing could race a bond that is already settling');
+      expect(find.text(l10n.leaveButton), findsOneWidget,
+          reason: 'leaving sends nothing, so it must stay available');
+    });
+
+    testWidgets('keep waiting returns to the waiting state', (tester) async {
+      await _pumpBondScreen(tester);
+      await tester.tap(find.text(l10n.copyButtonLabel));
+      await _settle(tester);
+      await tester.binding.handlePopRoute();
+      await tester.pump();
+      await _settle(tester);
+
+      await tester.tap(find.text(l10n.keepWaitingButton));
+      await _settle(tester);
+      await _settle(tester);
+
+      expect(find.text(l10n.leaveBondPaymentWaitingContent), findsNothing);
       expect(find.text(l10n.bondPaymentNotPaidYet), findsOneWidget);
     });
 

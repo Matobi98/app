@@ -259,8 +259,11 @@ class AppLocalizationsIt extends AppLocalizations {
   String get releaseOrderButton => 'Libera';
 
   @override
-  String get bondPaymentInFlight =>
-      'In attesa dell\'esito del pagamento: non puoi annullare finché non si risolve.';
+  String get leaveBondPaymentWaitingContent =>
+      'Il pagamento della cauzione è ancora in corso di risoluzione, quindi l\'ordine non può ancora tornare al libro. Puoi uscire: lo scambio resta in I miei scambi e potrai riprenderlo.';
+
+  @override
+  String get keepWaitingButton => 'Continua ad attendere';
 
   @override
   String get bondPaymentNotPaidYet => 'Non ho ancora pagato';

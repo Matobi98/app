@@ -530,11 +530,17 @@ abstract class AppLocalizations {
   /// **'Release'**
   String get releaseOrderButton;
 
-  /// Snackbar shown when the taker tries to leave or cancel while a bond payment outcome is still unknown
+  /// Body of the leave dialog while a bond payment outcome is unknown: leaving is safe, releasing the order is not offered
   ///
   /// In en, this message translates to:
-  /// **'Waiting for the payment result — you can\'t cancel until it resolves.'**
-  String get bondPaymentInFlight;
+  /// **'The bond payment is still resolving, so the order can\'t be returned to the book yet. You can leave — the trade stays in My Trades and you can come back to it.'**
+  String get leaveBondPaymentWaitingContent;
+
+  /// Dialog action that dismisses the leave prompt and stays on the bond screen while the payment resolves
+  ///
+  /// In en, this message translates to:
+  /// **'Keep waiting'**
+  String get keepWaitingButton;
 
   /// Recovery action shown after a bond payment was launched, returning the screen to a cancellable state when the payment never happened
   ///

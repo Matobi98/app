@@ -127,15 +127,31 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
     }
   }
 
-  /// Single back handler for every branch: block the pop while a payment is
-  /// unresolved, otherwise let the taker keep paying, leave the trade in place,
-  /// or release the bond outright.
+  /// Single back handler for every branch. Leaving is always allowed — it sends
+  /// nothing and the trade stays in My Trades — but releasing the order is only
+  /// offered while the bond is certainly unpaid, so it can never race a bond
+  /// that is settling.
   Future<void> _handleBackIntent() async {
     final l10n = AppLocalizations.of(context);
     if (_outcomeUnknown) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(l10n.bondPaymentInFlight)),
+      final leave = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: Text(l10n.leaveBondPaymentTitle),
+          content: Text(l10n.leaveBondPaymentWaitingContent),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: Text(l10n.keepWaitingButton),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: Text(l10n.leaveButton),
+            ),
+          ],
+        ),
       );
+      if (leave == true && mounted) context.pop();
       return;
     }
     final choice = await showDialog<_LeaveChoice>(
@@ -186,22 +202,43 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
       );
 
   /// Bottom slot shared by the NWC and manual branches: destructive cancel only
-  /// while the bond is certainly unpaid, recovery path once a payment was fired.
+  /// while the bond is certainly unpaid, and never a dead end — every waiting
+  /// phase offers a way out in case the daemon never confirms.
   Widget _footer(AppColors? colors, Color green, AppLocalizations l10n) =>
       switch (_phase) {
         _PaymentPhase.idle => _cancelButton(colors, l10n),
-        _PaymentPhase.launched => Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              _waitingIndicator(colors, green, l10n),
-              TextButton(
-                onPressed: _onNotPaidYet,
-                child: Text(l10n.bondPaymentNotPaidYet),
-              ),
-            ],
+        _PaymentPhase.launched => _waitingWithEscape(
+            colors,
+            green,
+            l10n,
+            label: l10n.bondPaymentNotPaidYet,
+            onPressed: _onNotPaidYet,
           ),
-        _PaymentPhase.confirming => _waitingIndicator(colors, green, l10n),
+        // The wallet reported success, so "not paid yet" no longer applies: the
+        // escape is leaving the screen, which sends nothing.
+        _PaymentPhase.confirming => _waitingWithEscape(
+            colors,
+            green,
+            l10n,
+            label: l10n.leaveButton,
+            onPressed: _handleBackIntent,
+          ),
       };
+
+  Widget _waitingWithEscape(
+    AppColors? colors,
+    Color green,
+    AppLocalizations l10n, {
+    required String label,
+    required VoidCallback onPressed,
+  }) =>
+      Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _waitingIndicator(colors, green, l10n),
+          TextButton(onPressed: onPressed, child: Text(label)),
+        ],
+      );
 
   Widget _cancelButton(AppColors? colors, AppLocalizations l10n) {
     final red = colors?.destructiveRed ?? const Color(0xFFD84D4D);
