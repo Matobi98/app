@@ -243,6 +243,29 @@ class AppLocalizationsEs extends AppLocalizations {
       'Esperando la factura de la fianza...';
 
   @override
+  String get leaveBondPaymentTitle => '¿Salir del pago de la fianza?';
+
+  @override
+  String get leaveBondPaymentContent =>
+      'La orden queda reservada hasta que la fianza expire. Podés pagarla más tarde desde la operación, o liberarla ahora.';
+
+  @override
+  String get keepPayingButton => 'Seguir pagando';
+
+  @override
+  String get leaveButton => 'Salir';
+
+  @override
+  String get releaseOrderButton => 'Liberar';
+
+  @override
+  String get bondPaymentInFlight =>
+      'Esperando el resultado del pago: no podés cancelar hasta que se resuelva.';
+
+  @override
+  String get bondPaymentNotPaidYet => 'Todavía no pagué';
+
+  @override
   String get bondInvoiceQrLabel =>
       'Código QR de la factura de la fianza antiabuso';
 

@@ -239,6 +239,29 @@ class AppLocalizationsEn extends AppLocalizations {
   String get tradeWaitingForBondInvoice => 'Waiting for the bond invoice...';
 
   @override
+  String get leaveBondPaymentTitle => 'Leave bond payment?';
+
+  @override
+  String get leaveBondPaymentContent =>
+      'The order stays reserved until the bond expires. You can pay it later from the trade, or release it now.';
+
+  @override
+  String get keepPayingButton => 'Keep paying';
+
+  @override
+  String get leaveButton => 'Leave';
+
+  @override
+  String get releaseOrderButton => 'Release';
+
+  @override
+  String get bondPaymentInFlight =>
+      'Waiting for the payment result — you can\'t cancel until it resolves.';
+
+  @override
+  String get bondPaymentNotPaidYet => 'I haven\'t paid yet';
+
+  @override
   String get bondInvoiceQrLabel => 'Anti-abuse bond invoice QR code';
 
   @override

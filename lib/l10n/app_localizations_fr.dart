@@ -245,6 +245,29 @@ class AppLocalizationsFr extends AppLocalizations {
       'En attente de la facture de caution...';
 
   @override
+  String get leaveBondPaymentTitle => 'Quitter le paiement de la caution ?';
+
+  @override
+  String get leaveBondPaymentContent =>
+      'L\'ordre reste réservé jusqu\'à l\'expiration de la caution. Vous pouvez la payer plus tard depuis l\'échange, ou la libérer maintenant.';
+
+  @override
+  String get keepPayingButton => 'Continuer à payer';
+
+  @override
+  String get leaveButton => 'Quitter';
+
+  @override
+  String get releaseOrderButton => 'Libérer';
+
+  @override
+  String get bondPaymentInFlight =>
+      'En attente du résultat du paiement — impossible d\'annuler avant sa résolution.';
+
+  @override
+  String get bondPaymentNotPaidYet => 'Je n\'ai pas encore payé';
+
+  @override
   String get bondInvoiceQrLabel => 'Code QR de la facture de caution anti-abus';
 
   @override

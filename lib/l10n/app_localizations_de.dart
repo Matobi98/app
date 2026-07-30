@@ -242,6 +242,29 @@ class AppLocalizationsDe extends AppLocalizations {
   String get tradeWaitingForBondInvoice => 'Warten auf die Kautionsrechnung...';
 
   @override
+  String get leaveBondPaymentTitle => 'Kautionszahlung verlassen?';
+
+  @override
+  String get leaveBondPaymentContent =>
+      'Die Order bleibt reserviert, bis die Kaution abläuft. Du kannst sie später über den Handel bezahlen oder jetzt freigeben.';
+
+  @override
+  String get keepPayingButton => 'Weiter bezahlen';
+
+  @override
+  String get leaveButton => 'Verlassen';
+
+  @override
+  String get releaseOrderButton => 'Freigeben';
+
+  @override
+  String get bondPaymentInFlight =>
+      'Warten auf das Zahlungsergebnis — Abbrechen ist erst nach der Klärung möglich.';
+
+  @override
+  String get bondPaymentNotPaidYet => 'Ich habe noch nicht bezahlt';
+
+  @override
   String get bondInvoiceQrLabel =>
       'QR-Code der Anti-Missbrauchs-Kautionsrechnung';
 

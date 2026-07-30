@@ -32,8 +32,26 @@ class PayBondInvoiceScreen extends ConsumerStatefulWidget {
       _PayBondInvoiceScreenState();
 }
 
+/// How far the bond payment has got, which decides whether cancelling and
+/// leaving are safe.
+enum _PaymentPhase {
+  /// Nothing dispatched yet — the bond is certainly unpaid.
+  idle,
+
+  /// A payment was launched (external wallet, invoice copied or shared, NWC in
+  /// flight) and the Lightning outcome is unknown, so cancelling could race a
+  /// bond that is settling or already settled.
+  launched,
+
+  /// The wallet reported success; waiting for the daemon to advance the order.
+  confirming,
+}
+
+/// What the taker chose when backing out of the bond screen.
+enum _LeaveChoice { keepPaying, leave, release }
+
 class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
-  bool _waiting = false;
+  _PaymentPhase _phase = _PaymentPhase.idle;
 
   /// `true` when NWC is connected but payment failed → show QR fallback.
   bool _manualMode = false;
@@ -41,12 +59,28 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
   /// One-shot guard so we don't navigate twice as further statuses stream in.
   bool _navigated = false;
 
+  bool get _outcomeUnknown => _phase != _PaymentPhase.idle;
+
+  /// Marks the payment as dispatched. Called at initiation — not on success —
+  /// so a bond that is settling can never be cancelled from under the daemon.
+  void _onPaymentLaunched() {
+    if (!mounted || _phase != _PaymentPhase.idle) return;
+    setState(() => _phase = _PaymentPhase.launched);
+  }
+
   /// NWC success callback: just show the spinner — the actual navigation is
   /// driven by the [tradeStatusProvider] listener below, which waits for the
   /// daemon to confirm the bond HTLC and advance the order.
   void _onPaymentDetected() {
     if (!mounted) return;
-    setState(() => _waiting = true);
+    setState(() => _phase = _PaymentPhase.confirming);
+  }
+
+  /// Recovery path when the launched payment never happened (wallet dismissed,
+  /// invoice copied but not paid), returning the screen to a cancellable state.
+  void _onNotPaidYet() {
+    if (!mounted) return;
+    setState(() => _phase = _PaymentPhase.idle);
   }
 
   /// Back out of the take while the bond is unpaid. Sends a real cancel so the
@@ -72,6 +106,11 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
       ),
     );
     if (confirmed != true || !mounted) return;
+    await _releaseOrder();
+  }
+
+  Future<void> _releaseOrder() async {
+    final l10n = AppLocalizations.of(context);
     try {
       await orders_api.cancelOrder(orderId: widget.orderId);
       if (!mounted) return;
@@ -88,6 +127,50 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
     }
   }
 
+  /// Single back handler for every branch: block the pop while a payment is
+  /// unresolved, otherwise let the taker keep paying, leave the trade in place,
+  /// or release the bond outright.
+  Future<void> _handleBackIntent() async {
+    final l10n = AppLocalizations.of(context);
+    if (_outcomeUnknown) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(l10n.bondPaymentInFlight)),
+      );
+      return;
+    }
+    final choice = await showDialog<_LeaveChoice>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(l10n.leaveBondPaymentTitle),
+        content: Text(l10n.leaveBondPaymentContent),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, _LeaveChoice.keepPaying),
+            child: Text(l10n.keepPayingButton),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, _LeaveChoice.leave),
+            child: Text(l10n.leaveButton),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, _LeaveChoice.release),
+            child: Text(l10n.releaseOrderButton),
+          ),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    switch (choice) {
+      case null:
+      case _LeaveChoice.keepPaying:
+        return;
+      case _LeaveChoice.leave:
+        context.pop();
+      case _LeaveChoice.release:
+        await _releaseOrder();
+    }
+  }
+
   Widget _waitingIndicator(AppColors? colors, Color green,
           AppLocalizations l10n) =>
       Column(
@@ -101,6 +184,24 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
           ),
         ],
       );
+
+  /// Bottom slot shared by the NWC and manual branches: destructive cancel only
+  /// while the bond is certainly unpaid, recovery path once a payment was fired.
+  Widget _footer(AppColors? colors, Color green, AppLocalizations l10n) =>
+      switch (_phase) {
+        _PaymentPhase.idle => _cancelButton(colors, l10n),
+        _PaymentPhase.launched => Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _waitingIndicator(colors, green, l10n),
+              TextButton(
+                onPressed: _onNotPaidYet,
+                child: Text(l10n.bondPaymentNotPaidYet),
+              ),
+            ],
+          ),
+        _PaymentPhase.confirming => _waitingIndicator(colors, green, l10n),
+      };
 
   Widget _cancelButton(AppColors? colors, AppLocalizations l10n) {
     final red = colors?.destructiveRed ?? const Color(0xFFD84D4D);
@@ -177,7 +278,14 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
       },
     );
 
-    return tradeAsync.when(
+    // Every branch below renders its own AppBar, so the back handling lives
+    // here: no branch can pop without going through the policy.
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _handleBackIntent();
+      },
+      child: tradeAsync.when(
       loading: () => Scaffold(
         appBar: AppBar(title: Text(l10n.payBondInvoiceTitle)),
         body: const Center(child: CircularProgressIndicator()),
@@ -222,18 +330,19 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
               child: Column(
                 children: [
                   const Spacer(),
-                  if (_waiting)
-                    _waitingIndicator(colors, green, l10n)
-                  else
+                  if (_phase == _PaymentPhase.idle)
                     NwcPaymentWidget(
                       bolt11: invoice,
                       amountSats: amountSats,
+                      onPaymentStarted: _onPaymentLaunched,
                       onPaymentSuccess: _onPaymentDetected,
-                      onFallbackToManual: () =>
-                          setState(() => _manualMode = true),
+                      onFallbackToManual: () => setState(() {
+                        _manualMode = true;
+                        _phase = _PaymentPhase.idle;
+                      }),
                     ),
                   const Spacer(),
-                  if (!_waiting) _cancelButton(colors, l10n),
+                  _footer(colors, green, l10n),
                 ],
               ),
             ),
@@ -316,7 +425,9 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
                               } catch (_) {
                                 launched = false;
                               }
-                              if (!launched && context.mounted) {
+                              if (launched) {
+                                _onPaymentLaunched();
+                              } else if (context.mounted) {
                                 ScaffoldMessenger.of(context).showSnackBar(
                                   SnackBar(
                                     content: Text(l10n.noLightningWalletFound),
@@ -350,6 +461,7 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
                                   await Clipboard.setData(
                                     ClipboardData(text: invoice),
                                   );
+                                  _onPaymentLaunched();
                                   if (!context.mounted) return;
                                   ScaffoldMessenger.of(context).showSnackBar(
                                     SnackBar(
@@ -377,6 +489,7 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
                                   try {
                                     await SharePlus.instance
                                         .share(ShareParams(text: invoice));
+                                    _onPaymentLaunched();
                                   } catch (e, st) {
                                     debugPrint(
                                       '[PayBondInvoiceScreen] share failed: $e\n$st',
@@ -407,15 +520,13 @@ class _PayBondInvoiceScreenState extends ConsumerState<PayBondInvoiceScreen> {
                 ),
                 const SizedBox(height: AppSpacing.lg),
 
-                if (_waiting)
-                  _waitingIndicator(colors, green, l10n)
-                else
-                  _cancelButton(colors, l10n),
+                _footer(colors, green, l10n),
               ],
             ),
           ),
         );
       },
+      ),
     );
   }
 }

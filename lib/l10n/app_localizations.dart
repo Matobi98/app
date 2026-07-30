@@ -500,6 +500,48 @@ abstract class AppLocalizations {
   /// **'Waiting for the bond invoice...'**
   String get tradeWaitingForBondInvoice;
 
+  /// Title of the dialog shown when the taker navigates back from the bond payment screen with the bond unpaid
+  ///
+  /// In en, this message translates to:
+  /// **'Leave bond payment?'**
+  String get leaveBondPaymentTitle;
+
+  /// Body of the leave-bond-payment dialog, explaining that leaving keeps the order reserved and releasing returns it to the book
+  ///
+  /// In en, this message translates to:
+  /// **'The order stays reserved until the bond expires. You can pay it later from the trade, or release it now.'**
+  String get leaveBondPaymentContent;
+
+  /// Dialog action that dismisses the leave prompt and stays on the bond payment screen
+  ///
+  /// In en, this message translates to:
+  /// **'Keep paying'**
+  String get keepPayingButton;
+
+  /// Dialog action that leaves the bond payment screen without cancelling, keeping the trade in My Trades
+  ///
+  /// In en, this message translates to:
+  /// **'Leave'**
+  String get leaveButton;
+
+  /// Dialog action that cancels the take and returns the order to the book
+  ///
+  /// In en, this message translates to:
+  /// **'Release'**
+  String get releaseOrderButton;
+
+  /// Snackbar shown when the taker tries to leave or cancel while a bond payment outcome is still unknown
+  ///
+  /// In en, this message translates to:
+  /// **'Waiting for the payment result — you can\'t cancel until it resolves.'**
+  String get bondPaymentInFlight;
+
+  /// Recovery action shown after a bond payment was launched, returning the screen to a cancellable state when the payment never happened
+  ///
+  /// In en, this message translates to:
+  /// **'I haven\'t paid yet'**
+  String get bondPaymentNotPaidYet;
+
   /// Accessibility label for the anti-abuse bond Lightning invoice QR code
   ///
   /// In en, this message translates to:
