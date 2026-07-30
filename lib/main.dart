@@ -3,11 +3,15 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+// Resolves the app's own data directory — never the user-visible Documents
+// folder. Web gets the stub; main() only calls it behind `!kIsWeb`.
+import 'package:mostro/core/storage/app_data_dir.dart'
+    if (dart.library.html) 'package:mostro/core/storage/app_data_dir_web.dart';
 import 'package:mostro/core/app.dart';
 import 'package:mostro/core/mostro_defaults.dart';
 import 'package:mostro/core/services/identity_service.dart';
+import 'package:mostro/core/web/bridge_probe.dart';
 import 'package:mostro/features/settings/providers/settings_provider.dart';
 import 'package:mostro/features/settings/widgets/mostro_node_selector.dart';
 import 'package:mostro/features/walkthrough/providers/first_run_provider.dart';
@@ -15,12 +19,13 @@ import 'package:mostro/firebase_options.dart';
 import 'package:mostro/src/rust/frb_generated.dart';
 import 'package:mostro/src/rust/api.dart' as rust_api;
 import 'package:mostro/features/settings/providers/nwc_provider.dart';
+import 'package:mostro/src/rust/api/escrow.dart' as escrow_api;
 import 'package:mostro/src/rust/api/nwc.dart' as nwc_api;
-import 'package:mostro/src/rust/api/logging.dart' as logging_api;
 import 'package:mostro/src/rust/api/nostr.dart' as nostr_api;
 import 'package:mostro/src/rust/api/orders.dart' as orders_api;
 import 'package:mostro/src/rust/api/settings.dart' as settings_api;
 import 'package:mostro/src/rust/api/bond.dart' as bond_api;
+import 'package:mostro/src/rust/api/identity.dart' as identity_api;
 import 'package:mostro/src/rust/api/types.dart' show SlashCause, BondSlashedEvent;
 import 'package:mostro/features/notifications/models/notification_model.dart';
 import 'package:mostro/features/notifications/providers/notifications_provider.dart';
@@ -39,12 +44,26 @@ Future<void> main() async {
 
   await RustLib.init();
 
+  // Pre-read SharedPreferences so providers start with synchronous initial
+  // values — eliminates the AsyncValue.loading() race that caused the router
+  // to show the home screen before redirecting to /walkthrough on first launch.
+  final prefs = await SharedPreferences.getInstance();
+  final firstRunComplete = prefs.getBool(kFirstRunCompleteKey) ?? false;
+  final backupDismissed = prefs.getBool(kBackupReminderDismissedKey) ?? false;
+  final backupActive = prefs.getBool(kBackupReminderActiveKey) ?? false;
+  final backupPending = backupActive && !backupDismissed;
+  final savedSettings = AppSettingsState.fromPrefs(prefs);
+
+  // Before any startup work below, so a failure in it is captured at the
+  // verbosity the user asked for rather than the default.
+  await settings_api.setLoggingEnabled(enabled: savedSettings.loggingEnabled);
+
   // Initialize persistent SQLite store. Must come before any trade / order
   // operations that read or write trade keys and trade records.
   if (!kIsWeb) {
     try {
-      final docsDir = await getApplicationDocumentsDirectory();
-      await rust_api.initDb(path: p.join(docsDir.path, 'mostro.db'));
+      final dataDir = await appDataDirPath();
+      await rust_api.initDb(path: p.join(dataDir, 'mostro.db'));
     } catch (e, st) {
       // DB init failure is non-fatal: trade-key and role persistence won't
       // work for this session, but the app can still browse orders and relay
@@ -58,12 +77,38 @@ Future<void> main() async {
   // node. No-op when none was saved (the compiled-in default then applies).
   // The resolved pubkey seeds mostroPubkeyProvider so Settings shows the real
   // active node on launch.
+  //
+  // This is also the first call that proves the Rust bridge is alive end to
+  // end, so its outcome doubles as the web readiness probe CI waits on — see
+  // lib/core/web/bridge_probe.dart (no-op off web).
   String activeMostroPubkey = defaultMostroPubkey;
   try {
     await settings_api.rehydrateActiveMostroNode();
     activeMostroPubkey = await settings_api.getMostroPubkey();
+    // Load the escrow-mode overrides before the relay pool starts, so the first
+    // capability fetch already resolves against them. Nothing can have written
+    // them in a release build (docs/cashu/README.md §4.3).
+    await escrow_api.rehydrateEscrowOverrides();
+    markBridgeReady();
   } catch (e) {
     debugPrint('[main] rehydrate active Mostro node failed: $e');
+    markBridgeFailed(e);
+  }
+
+  // Mirror consumed trade-key indices into secure storage — the copy that
+  // outlives mostro.db, which Rust keeps as the primary record (issue #249).
+  //
+  // Subscribed BEFORE identity init on purpose: loading the identity is itself
+  // a publication point (when the database knew a higher counter than secure
+  // storage, the reconciled value is published so this copy catches up), and
+  // the Tokio broadcast channel drops a value that has no receiver yet.
+  // Guarded like every other optional startup step: if the bridge is broken
+  // the mirror is simply absent — the database copy is still the primary
+  // record — rather than taking main() down before the UI renders.
+  try {
+    _mirrorTradeKeyIndex(await identity_api.onTradeKeyIndexChanged());
+  } catch (e) {
+    debugPrint('[identity] trade-key index mirror unavailable: $e');
   }
 
   // Initialize identity: creates on first launch, reloads on subsequent launches.
@@ -73,16 +118,6 @@ Future<void> main() async {
   } catch (e, st) {
     debugPrint('[main] Identity init failed — secure storage unavailable: $e\n$st');
   }
-
-  // Pre-read SharedPreferences so providers start with synchronous initial
-  // values — eliminates the AsyncValue.loading() race that caused the router
-  // to show the home screen before redirecting to /walkthrough on first launch.
-  final prefs = await SharedPreferences.getInstance();
-  final firstRunComplete = prefs.getBool(kFirstRunCompleteKey) ?? false;
-  final backupDismissed = prefs.getBool(kBackupReminderDismissedKey) ?? false;
-  final backupActive = prefs.getBool(kBackupReminderActiveKey) ?? false;
-  final backupPending = backupActive && !backupDismissed;
-  final savedSettings = AppSettingsState.fromPrefs(prefs);
 
   // Subscribe to bond-slashed notices BEFORE relay delivery starts, so the
   // Tokio broadcast channel buffers any notice arriving during startup rather
@@ -100,9 +135,6 @@ Future<void> main() async {
 
   // Watch for connection state changes in background (logs appear in flutter output).
   _watchConnectionState();
-
-  // Forward Rust log entries to debugPrint so they appear in `flutter run`.
-  _forwardRustLogs();
 
   final container = ProviderContainer(
     overrides: [
@@ -136,6 +168,27 @@ Future<void> main() async {
   ));
 }
 
+/// Persists every consumed trade-key index reported by Rust.
+///
+/// Runs for the process lifetime. A write failure is logged and the loop
+/// continues: the database copy is still authoritative, and the next index
+/// (or the load-time reconciliation) supersedes the one that was missed.
+void _mirrorTradeKeyIndex(identity_api.TradeKeyIndexStream stream) {
+  Future.microtask(() async {
+    while (true) {
+      final int index;
+      try {
+        index = await stream.next();
+      } catch (e) {
+        debugPrint('[identity] trade-key index stream closed: $e');
+        break;
+      }
+      debugPrint('[identity] mirroring trade-key index $index to secure storage');
+      await IdentityService.saveTradeKeyIndex(index);
+    }
+  });
+}
+
 /// Reconnect a previously saved NWC wallet in the background.
 void _restoreNwcConnection(String nwcUri, ProviderContainer container) {
   Future.microtask(() async {
@@ -152,31 +205,6 @@ void _restoreNwcConnection(String nwcUri, ProviderContainer container) {
       debugPrint('[nwc] wallet restored: ${info.walletName ?? info.walletPubkey}');
     } catch (e) {
       debugPrint('[nwc] wallet restore failed: $e');
-    }
-  });
-}
-
-/// Forward Rust log entries to debugPrint so they are visible in `flutter run`.
-///
-/// Only active in debug builds.
-void _forwardRustLogs() {
-  if (!kDebugMode) return;
-  debugPrint('[rust-log] starting Rust log forwarder...');
-  Future.microtask(() async {
-    try {
-      debugPrint('[rust-log] subscribing to Rust log stream...');
-      final stream = await logging_api.onLogEntry();
-      debugPrint('[rust-log] subscribed — waiting for entries');
-      while (true) {
-        final entry = await stream.next();
-        if (entry == null) {
-          debugPrint('[rust-log] stream closed');
-          break;
-        }
-        debugPrint('[rust/${entry.tag}] ${entry.message}');
-      }
-    } catch (e, st) {
-      debugPrint('[rust-log] bridge error: $e\n$st');
     }
   });
 }

@@ -289,6 +289,10 @@ class AppLocalizationsFr extends AppLocalizations {
       'Temps pour payer la caution anti-abus';
 
   @override
+  String get storageUnavailable =>
+      'L\'application ne peut pas créer ni prendre d\'ordres tant que sa base de données locale est indisponible. Redémarrez l\'application et réessayez';
+
+  @override
   String addInvoiceAmount(String sats) {
     return 'Montant à recevoir : $sats sats';
   }
@@ -681,6 +685,10 @@ class AppLocalizationsFr extends AppLocalizations {
   @override
   String get backupConfirmCheckbox =>
       'J\'ai noté mes mots et les ai sauvegardés en lieu sûr';
+
+  @override
+  String get backupRitualSecondFailureMessage =>
+      'C\'est encore incorrect. Veuillez vérifier et sauvegarder vos mots secrets, puis recommencer la vérification depuis le début.';
 
   @override
   String get cancelTradeDialogTitle => 'Annuler l\'échange ?';
@@ -1421,16 +1429,16 @@ class AppLocalizationsFr extends AppLocalizations {
   String get noLogsToShareTooltip => 'Aucun journal à partager';
 
   @override
-  String get disableLoggingTooltip => 'Désactiver la journalisation';
+  String get disableLoggingTooltip => 'Désactiver la journalisation détaillée';
 
   @override
-  String get enableLoggingTooltip => 'Activer la journalisation';
+  String get enableLoggingTooltip => 'Activer la journalisation détaillée';
 
   @override
-  String get loggingEnabledStatus => 'Journalisation activée';
+  String get loggingEnabledStatus => 'Journalisation détaillée activée';
 
   @override
-  String get loggingDisabledStatus => 'Journalisation désactivée';
+  String get loggingDisabledStatus => 'Journalisation détaillée désactivée';
 
   @override
   String get noLogEntriesMessage => 'Aucune entrée de journal';
@@ -2206,9 +2214,29 @@ class AppLocalizationsFr extends AppLocalizations {
   String get marketPriceCaption => 'Prix du marché';
 
   @override
-  String orderReputationStats(int trades, int days) {
-    return ' · $trades transactions · $days jours';
+  String reputationTradesLabel(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: 'transactions',
+      one: 'transaction',
+    );
+    return '$_temp0';
   }
+
+  @override
+  String reputationDaysLabel(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: 'jours',
+      one: 'jour',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get sortNewest => 'Tri : plus récentes ▾';
 
   @override
   String get hideEarlierEvents => 'Masquer les événements précédents';
@@ -2363,4 +2391,86 @@ class AppLocalizationsFr extends AppLocalizations {
 
   @override
   String get bondSlashedDetailPaymentMethod => 'Moyen de paiement';
+
+  @override
+  String aboutDaysValue(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count jours',
+      one: '$count jour',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get aboutCashuEscrowSection => 'Séquestre Cashu';
+
+  @override
+  String get aboutCashuMintUrlLabel => 'Mint';
+
+  @override
+  String get aboutCashuMintUrlExplanation =>
+      'Le mint Cashu que ce nœud utilise pour tous les séquestres. L\'ecash bloqué pour un échange est émis par ce mint ; il n\'y a pas de choix par ordre.';
+
+  @override
+  String get aboutCashuMintNotAdvertised => 'Non annoncé';
+
+  @override
+  String get aboutCashuLocktimeLabel => 'Verrouillage du séquestre';
+
+  @override
+  String get aboutCashuLocktimeExplanation =>
+      'Durée pendant laquelle l\'ecash du vendeur reste bloqué en séquestre. À l\'expiration, le vendeur peut récupérer les fonds sans l\'aide du nœud.';
+
+  @override
+  String get aboutCashuSettlementMarginLabel => 'Marge de règlement';
+
+  @override
+  String get aboutCashuSettlementMarginExplanation =>
+      'Combien de temps avant l\'expiration du séquestre ce nœud cesse d\'accepter « fiat envoyé », afin qu\'aucun échange ne soit réglé sans temps suffisant pour être mené à terme.';
+
+  @override
+  String get escrowModeLightning => 'Lightning';
+
+  @override
+  String get escrowModeCashu => 'Cashu';
+
+  @override
+  String get escrowModeUnknown => 'Non annoncé';
+
+  @override
+  String get settingsEscrowOverrideTitle =>
+      'Backend de séquestre (développeur)';
+
+  @override
+  String get settingsEscrowOverrideSubtitle =>
+      'Testez Cashu avec un nœud qui ne l\'annonce pas encore. Builds de débogage uniquement.';
+
+  @override
+  String get settingsForceCashuLabel => 'Forcer le séquestre Cashu';
+
+  @override
+  String get settingsCashuMintOverrideLabel => 'URL de mint alternative';
+
+  @override
+  String get settingsCashuMintOverrideApply => 'Appliquer';
+
+  @override
+  String get settingsCashuMintOverrideInvalid =>
+      'Ce n\'est pas une URL de mint valide. Utilisez http ou https avec un hôte.';
+
+  @override
+  String settingsEscrowEffectiveMode(String mode) {
+    return 'Backend effectif : $mode';
+  }
+
+  @override
+  String settingsEscrowEffectiveMint(String mint) {
+    return 'Mint effectif : $mint';
+  }
+
+  @override
+  String get settingsEscrowCashuUnavailable =>
+      'Cashu ne peut pas fonctionner sans mint : configurez-en un ci-dessous.';
 }

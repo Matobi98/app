@@ -288,6 +288,10 @@ class AppLocalizationsIt extends AppLocalizations {
       'Tempo per pagare la cauzione anti-abuso';
 
   @override
+  String get storageUnavailable =>
+      'L\'app non può creare né prendere ordini finché il suo database locale non è disponibile. Riavvia l\'app e riprova';
+
+  @override
   String addInvoiceAmount(String sats) {
     return 'Importo da ricevere: $sats sats';
   }
@@ -678,6 +682,10 @@ class AppLocalizationsIt extends AppLocalizations {
   @override
   String get backupConfirmCheckbox =>
       'Ho annotato le mie parole e le ho salvate in modo sicuro';
+
+  @override
+  String get backupRitualSecondFailureMessage =>
+      'Di nuovo errato. Per favore controlla e salva le tue parole segrete, poi verifica dall\'inizio.';
 
   @override
   String get cancelTradeDialogTitle => 'Annullare lo scambio?';
@@ -1416,16 +1424,16 @@ class AppLocalizationsIt extends AppLocalizations {
   String get noLogsToShareTooltip => 'Nessun log da condividere';
 
   @override
-  String get disableLoggingTooltip => 'Disattiva la registrazione';
+  String get disableLoggingTooltip => 'Disattiva la registrazione dettagliata';
 
   @override
-  String get enableLoggingTooltip => 'Attiva la registrazione';
+  String get enableLoggingTooltip => 'Attiva la registrazione dettagliata';
 
   @override
-  String get loggingEnabledStatus => 'Registrazione attivata';
+  String get loggingEnabledStatus => 'Registrazione dettagliata attivata';
 
   @override
-  String get loggingDisabledStatus => 'Registrazione disattivata';
+  String get loggingDisabledStatus => 'Registrazione dettagliata disattivata';
 
   @override
   String get noLogEntriesMessage => 'Nessuna voce di registro';
@@ -2198,9 +2206,29 @@ class AppLocalizationsIt extends AppLocalizations {
   String get marketPriceCaption => 'Prezzo di mercato';
 
   @override
-  String orderReputationStats(int trades, int days) {
-    return ' · $trades operazioni · $days giorni';
+  String reputationTradesLabel(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: 'operazioni',
+      one: 'operazione',
+    );
+    return '$_temp0';
   }
+
+  @override
+  String reputationDaysLabel(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: 'giorni',
+      one: 'giorno',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get sortNewest => 'Ordina: più recenti ▾';
 
   @override
   String get hideEarlierEvents => 'Nascondi eventi precedenti';
@@ -2356,4 +2384,85 @@ class AppLocalizationsIt extends AppLocalizations {
 
   @override
   String get bondSlashedDetailPaymentMethod => 'Metodo di pagamento';
+
+  @override
+  String aboutDaysValue(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count giorni',
+      one: '$count giorno',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get aboutCashuEscrowSection => 'Deposito Cashu';
+
+  @override
+  String get aboutCashuMintUrlLabel => 'Mint';
+
+  @override
+  String get aboutCashuMintUrlExplanation =>
+      'La mint Cashu che questo nodo usa per ogni deposito. L\'ecash bloccato per uno scambio è emesso da questa mint; non si sceglie per singolo ordine.';
+
+  @override
+  String get aboutCashuMintNotAdvertised => 'Non dichiarata';
+
+  @override
+  String get aboutCashuLocktimeLabel => 'Blocco del deposito';
+
+  @override
+  String get aboutCashuLocktimeExplanation =>
+      'Per quanto tempo l\'ecash del venditore resta bloccato in deposito. Alla scadenza il venditore può recuperare i fondi senza l\'intervento del nodo.';
+
+  @override
+  String get aboutCashuSettlementMarginLabel => 'Margine di liquidazione';
+
+  @override
+  String get aboutCashuSettlementMarginExplanation =>
+      'Quanto prima della scadenza del deposito questo nodo smette di accettare «fiat inviato», così nessuno scambio viene liquidato con troppo poco tempo per concludersi.';
+
+  @override
+  String get escrowModeLightning => 'Lightning';
+
+  @override
+  String get escrowModeCashu => 'Cashu';
+
+  @override
+  String get escrowModeUnknown => 'Non dichiarato';
+
+  @override
+  String get settingsEscrowOverrideTitle => 'Backend di deposito (sviluppo)';
+
+  @override
+  String get settingsEscrowOverrideSubtitle =>
+      'Prova Cashu con un nodo che non lo dichiara ancora. Solo nelle build di debug.';
+
+  @override
+  String get settingsForceCashuLabel => 'Forza il deposito Cashu';
+
+  @override
+  String get settingsCashuMintOverrideLabel => 'URL mint alternativo';
+
+  @override
+  String get settingsCashuMintOverrideApply => 'Applica';
+
+  @override
+  String get settingsCashuMintOverrideInvalid =>
+      'Non è un URL di mint valido. Usa http o https con un host.';
+
+  @override
+  String settingsEscrowEffectiveMode(String mode) {
+    return 'Backend effettivo: $mode';
+  }
+
+  @override
+  String settingsEscrowEffectiveMint(String mint) {
+    return 'Mint effettiva: $mint';
+  }
+
+  @override
+  String get settingsEscrowCashuUnavailable =>
+      'Cashu non può funzionare senza una mint: impostane una qui sotto.';
 }

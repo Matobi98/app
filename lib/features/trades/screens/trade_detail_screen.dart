@@ -17,6 +17,7 @@ import 'package:mostro/features/home/providers/home_order_providers.dart';
 import 'package:mostro/features/order/providers/trade_state_provider.dart';
 import 'package:mostro/features/trades/providers/trades_providers.dart';
 import 'package:mostro/features/trades/widgets/release_confirmation_dialog.dart';
+import 'package:mostro/shared/utils/platform_int64.dart';
 import 'package:mostro/shared/widgets/mostro_reactive_button.dart';
 import 'package:mostro/shared/widgets/nym_avatar.dart';
 
@@ -141,8 +142,8 @@ class _TradeDetailScreenState extends ConsumerState<TradeDetailScreen> {
     return _epochSeconds(info?.expiresAt);
   }
 
-  /// PlatformInt64 = int on native, BigInt on web.
-  int? _epochSeconds(Object? raw) => raw is BigInt ? raw.toInt() : raw as int?;
+  int? _epochSeconds(Object? raw) =>
+      raw == null ? null : platformInt64ToInt(raw);
 
   void _startCountdown() {
     _countdownTimer = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -253,9 +254,7 @@ class _TradeDetailScreenState extends ConsumerState<TradeDetailScreen> {
     try {
       final dispute = await disputes_api.openDispute(tradeId: widget.orderId);
       if (!mounted) return;
-      final raw = dispute.openedAt;
-      // PlatformInt64 = int on native, BigInt on web.
-      final openedAt = raw is BigInt ? raw.toInt() : raw;
+      final openedAt = platformInt64ToInt(dispute.openedAt);
       ref.read(disputeNotifierProvider.notifier).upsert(
             DisputeItem(
               id: dispute.id,

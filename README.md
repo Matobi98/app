@@ -231,9 +231,17 @@ Download the latest APK from the [Releases](../../releases) page and install it,
 
 Available via TestFlight (link in Releases) or build from source with Xcode.
 
-**Web (PWA)**
+**Web**
 
-Open the hosted web app in a modern browser and install it as a Progressive Web App using the browser's "Add to Home Screen" / "Install" option.
+Open **<https://mostro.network/app/>** in a modern browser — it always serves the latest
+build of `main`. No native app is installed and nothing is uploaded: the identity is generated
+in your browser and stays there, and the app talks to Nostr relays directly.
+(`https://mostrop2p.github.io/app/` redirects there.)
+
+The very first visit reloads itself once while it installs the service worker that supplies
+the cross-origin isolation headers the Rust core needs; that is expected. Two requirements
+follow from it: the page must be loaded over **HTTPS** (a service worker needs a secure
+context), and a browser with service workers disabled cannot run the web client.
 
 **Desktop (macOS / Windows / Linux)**
 
@@ -260,6 +268,7 @@ Make sure the following tools are installed on your system:
 | Rust toolchain | 1.94+ stable | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
 | WASM target | — | `rustup target add wasm32-unknown-unknown` |
 | wasm-pack | latest | `cargo install wasm-pack` |
+| Rust nightly + `rust-src` (web only) | — | `rustup toolchain install nightly && rustup component add rust-src --toolchain nightly` |
 | flutter_rust_bridge CLI | 2.11.1 | `cargo install flutter_rust_bridge_codegen --version 2.11.1 --locked` |
 | Xcode (macOS / iOS only) | 15+ | Mac App Store |
 | Android Studio / NDK (Android only) | latest | [developer.android.com](https://developer.android.com/studio) |
@@ -296,11 +305,108 @@ flutter run
 # Target a specific platform
 flutter run -d android
 flutter run -d ios
-flutter run -d chrome        # Web (WASM)
+flutter run -d chrome        # Web — needs extra steps, see "Running on Web" below
 flutter run -d macos
 flutter run -d windows
 flutter run -d linux
 ```
+
+### Running on Web
+
+Web needs two steps that the other platforms don't. On native, the Flutter build
+compiles the Rust core for you; on web it does **not** — you compile the Rust core to
+WebAssembly yourself, and the page must be served with cross-origin isolation headers.
+Skip either step and the app builds but shows a **blank page**.
+
+**One-time prerequisites** — in addition to the table above. The wasm build compiles
+the Rust core with `-Z build-std`, which requires a nightly toolchain with `rust-src`
+(and the wasm target on that same nightly toolchain):
+
+```bash
+rustup toolchain install nightly
+rustup component add rust-src --toolchain nightly
+rustup target add wasm32-unknown-unknown --toolchain nightly
+cargo install wasm-pack
+```
+
+**1. Compile the Rust core to WASM.** This produces `web/pkg/` (`rust.js` +
+`rust_bg.wasm`). Re-run it after any change under `rust/src/`:
+
+```bash
+./scripts/build-web.sh              # add --release for an optimized build
+```
+
+Do **not** run `flutter_rust_bridge_codegen build-web` directly: on current nightly it
+silently produces WASM without shared memory, which crashes at runtime with
+`DataCloneError: ... #<Memory> could not be cloned` when FRB spawns its worker pool.
+The script adds the required linker flags and verifies the output (see issue #212).
+
+If you skip this step entirely, the console shows `Refused to execute script from
+'.../pkg/rust.js' because its MIME type ('text/html') is not executable` — the WASM was
+never built.
+
+**2. Run in Chrome with cross-origin isolation headers.** The Rust core uses
+`SharedArrayBuffer`, which browsers enable only under COOP/COEP:
+
+```bash
+flutter run -d chrome \
+  --web-header "Cross-Origin-Opener-Policy=same-origin" \
+  --web-header "Cross-Origin-Embedder-Policy=require-corp"
+```
+
+Without the headers the console shows `Buffers cannot be shared due to missing
+cross-origin headers` and the page stays blank.
+
+On first launch the app generates an identity and connects to relays; you should see the
+order book populate from the daemon's Kind 38383 events without running anything locally.
+
+### Deploying the web client
+
+`main` is published automatically to **<https://mostro.network/app/>** by
+[`.github/workflows/deploy-pages.yml`](.github/workflows/deploy-pages.yml) on every merge.
+(The organization serves its Pages sites from that domain, so this project page lives under
+`mostro.network/app/` rather than `mostrop2p.github.io/app/`, which 301s to it. The sub-path
+is the same either way.)
+The build itself lives in the reusable
+[`.github/workflows/web-build.yml`](.github/workflows/web-build.yml), which the deploy calls
+and **CI also runs on every pull request** — so a change that breaks the web target fails
+before it lands, and what CI validates cannot drift from what ships. It runs the same steps as
+above (`scripts/frb-generate.sh`, then `scripts/build-web.sh --release`) and finishes with:
+
+```bash
+flutter build web --release --base-href "/app/" --pwa-strategy=none
+```
+
+It then verifies the bundle and smoke-tests it in headless Chrome
+([`test/web/smoke/smoke.mjs`](test/web/smoke/smoke.mjs)): the release bundle is served
+cross-origin isolated under `/app/`, and the test asserts the page is isolated, the Flutter
+view mounted, a Rust bridge call returned, and nothing errored. Static checks alone cannot
+catch that — every blank-page cause below greps perfectly clean.
+
+Three things make it work on a static host that cannot set HTTP headers:
+
+- **`web/coi-serviceworker.min.js`** (vendored, MIT — see `web/coi-serviceworker.LICENSE`)
+  is loaded as the first script in `web/index.html`. It installs a service worker that
+  re-serves every request with the COOP/COEP headers injected, which is what makes
+  `SharedArrayBuffer` — and therefore the Rust core's wasm threads — available. The cost is
+  one automatic reload on a visitor's first load. It stays out of the way during local
+  development, where the headers already come from `--web-header`.
+- **`--base-href "/app/"`** — project pages are served from a sub-path; without it every
+  asset 404s and the page is blank.
+- **`--pwa-strategy=none`** — Flutter's own (deprecated) service worker would register over
+  the same scope and evict the isolation shim, silently un-isolating the page. Offline
+  caching is the trade-off.
+
+The shim registers a service worker, which browsers only allow in a **secure context** — the
+site has to be reachable over HTTPS (Pages: *Settings → Pages → Enforce HTTPS*), or the page
+loads un-isolated and stays blank.
+
+Deploying elsewhere works too, but the bundle is not portable across paths: `--base-href`
+is baked in at build time, so rebuild with the path the site is actually served from
+(`/` at a domain root, `/whatever/` under a sub-path). What carries over unchanged is the
+isolation choice — either set `Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp` at the server/CDN and drop the shim, or keep
+the shim and let it supply them.
 
 ### Build for Production
 
@@ -314,8 +420,9 @@ flutter build appbundle --release
 # iOS
 flutter build ios --release
 
-# Web (PWA)
-flutter build web --pwa-strategy=offline-first --release
+# Web — compile the Rust core first (see "Running on Web"), then:
+./scripts/build-web.sh --release
+flutter build web --release --base-href "/app/" --pwa-strategy=none
 
 # macOS
 flutter build macos --release

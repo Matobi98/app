@@ -27,10 +27,37 @@ test/
 cd rust && cargo build
 cd rust && cargo test && cargo clippy      # mandated verify (Rust)
 ./scripts/frb-generate.sh                   # after ANY change to rust/src/api/
+./scripts/build-web.sh                      # web only: compile the Rust core to web/pkg/
 flutter analyze && flutter test             # Dart side
+
+# web smoke test — needs a release bundle first (see "Web (wasm)" below):
+#   ./scripts/build-web.sh --release
+#   flutter build web --release --base-href "/app/" --pwa-strategy=none
+cd test/web/smoke && npm ci && npx playwright install chromium && BASE_PATH=/app/ node smoke.mjs
 flutter run -d linux|chrome|android         # Rust is a lib — there is no `cargo run`
 flutter gen-l10n                            # after editing lib/l10n/*.arb
 ```
+
+## Web (wasm) — non-obvious constraints
+- The Flutter build does **not** compile the Rust core on web. Run `./scripts/build-web.sh`
+  (never `flutter_rust_bridge_codegen build-web`: on current nightly it silently emits
+  non-shared memory and the FRB worker pool dies with `DataCloneError`).
+- The page must be **cross-origin isolated** (`SharedArrayBuffer`). Locally that comes from
+  `flutter run -d chrome --web-header ...`; in production from the vendored
+  `web/coi-serviceworker.min.js`, which must stay the first script in `web/index.html`.
+- `main` deploys to <https://mostro.network/app/> via `.github/workflows/deploy-pages.yml`
+  (`--base-href` for the sub-path, `--pwa-strategy=none` so Flutter's service worker does not
+  take the isolation shim's scope). Every one of these, when wrong, yields a **blank page** —
+  `test/web/pages_bundle_test.dart` guards them statically.
+- The build itself lives in the reusable **`.github/workflows/web-build.yml`**, called by both
+  `ci.yml` (every PR) and `deploy-pages.yml` — edit it there, never in a caller, or the bundle
+  CI validates drifts from the one that ships.
+- Static greps pass on a page that dies at runtime, so that workflow also runs
+  **`test/web/smoke/smoke.mjs`**: it serves the release bundle cross-origin isolated under
+  `/app/` and asserts in headless Chrome that the page is isolated, the Flutter view mounted,
+  a **Rust bridge call returned**, and nothing errored. The bridge signal comes from
+  `lib/core/web/bridge_probe.dart`, which `main()` sets after its first successful Rust call
+  (no-op off web) — rename that flag on one side only and the check silently never fires.
 
 ## Code Style
 
@@ -72,8 +99,13 @@ bridged by flutter_rust_bridge.
 ## Transport (protocol v2)
 - **Daemon messages** (new-order, take, release, cancel, dispute, rate, invoice, restore):
   **NIP-44 / signed Kind 14** (transport v2), via `wrap_mostro_message`/`unwrap_mostro_message`.
-- **Peer & dispute chat**: **NIP-59 gift wrap / Kind 1059**, via `wrap`/`unwrap`.
-- Both live in `rust/src/nostr/gift_wrap.rs` (rename to `transport.rs` pending).
+- **Peer chat**: **chat envelope** (kind 14 signed with `K_sign`, NIP-44 inner kind 1
+  signed by the trade key — <https://mostro.network/protocol/chat.html>), via
+  `mostro_wrap`/`mostro_unwrap` + `crypto/chat_keys.rs`. Outbound NIP-59 is gone from
+  this channel (gift-wrap flood attack, issue #246); inbound 1059 is still accepted
+  from pre-migration peers until the dual-read deadline (`LEGACY_CHAT_DEPRECATION_TS`).
+- **Dispute admin chat**: still **NIP-59 gift wrap / Kind 1059**, via `wrap`/`unwrap`.
+- All live in `rust/src/nostr/gift_wrap.rs` (rename to `transport.rs` pending).
 - Wire status strings are **kebab-case** (`waiting-buyer-invoice`, `fiat-sent`).
 
 ## Translations
@@ -106,7 +138,7 @@ bridged by flutter_rust_bridge.
 ## Domain gotchas (durable)
 - **Reputation/ratings come from Kind 38383 event tags, not a DB.** In-memory
   `RATING_STORE`/`DISPUTE_STORE` are correct by design — don't invent "persist to DB" tasks.
-  The only real persistence gap is **chat history**.
+  Chat history persists to the `messages` table since #246 (web still memory-only, #233).
 - **Order book is sourced only from daemon Kind 38383 events.** `create_order` waits for daemon
   confirmation; on timeout it returns an error and **persists nothing** (no phantom order).
 

@@ -31,6 +31,9 @@ TradeInfo fakeTrade({
     isMine: isMine,
     amountSats: amountSats == null ? null : BigInt.from(amountSats),
     expiresAt: expiresAt,
+    rating: 0,
+    totalReviews: 0,
+    daysActive: 0,
   );
 
   return TradeInfo(

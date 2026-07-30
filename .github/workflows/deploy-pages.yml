@@ -1,0 +1,56 @@
+name: Deploy web to GitHub Pages
+
+# Publishes the web client to https://mostro.network/app/ on every merge to main
+# (the org serves Pages from that domain; mostrop2p.github.io/app/ 301s to it).
+# The app is a pure client — outbound wss:// to Nostr relays, identity generated in the
+# browser, persistence in IndexedDB — so static hosting is enough (see issue #212).
+#
+# The bundle itself is built by the reusable web-build.yml, which CI also runs on
+# every pull request — so a web regression fails before it lands, and what CI
+# validates cannot drift from what gets published (issue #154).
+#
+# One-time repository setting this workflow depends on:
+#   Settings → Pages → Build and deployment → Source: "GitHub Actions"
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Granted per job, not workflow-wide: the build runs codegen and third-party
+# build scripts and has no business holding a Pages or OIDC write token.
+permissions: {}
+
+# Never cancel a deployment that is already publishing — a half-applied Pages
+# deployment is worse than a queued one. Matches GitHub's starter workflow.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build web bundle
+    uses: ./.github/workflows/web-build.yml
+    permissions:
+      contents: read
+    with:
+      upload-pages-artifact: true
+
+  deploy:
+    name: Deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    # workflow_dispatch lets the operator pick any ref. Publishing a branch build
+    # to the production URL would bypass the "everything lands via PR to main"
+    # rule, so only main deploys — a manual run elsewhere still builds and
+    # verifies, which is the useful part of dispatching it.
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

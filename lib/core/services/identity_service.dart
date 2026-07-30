@@ -1,13 +1,8 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
+import 'package:mostro/shared/utils/platform_int64.dart';
 import 'package:mostro/src/rust/api/identity.dart' as identity_api;
-
-/// Returns [v] as the correct `PlatformInt64` type for the current platform:
-/// `int` on native, `BigInt` on web (dart2js). Returning `dynamic` lets
-/// callers pass it directly to bridge parameters typed as `PlatformInt64?`
-/// without a static-type error on either platform.
-dynamic _toInt64(int v) => kIsWeb ? BigInt.from(v) : v;
 
 /// Secure-storage keys.
 const _kMnemonic = 'mostro_identity_mnemonic';
@@ -54,6 +49,40 @@ class IdentityService {
     } catch (e) {
       debugPrint('[identity] getMnemonicWords($_kMnemonic) error: $e');
       return [];
+    }
+  }
+
+  /// Decide what to write to secure storage for an [incoming] consumed trade
+  /// key index, given the [current] stored raw value. Returns null when the
+  /// write should be skipped.
+  ///
+  /// The counter must never move backwards — a lower value means re-deriving
+  /// keys the daemon already registered, which it rejects with
+  /// `InvalidTradeIndex`. An unparsable or missing stored value is treated as
+  /// "nothing known", so [incoming] wins.
+  static int? nextStoredTradeKeyIndex(String? current, int incoming) {
+    final stored = int.tryParse(current ?? '');
+    if (stored != null && stored >= incoming) return null;
+    return incoming;
+  }
+
+  /// Mirror a consumed trade key index into secure storage.
+  ///
+  /// Rust owns the counter and persists it in `mostro.db`; this is the second
+  /// durable copy, and the only one that survives loss of that file. On the
+  /// next launch [_loadExisting] passes it back and Rust reconciles the two by
+  /// taking the higher (issue #249).
+  ///
+  /// Never throws: failing to mirror must not break an order that has already
+  /// been created, and the database copy still holds.
+  static Future<void> saveTradeKeyIndex(int index) async {
+    try {
+      final current = await _storage.read(key: _kTradeKeyIndex);
+      final next = nextStoredTradeKeyIndex(current, index);
+      if (next == null) return;
+      await _storage.write(key: _kTradeKeyIndex, value: next.toString());
+    } catch (e) {
+      debugPrint('[identity] saveTradeKeyIndex($index) error: $e');
     }
   }
 
@@ -185,7 +214,7 @@ class IdentityService {
       words: words,
       tradeKeyIndex: tradeKeyIndex,
       privacyMode: privacyMode,
-      createdAt: createdAt > 0 ? _toInt64(createdAt ~/ 1000) : null,
+      createdAt: createdAt > 0 ? intToPlatformInt64(createdAt ~/ 1000) : null,
     );
 
     debugPrint('[identity] identity loaded — pubkey=${info.publicKey}');

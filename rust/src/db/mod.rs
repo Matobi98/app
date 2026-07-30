@@ -8,6 +8,37 @@ pub mod indexeddb;
 
 use anyhow::Result;
 
+/// Keys used in the generic key-value settings store.
+///
+/// Collected here so the namespace is greppable in one place: the store has no
+/// schema, so a typo in a key string is a silently-lost preference rather than
+/// a compile error.
+pub mod settings_keys {
+    /// Active Mostro node pubkey (hex). Written through the dedicated
+    /// [`super::Storage::save_active_mostro_pubkey`] accessor.
+    pub const ACTIVE_MOSTRO_PUBKEY: &str = "active_mostro_pubkey";
+
+    /// Developer escrow-mode override — `"auto"` or `"force_cashu"`.
+    /// See [`crate::mostro::escrow_mode::EscrowModeOverride`].
+    pub const ESCROW_MODE_OVERRIDE: &str = "escrow_mode_override";
+
+    /// Developer mint-URL override, pointing Cashu at a local mint instead of
+    /// the one the node advertises.
+    pub const CASHU_MINT_URL_OVERRIDE: &str = "cashu_mint_url_override";
+
+    /// Per-order chat `since` cursor — the `created_at` (unix seconds, decimal
+    /// string) of the newest accepted outer chat event, clamped to the local
+    /// clock. Full key is `chat_cursor:<order_id>`; build it with
+    /// [`chat_cursor`]. Bounds the chat subscription backlog so a flood is
+    /// never re-downloaded on restart (protocol chat spec, issue #246).
+    pub const CHAT_CURSOR_PREFIX: &str = "chat_cursor:";
+
+    /// Build the settings key holding the chat `since` cursor for `order_id`.
+    pub fn chat_cursor(order_id: &str) -> String {
+        format!("{CHAT_CURSOR_PREFIX}{order_id}")
+    }
+}
+
 /// Storage trait — implemented by both SQLite (native) and IndexedDB (WASM).
 ///
 /// **Send-safety note**: `#[allow(async_fn_in_trait)]` is used here instead of
@@ -32,6 +63,15 @@ pub trait Storage: Send + Sync {
     async fn save_message(&self, msg: &crate::api::types::ChatMessage) -> Result<()>;
     async fn list_messages(&self, trade_id: &str) -> Result<Vec<crate::api::types::ChatMessage>>;
     async fn mark_messages_read(&self, trade_id: &str) -> Result<()>;
+
+    /// `true` if a message with this id was already accepted and stored.
+    ///
+    /// This is the **durable inner-event-id dedup** required by the chat spec:
+    /// both parties hold `K_sign`, so either can re-wrap a previously received
+    /// inner event inside a fresh outer one ("I sent the fiat", replayed). An
+    /// in-memory LRU is not enough — an evicted entry makes the message
+    /// replayable again — so the check must reach persisted history.
+    async fn message_exists(&self, id: &str) -> Result<bool>;
 
     async fn save_relay(&self, relay: &crate::api::types::RelayInfo) -> Result<()>;
     async fn delete_relay(&self, url: &str) -> Result<()>;
@@ -77,6 +117,21 @@ pub trait Storage: Send + Sync {
     async fn clear_trade_keys(&self) -> Result<()>;
 
     // ── Settings / Mostro node ────────────────────────────────────────────────
+
+    /// Read a value from the generic key-value settings store, or `None` when
+    /// the key was never written.
+    ///
+    /// The store is for small, self-contained preferences — anything with
+    /// structure gets its own table. See [`settings_keys`] for the keys in use.
+    async fn get_setting(&self, key: &str) -> Result<Option<String>>;
+
+    /// Write a value to the generic key-value settings store, replacing any
+    /// previous value for `key`.
+    async fn set_setting(&self, key: &str, value: &str) -> Result<()>;
+
+    /// Remove a key from the generic settings store. Absent keys are not an
+    /// error — clearing an unset preference is a no-op by design.
+    async fn delete_setting(&self, key: &str) -> Result<()>;
 
     /// Persist the active Mostro node's pubkey (hex). This is the *identity* of
     /// the selected node — node metadata (kind 0 / 38385) is a separate concern.

@@ -21,6 +21,9 @@ PUBSPEC='pubspec.yaml'
 CARGO_TOML='rust/Cargo.toml'
 CI_WORKFLOW='.github/workflows/ci.yml'
 GOLDENS_WORKFLOW='.github/workflows/update-goldens.yml'
+# The web build moved out of deploy-pages.yml into this reusable workflow, which
+# both it and ci.yml call — so this is where the web pipeline now states the pin.
+WEB_WORKFLOW='.github/workflows/web-build.yml'
 
 SEMVER='[0-9]+\.[0-9]+\.[0-9]+'
 
@@ -59,6 +62,7 @@ check_pin() {
 check_pin "$CARGO_TOML" "^[[:space:]]*flutter_rust_bridge[[:space:]]*=[[:space:]]*\"=?(${SEMVER})\".*$"
 check_pin "$CI_WORKFLOW" "^[[:space:]]*FRB_VERSION:[[:space:]]*\"?(${SEMVER})\"?.*$"
 check_pin "$GOLDENS_WORKFLOW" "^[[:space:]]*FRB_VERSION:[[:space:]]*\"?(${SEMVER})\"?.*$"
+check_pin "$WEB_WORKFLOW" "^[[:space:]]*FRB_VERSION:[[:space:]]*\"?(${SEMVER})\"?.*$"
 
 if (( ${#mismatches[@]} > 0 )); then
   echo "✗ flutter_rust_bridge is pinned inconsistently across the repository." >&2
