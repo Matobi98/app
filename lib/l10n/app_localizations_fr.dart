@@ -249,7 +249,7 @@ class AppLocalizationsFr extends AppLocalizations {
 
   @override
   String get leaveBondPaymentContent =>
-      'L\'ordre reste réservé jusqu\'à l\'expiration de la caution. Vous pouvez la payer plus tard depuis l\'échange, ou la libérer maintenant.';
+      'L\'ordre reste réservé jusqu\'à l\'expiration de la caution. Vous pouvez la payer plus tard depuis l\'échange, ou remettre l\'ordre au carnet maintenant.';
 
   @override
   String get keepPayingButton => 'Continuer à payer';
@@ -258,7 +258,7 @@ class AppLocalizationsFr extends AppLocalizations {
   String get leaveButton => 'Quitter';
 
   @override
-  String get releaseOrderButton => 'Libérer';
+  String get releaseOrderButton => 'Remettre l\'ordre';
 
   @override
   String get leaveBondPaymentWaitingContent =>

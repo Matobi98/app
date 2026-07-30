@@ -506,10 +506,10 @@ abstract class AppLocalizations {
   /// **'Leave bond payment?'**
   String get leaveBondPaymentTitle;
 
-  /// Body of the leave-bond-payment dialog, explaining that leaving keeps the order reserved and releasing returns it to the book
+  /// Body of the leave-bond-payment dialog: leaving keeps the order reserved, the third action puts it back on the book
   ///
   /// In en, this message translates to:
-  /// **'The order stays reserved until the bond expires. You can pay it later from the trade, or release it now.'**
+  /// **'The order stays reserved until the bond expires. You can pay it later from the trade, or put the order back on the book now.'**
   String get leaveBondPaymentContent;
 
   /// Dialog action that dismisses the leave prompt and stays on the bond payment screen
@@ -527,7 +527,7 @@ abstract class AppLocalizations {
   /// Dialog action that cancels the take and returns the order to the book
   ///
   /// In en, this message translates to:
-  /// **'Release'**
+  /// **'Return order'**
   String get releaseOrderButton;
 
   /// Body of the leave dialog while a bond payment outcome is unknown: leaving is safe, releasing the order is not offered

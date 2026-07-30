@@ -246,7 +246,7 @@ class AppLocalizationsDe extends AppLocalizations {
 
   @override
   String get leaveBondPaymentContent =>
-      'Die Order bleibt reserviert, bis die Kaution abläuft. Du kannst sie später über den Handel bezahlen oder jetzt freigeben.';
+      'Die Order bleibt reserviert, bis die Kaution abläuft. Du kannst sie später über den Handel bezahlen oder die Order jetzt ins Orderbuch zurückgeben.';
 
   @override
   String get keepPayingButton => 'Weiter bezahlen';
@@ -255,7 +255,7 @@ class AppLocalizationsDe extends AppLocalizations {
   String get leaveButton => 'Verlassen';
 
   @override
-  String get releaseOrderButton => 'Freigeben';
+  String get releaseOrderButton => 'Order zurückgeben';
 
   @override
   String get leaveBondPaymentWaitingContent =>

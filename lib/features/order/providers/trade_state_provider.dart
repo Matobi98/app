@@ -56,16 +56,18 @@ final tradeAmountProvider =
 /// when no local trade row exists.
 final tradeStatusProvider =
     StreamProvider.family.autoDispose<OrderStatus, String>((ref, orderId) async* {
+  final listTrades = ref.read(bridgeListTradesProvider);
+  final getOrder = ref.read(bridgeGetOrderProvider);
   while (true) {
     try {
-      final trades = await orders_api.listTrades();
+      final trades = await listTrades();
       final trade = trades.where((t) => t.order.id == orderId).firstOrNull;
       if (trade != null) {
         yield trade.order.status;
         if (_isTerminal(trade.order.status)) return;
       } else {
         // No local trade row — fall back to the public order book.
-        final info = await orders_api.getOrder(orderId: orderId);
+        final info = await getOrder(orderId);
         if (info != null) {
           yield info.status;
           if (_isTerminal(info.status)) return;

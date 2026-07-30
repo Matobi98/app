@@ -247,7 +247,7 @@ class AppLocalizationsEs extends AppLocalizations {
 
   @override
   String get leaveBondPaymentContent =>
-      'La orden queda reservada hasta que la fianza expire. Podés pagarla más tarde desde la operación, o liberarla ahora.';
+      'La orden queda reservada hasta que la fianza expire. Podés pagarla más tarde desde la operación, o devolver la orden al libro ahora.';
 
   @override
   String get keepPayingButton => 'Seguir pagando';
@@ -256,7 +256,7 @@ class AppLocalizationsEs extends AppLocalizations {
   String get leaveButton => 'Salir';
 
   @override
-  String get releaseOrderButton => 'Liberar';
+  String get releaseOrderButton => 'Devolver orden';
 
   @override
   String get leaveBondPaymentWaitingContent =>

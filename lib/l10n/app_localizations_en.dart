@@ -243,7 +243,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get leaveBondPaymentContent =>
-      'The order stays reserved until the bond expires. You can pay it later from the trade, or release it now.';
+      'The order stays reserved until the bond expires. You can pay it later from the trade, or put the order back on the book now.';
 
   @override
   String get keepPayingButton => 'Keep paying';
@@ -252,7 +252,7 @@ class AppLocalizationsEn extends AppLocalizations {
   String get leaveButton => 'Leave';
 
   @override
-  String get releaseOrderButton => 'Release';
+  String get releaseOrderButton => 'Return order';
 
   @override
   String get leaveBondPaymentWaitingContent =>

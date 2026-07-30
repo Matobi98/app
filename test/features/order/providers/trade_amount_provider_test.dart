@@ -79,4 +79,39 @@ void main() {
       );
     });
   });
+
+  group('tradeStatusProvider', () {
+    test('prefers the trade row over the coarse public bucket', () async {
+      final container = createContainer(overrides: [
+        bridgeListTradesProvider.overrideWithValue(
+          () async => [
+            fakeTrade(orderId: _orderId, status: OrderStatus.waitingTakerBond),
+          ],
+        ),
+        // The daemon publishes WaitingTakerBond as the coarse `pending`.
+        bridgeGetOrderProvider.overrideWithValue((_) async => _publicOrder()),
+      ]);
+
+      container.listen(tradeStatusProvider(_orderId), (_, __) {});
+
+      expect(
+        await container.read(tradeStatusProvider(_orderId).future),
+        OrderStatus.waitingTakerBond,
+      );
+    });
+
+    test('falls back to the book when no trade row exists', () async {
+      final container = createContainer(overrides: [
+        bridgeListTradesProvider.overrideWithValue(() async => []),
+        bridgeGetOrderProvider.overrideWithValue((_) async => _publicOrder()),
+      ]);
+
+      container.listen(tradeStatusProvider(_orderId), (_, __) {});
+
+      expect(
+        await container.read(tradeStatusProvider(_orderId).future),
+        OrderStatus.pending,
+      );
+    });
+  });
 }
