@@ -12,17 +12,20 @@ final tradeRoleProvider =
 
 /// Poll every 2 s until the trade's `amountSats` is non-null, then stop.
 ///
-/// Sizes the buyer's add-invoice. Prefers the persisted trade over the order
-/// book, whose amount is the coarse public 38383 figure (the full order amount)
-/// rather than the daemon's calculated per-role sats. See [tradeStatusProvider].
+/// Sizes the buyer's add-invoice. A persisted trade row is authoritative: its
+/// amount is the daemon's calculated per-role sats, so keep polling until it
+/// arrives. The order book only answers when we follow no trade, since its
+/// amount is the coarse public 38383 figure — emitting that would stop the
+/// polling with the wrong invoice amount. See [tradeStatusProvider].
 final tradeAmountProvider =
     StreamProvider.family.autoDispose<BigInt?, String>((ref, orderId) async* {
   while (true) {
     try {
       final trades = await orders_api.listTrades();
       final trade = trades.where((t) => t.order.id == orderId).firstOrNull;
-      final sats = trade?.order.amountSats ??
-          (await orders_api.getOrder(orderId: orderId))?.amountSats;
+      final sats = trade != null
+          ? trade.order.amountSats
+          : (await orders_api.getOrder(orderId: orderId))?.amountSats;
       yield sats;
       if (sats != null) return; // done — no need to keep polling
     } catch (e, st) {

@@ -90,18 +90,30 @@ calculated `amount_sats`, `hold_invoice`), persisted to My Trades, the
 order book entry is synced, and the trade session/subscriptions start.
 On rejection or timeout **nothing is persisted** — no phantom trade.
 
+A bond-requiring node replies `pay-bond-invoice` instead: the trade is
+persisted at `WaitingTakerBond` with the bolt11 in `bond_invoice` and its
+amount in `bond_amount_sats`, leaving `hold_invoice`/`amount_sats` null until
+the bond is paid and the daemon advances the order.
+
 **Errors**: `OrderNotFound`, `CannotTakeOwnOrder`, `OrderAlreadyTaken`,
 `InvalidRole`, `FiatAmountRequired`/`OutOfRange` (range orders),
-`BondRequired` (daemon requires an anti-abuse bond — not supported yet),
 `NoDaemonResponse`, plus daemon `CantDo` reasons passed through as errors.
 
 ---
 
 ### cancel_order(order_id: String) → ()
-Cancel own untaken order.
+Cancel a trade the local user is party to — as maker or as taker.
 
-**Preconditions**: Order MUST be owned by current user. Order status
-MUST be `Pending`.
+**Preconditions**: A trade key MUST be persisted for the order.
+
+The optimistic book handling depends on ownership and status, since a
+maker-created order is persisted as `Pending` too:
+
+| Case | Effect on the local order book |
+|---|---|
+| Taker, `WaitingTakerBond`/`Pending` | Pre-commit back-out (no bond paid). The order stays `Pending` on the daemon, so the book entry is reset to `Pending` — available again |
+| Maker, `Pending` | The listing dies; the entry is removed |
+| Either role, `Active`/`FiatSent` | Cooperative cancel — both parties must cancel. The entry is removed |
 
 **Errors**: `NotMyOrder`, `OrderNotCancelable`, `ProtocolError`.
 
