@@ -1337,33 +1337,27 @@ pub async fn cancel_order(order_id: String) -> Result<()> {
     .await?;
     publish_event_json(&event_json).await?;
 
-    // Classify the cancel by ownership and status (see the fn doc): only a
-    // taker's pre-commit back-out returns the order to the book.
-    let is_taker_backout = match crate::db::app_db::db() {
-        Some(db) => db
-            .get_trade_by_order_id(&order_id)
-            .await
-            .ok()
-            .flatten()
-            .is_some_and(|t| {
-                !t.order.is_mine
-                    && matches!(
-                        t.order.status,
-                        OrderStatus::WaitingTakerBond | OrderStatus::Pending
-                    )
-            }),
-        None => false,
+    let effect = match crate::db::app_db::db() {
+        Some(db) => classify_cancel(
+            db.get_trade_by_order_id(&order_id)
+                .await
+                .ok()
+                .flatten()
+                .as_ref(),
+        ),
+        None => CancelEffect::DropListing,
     };
 
     // Optimistic update: mark the trade as Canceled in the local DB immediately
     // so the UI reflects the change without waiting for the daemon's gift-wrap
     // response.
-    if is_taker_backout {
-        order_book()
-            .update_order_status(&order_id, OrderStatus::Pending)
-            .await;
-    } else {
-        order_book().remove_order(&order_id).await;
+    match effect {
+        CancelEffect::ReturnToBook => {
+            order_book()
+                .update_order_status(&order_id, OrderStatus::Pending)
+                .await;
+        }
+        CancelEffect::DropListing => order_book().remove_order(&order_id).await,
     }
     if let Some(db) = crate::db::app_db::db() {
         if let Err(e) = db
@@ -1380,7 +1374,7 @@ pub async fn cancel_order(order_id: String) -> Result<()> {
     }
 
     log::info!(
-        "[orders] cancel published for order={order_id} trade_index={trade_index} taker_backout={is_taker_backout}"
+        "[orders] cancel published for order={order_id} trade_index={trade_index} effect={effect:?}"
     );
     Ok(())
 }
@@ -1816,19 +1810,13 @@ async fn dispatch_mostro_message(
             if let Some(order_id) = &kind.id {
                 let oid = order_id.to_string();
                 // Our trade is over, but someone else's order can outlive it: a
-                // taker back-out leaves the listing available, and the daemon
-                // republishes it as Pending. Only drop orders we own; for the
-                // rest let the public 38383 event decide.
-                let owned = match crate::db::app_db::db() {
-                    Some(db) => db
-                        .get_trade_by_order_id(&oid)
-                        .await
-                        .ok()
-                        .flatten()
-                        .is_some_and(|t| t.order.is_mine),
-                    None => true,
+                // taker back-out leaves the listing available and the daemon
+                // republishes it as Pending, so let the 38383 event decide.
+                let trade = match crate::db::app_db::db() {
+                    Some(db) => db.get_trade_by_order_id(&oid).await.ok().flatten(),
+                    None => None,
                 };
-                if owned {
+                if cancel_drops_listing(trade.as_ref()) {
                     order_book().remove_order(&oid).await;
                 }
                 // Sync the Canceled status into the trade DB so My Trades
@@ -2307,6 +2295,77 @@ fn merge_followed_state(
     incoming
 }
 
+/// How a cancellation should affect the local order book.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CancelEffect {
+    /// Taker pre-commit back-out: the order returns to the book as `Pending`.
+    ReturnToBook,
+    /// The listing itself dies: drop it from the book.
+    DropListing,
+}
+
+/// Classify a cancellation we initiate, by ownership as well as status: a
+/// maker-created order is persisted as `Pending` too, so status alone would
+/// read a maker's withdrawal as a taker's back-out.
+fn classify_cancel(trade: Option<&crate::api::types::TradeInfo>) -> CancelEffect {
+    match trade {
+        Some(t)
+            if !t.order.is_mine
+                && matches!(
+                    t.order.status,
+                    OrderStatus::WaitingTakerBond | OrderStatus::Pending
+                ) =>
+        {
+            CancelEffect::ReturnToBook
+        }
+        _ => CancelEffect::DropListing,
+    }
+}
+
+/// Whether a daemon `Canceled` should drop the order from the book: only when
+/// we own the listing, since someone else's order outlives our trade.
+fn cancel_drops_listing(trade: Option<&crate::api::types::TradeInfo>) -> bool {
+    trade.is_none_or(|t| t.order.is_mine)
+}
+
+/// Apply a public Kind 38383 update for a followed order to the trade row and
+/// the book cache, guarding both against coarse-bucket downgrades.
+async fn sync_public_order_update(order: OrderInfo) {
+    let followed = followed_trade_state(&order.id).await;
+    let apply = match &followed {
+        Some((cur, _)) => public_status_supersedes(cur, &order.status),
+        None => true,
+    };
+    if apply {
+        if let Some(db) = crate::db::app_db::db() {
+            if let Err(e) = db
+                .update_trade_fields(
+                    &order.id,
+                    Some(order.status.clone()),
+                    None,
+                    order.amount_sats,
+                )
+                .await
+            {
+                log::warn!(
+                    "[orders] failed to sync d-tag trade status for order={}: {e}",
+                    order.id
+                );
+            }
+        }
+    } else {
+        log::debug!(
+            "[orders] d-tag update: keeping fine-grained {:?} over coarse {:?} for order={}",
+            followed.as_ref().map(|(s, _)| s),
+            order.status,
+            order.id
+        );
+    }
+    order_book()
+        .upsert_order(merge_followed_state(order, followed.as_ref()))
+        .await;
+}
+
 /// Calculated trade sats from an `add-invoice` reply's `Order` payload, or
 /// `None` for a non-positive amount or a non-`Order` payload.
 fn add_invoice_amount(payload: &Option<mostro_core::message::Payload>) -> Option<u64> {
@@ -2487,42 +2546,7 @@ async fn subscribe_single_order(order_id: &str) {
                                 order.status
                             );
                             last_activity = crate::rt::time::Instant::now();
-                            // Guard both the trade row and the book cache
-                            // against coarse-bucket downgrades.
-                            let followed = followed_trade_state(&order.id).await;
-                            let apply = match &followed {
-                                Some((cur, _)) => public_status_supersedes(cur, &order.status),
-                                None => true,
-                            };
-                            if apply {
-                                if let Some(db) = crate::db::app_db::db() {
-                                    if let Err(e) = db
-                                        .update_trade_fields(
-                                            &order.id,
-                                            Some(order.status.clone()),
-                                            None,
-                                            order.amount_sats,
-                                        )
-                                        .await
-                                    {
-                                        log::warn!(
-                                            "[orders] failed to sync d-tag trade status for order={}: {e}",
-                                            order.id
-                                        );
-                                    }
-                                }
-                            } else {
-                                log::debug!(
-                                    "[orders] d-tag update: keeping fine-grained {:?} \
-                                     over coarse {:?} for order={}",
-                                    followed.as_ref().map(|(s, _)| s),
-                                    order.status,
-                                    order.id
-                                );
-                            }
-                            order_book()
-                                .upsert_order(merge_followed_state(order, followed.as_ref()))
-                                .await;
+                            sync_public_order_update(order).await;
                         }
                     }
                 }
@@ -3576,118 +3600,190 @@ mod tests {
         }
     }
 
-    /// A taker bond survives the coarse public 38383 buckets and advances for
-    /// both roles, over the real SQLite store (PR #213 review).
+    /// Initialise the global store once, so the tests below drive the same
+    /// `app_db::db()` the production paths read instead of a local copy.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn init_test_db() {
+        static INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+        INIT.get_or_init(|| async {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("mostro_orders_test_{unique}.db"));
+            crate::db::app_db::init_db(&path.to_string_lossy())
+                .await
+                .expect("init temp db");
+        })
+        .await;
+    }
+
+    fn bond_trade(order_id: &str, role: TradeRole) -> crate::api::types::TradeInfo {
+        use crate::api::types::{BuyerStep, SellerStep, TradeInfo, TradeStep};
+
+        let mut order = dummy_order_info(order_id);
+        order.status = OrderStatus::WaitingTakerBond;
+        let step = match role {
+            TradeRole::Buyer => TradeStep::Buyer(BuyerStep::OrderTaken),
+            TradeRole::Seller => TradeStep::Seller(SellerStep::TakerFound),
+        };
+        TradeInfo {
+            id: format!("trade-{order_id}"),
+            order,
+            role,
+            counterparty_pubkey: String::new(),
+            current_step: step,
+            hold_invoice: None,
+            bond_invoice: Some("lnbc1bond".to_string()),
+            bond_amount_sats: Some(1000),
+            buyer_invoice: None,
+            trade_key_index: 0,
+            cooperative_cancel_state: None,
+            timeout_at: None,
+            started_at: 0,
+            completed_at: None,
+            outcome: None,
+        }
+    }
+
+    /// A coarse public bucket must downgrade neither the trade row nor the book
+    /// cache, driven through the production sync path rather than a copy of its
+    /// decision — so it fails if either write regresses (PR #213 review).
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
-    async fn bond_state_survives_coarse_38383_and_advances() {
-        use crate::api::types::{
-            BuyerStep, OrderStatus as S, SellerStep, TradeInfo, TradeRole, TradeStep,
-        };
-        use crate::db::sqlite::SqliteStorage;
+    async fn coarse_public_update_downgrades_neither_trade_nor_book() {
+        use crate::api::types::OrderStatus as S;
         use crate::db::Storage;
 
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("mostro_bond_test_{unique}.db"));
-        let path_str = path.to_string_lossy().to_string();
-        let db = SqliteStorage::open(&path_str).await.expect("open temp db");
+        init_test_db().await;
+        let db = crate::db::app_db::db().expect("db initialised");
 
-        fn bond_trade(order_id: &str, role: TradeRole) -> TradeInfo {
-            let mut order = dummy_order_info(order_id);
-            order.status = S::WaitingTakerBond;
-            let step = match role {
-                TradeRole::Buyer => TradeStep::Buyer(BuyerStep::OrderTaken),
-                TradeRole::Seller => TradeStep::Seller(SellerStep::TakerFound),
-            };
-            TradeInfo {
-                id: format!("trade-{order_id}"),
-                order,
-                role,
-                counterparty_pubkey: String::new(),
-                current_step: step,
-                hold_invoice: None,
-                bond_invoice: Some("lnbc1bond".to_string()),
-                bond_amount_sats: Some(1000),
-                buyer_invoice: None,
-                trade_key_index: 0,
-                cooperative_cancel_state: None,
-                timeout_at: None,
-                started_at: 0,
-                completed_at: None,
-                outcome: None,
-            }
-        }
+        let order_id = format!("downgrade-{}", uuid::Uuid::new_v4());
+        let mut trade = bond_trade(&order_id, TradeRole::Buyer);
+        db.save_trade(&trade).await.unwrap();
 
-        async fn status_of(db: &SqliteStorage, id: &str) -> Option<S> {
-            db.get_trade_by_order_id(id)
+        // Bond unpaid: the daemon publishes WaitingTakerBond as Pending.
+        let mut public = dummy_order_info(&order_id);
+        public.status = S::Pending;
+        sync_public_order_update(public.clone()).await;
+
+        assert_eq!(
+            db.get_trade_by_order_id(&order_id)
                 .await
                 .unwrap()
-                .map(|t| t.order.status)
-        }
-
-        // Mirrors the d-tag sync: apply the public status only when the gate allows.
-        async fn sync_public(db: &SqliteStorage, id: &str, incoming: S, amount: Option<u64>) {
-            let cur = status_of(db, id).await;
-            let apply = cur
-                .as_ref()
-                .is_none_or(|c| public_status_supersedes(c, &incoming));
-            if apply {
-                db.update_trade_fields(id, Some(incoming), None, amount)
-                    .await
-                    .unwrap();
-            }
-        }
-
-        // ── Buyer role
-        let buyer = "order-buyer";
-        db.save_trade(&bond_trade(buyer, TradeRole::Buyer)).await.unwrap();
-        assert_eq!(status_of(&db, buyer).await, Some(S::WaitingTakerBond));
-
-        sync_public(&db, buyer, S::Pending, None).await;
-        assert_eq!(
-            status_of(&db, buyer).await,
+                .map(|t| t.order.status),
             Some(S::WaitingTakerBond),
-            "coarse Pending must not clobber WaitingTakerBond"
+            "coarse Pending must not clobber the trade row"
         );
-
-        // Post-bond advance, then a coarse InProgress that must not clobber it.
-        db.update_trade_fields(buyer, Some(S::WaitingBuyerInvoice), None, Some(9526))
-            .await
-            .unwrap();
-        sync_public(&db, buyer, S::InProgress, None).await;
-        let t = db.get_trade_by_order_id(buyer).await.unwrap().unwrap();
         assert_eq!(
-            t.order.status,
-            S::WaitingBuyerInvoice,
-            "coarse InProgress must not clobber WaitingBuyerInvoice"
+            order_book().get_order(&order_id).await.map(|o| o.status),
+            Some(S::WaitingTakerBond),
+            "coarse Pending must not clobber the book cache"
         );
-        assert_eq!(t.order.amount_sats, Some(9526));
 
-        // ── Seller role
-        let seller = "order-seller";
-        db.save_trade(&bond_trade(seller, TradeRole::Seller)).await.unwrap();
-        sync_public(&db, seller, S::Pending, None).await;
-        assert_eq!(status_of(&db, seller).await, Some(S::WaitingTakerBond));
+        // Post-bond: the daemon publishes WaitingBuyerInvoice as InProgress and
+        // the listing carries the coarse amount, not this taker's.
+        trade.order.status = S::WaitingBuyerInvoice;
+        trade.order.amount_sats = Some(9526);
+        db.save_trade(&trade).await.unwrap();
+        public.status = S::InProgress;
+        public.amount_sats = Some(10_000);
+        sync_public_order_update(public.clone()).await;
 
-        db.update_trade_fields(seller, Some(S::WaitingPayment), Some("lnbcescrow".into()), Some(7851))
-            .await
-            .unwrap();
-        sync_public(&db, seller, S::InProgress, None).await;
-        let t = db.get_trade_by_order_id(seller).await.unwrap().unwrap();
-        assert_eq!(t.order.status, S::WaitingPayment);
-        assert_eq!(t.hold_invoice.as_deref(), Some("lnbcescrow"));
+        let cached = order_book().get_order(&order_id).await.expect("order cached");
+        assert_eq!(cached.status, S::WaitingBuyerInvoice);
+        assert_eq!(
+            cached.amount_sats,
+            Some(9526),
+            "book must keep the per-role amount over the coarse listing figure"
+        );
 
-        // ── Terminal public status still wins.
-        sync_public(&db, seller, S::Canceled, None).await;
-        assert_eq!(status_of(&db, seller).await, Some(S::Canceled));
+        // Terminal buckets are genuine endpoints and still win.
+        public.status = S::Canceled;
+        sync_public_order_update(public).await;
+        assert_eq!(
+            db.get_trade_by_order_id(&order_id)
+                .await
+                .unwrap()
+                .map(|t| t.order.status),
+            Some(S::Canceled)
+        );
+    }
 
-        drop(db);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(format!("{path_str}-wal"));
-        let _ = std::fs::remove_file(format!("{path_str}-shm"));
+    /// Once our trade reaches a terminal status the listing regains authority:
+    /// an order the taker backed out of must reappear as available.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn backed_out_take_returns_the_order_to_the_book() {
+        use crate::api::types::OrderStatus as S;
+        use crate::db::Storage;
+
+        init_test_db().await;
+        let db = crate::db::app_db::db().expect("db initialised");
+
+        let order_id = format!("backout-{}", uuid::Uuid::new_v4());
+        let mut trade = bond_trade(&order_id, TradeRole::Buyer);
+        trade.order.status = S::Canceled;
+        db.save_trade(&trade).await.unwrap();
+
+        let mut public = dummy_order_info(&order_id);
+        public.status = S::Pending;
+        sync_public_order_update(public).await;
+
+        assert_eq!(
+            order_book().get_order(&order_id).await.map(|o| o.status),
+            Some(S::Pending),
+            "the maker's order outlives our cancelled take and stays available"
+        );
+    }
+
+    /// Ownership, not status alone, decides how our own cancel hits the book:
+    /// maker-created orders are persisted as Pending too.
+    #[test]
+    fn cancel_classification_separates_maker_withdrawal_from_taker_backout() {
+        use crate::api::types::OrderStatus as S;
+
+        let taker_bond = bond_trade("c1", TradeRole::Buyer);
+        assert_eq!(
+            classify_cancel(Some(&taker_bond)),
+            CancelEffect::ReturnToBook
+        );
+
+        let mut taker_pending = bond_trade("c2", TradeRole::Buyer);
+        taker_pending.order.status = S::Pending;
+        assert_eq!(
+            classify_cancel(Some(&taker_pending)),
+            CancelEffect::ReturnToBook
+        );
+
+        // Same Pending status, but this listing is ours.
+        let mut maker_pending = bond_trade("c3", TradeRole::Seller);
+        maker_pending.order.status = S::Pending;
+        maker_pending.order.is_mine = true;
+        assert_eq!(
+            classify_cancel(Some(&maker_pending)),
+            CancelEffect::DropListing
+        );
+
+        // Committed trade: a cooperative cancel drops it.
+        let mut active = bond_trade("c4", TradeRole::Buyer);
+        active.order.status = S::Active;
+        assert_eq!(classify_cancel(Some(&active)), CancelEffect::DropListing);
+
+        assert_eq!(classify_cancel(None), CancelEffect::DropListing);
+    }
+
+    /// A daemon `Canceled` must not hide a listing that is not ours.
+    #[test]
+    fn daemon_cancel_only_drops_listings_we_own() {
+        let taker = bond_trade("d1", TradeRole::Buyer);
+        assert!(!cancel_drops_listing(Some(&taker)));
+
+        let mut maker = bond_trade("d2", TradeRole::Seller);
+        maker.order.is_mine = true;
+        assert!(cancel_drops_listing(Some(&maker)));
+
+        assert!(cancel_drops_listing(None));
     }
 
     /// Only the pending create's own local UUID may be rebound to an incoming
