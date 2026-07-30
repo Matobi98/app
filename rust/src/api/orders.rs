@@ -2247,6 +2247,31 @@ fn public_status_supersedes(current: &OrderStatus, incoming: &OrderStatus) -> bo
     }
 }
 
+/// Authoritative `(status, amount_sats)` persisted for a trade we follow.
+async fn followed_trade_state(order_id: &str) -> Option<(OrderStatus, Option<u64>)> {
+    let db = crate::db::app_db::db()?;
+    let trade = db.get_trade_by_order_id(order_id).await.ok().flatten()?;
+    Some((trade.order.status, trade.order.amount_sats))
+}
+
+/// Overlay the authoritative trade state onto an incoming public order, so the
+/// book cache behind `getOrder` never contradicts the trade row.
+fn merge_followed_state(
+    mut incoming: OrderInfo,
+    followed: Option<&(OrderStatus, Option<u64>)>,
+) -> OrderInfo {
+    if let Some((status, amount_sats)) = followed {
+        if !public_status_supersedes(status, &incoming.status) {
+            incoming.status = status.clone();
+            // Public `amt` is the coarse listing figure, not the per-role amount.
+            if amount_sats.is_some() {
+                incoming.amount_sats = *amount_sats;
+            }
+        }
+    }
+    incoming
+}
+
 /// Calculated trade sats from an `add-invoice` reply's `Order` payload, or
 /// `None` for a non-positive amount or a non-`Order` payload.
 fn add_invoice_amount(payload: &Option<mostro_core::message::Payload>) -> Option<u64> {
@@ -2427,21 +2452,15 @@ async fn subscribe_single_order(order_id: &str) {
                                 order.status
                             );
                             last_activity = crate::rt::time::Instant::now();
-                            // Guard the trade row against coarse-bucket
-                            // downgrades (see `public_status_supersedes`); the
-                            // public order-book cache below is left as-is.
-                            if let Some(db) = crate::db::app_db::db() {
-                                let current = db
-                                    .get_trade_by_order_id(&order.id)
-                                    .await
-                                    .ok()
-                                    .flatten()
-                                    .map(|t| t.order.status);
-                                let apply = match &current {
-                                    Some(cur) => public_status_supersedes(cur, &order.status),
-                                    None => true,
-                                };
-                                if apply {
+                            // Guard both the trade row and the book cache
+                            // against coarse-bucket downgrades.
+                            let followed = followed_trade_state(&order.id).await;
+                            let apply = match &followed {
+                                Some((cur, _)) => public_status_supersedes(cur, &order.status),
+                                None => true,
+                            };
+                            if apply {
+                                if let Some(db) = crate::db::app_db::db() {
                                     if let Err(e) = db
                                         .update_trade_fields(
                                             &order.id,
@@ -2456,16 +2475,19 @@ async fn subscribe_single_order(order_id: &str) {
                                             order.id
                                         );
                                     }
-                                } else {
-                                    log::debug!(
-                                        "[orders] d-tag update: keeping fine-grained {current:?} \
-                                         over coarse {:?} for order={}",
-                                        order.status,
-                                        order.id
-                                    );
                                 }
+                            } else {
+                                log::debug!(
+                                    "[orders] d-tag update: keeping fine-grained {:?} \
+                                     over coarse {:?} for order={}",
+                                    followed.as_ref().map(|(s, _)| s),
+                                    order.status,
+                                    order.id
+                                );
                             }
-                            order_book().upsert_order(order).await;
+                            order_book()
+                                .upsert_order(merge_followed_state(order, followed.as_ref()))
+                                .await;
                         }
                     }
                 }
@@ -2847,7 +2869,15 @@ async fn ingest_order_event(event: &nostr_sdk::Event) {
             }
             // Sync trade status in DB for own orders so My Trades
             // reflects status changes even without gift-wrap delivery.
-            if info.is_mine && info.status != crate::api::types::OrderStatus::Pending {
+            let followed = followed_trade_state(&info.id).await;
+            let supersedes = match &followed {
+                Some((cur, _)) => public_status_supersedes(cur, &info.status),
+                None => true,
+            };
+            if info.is_mine
+                && info.status != crate::api::types::OrderStatus::Pending
+                && supersedes
+            {
                 if let Some(db) = crate::db::app_db::db() {
                     if let Err(e) = db
                         .update_trade_fields(
@@ -2865,7 +2895,9 @@ async fn ingest_order_event(event: &nostr_sdk::Event) {
                     }
                 }
             }
-            order_book().upsert_order(info).await;
+            order_book()
+                .upsert_order(merge_followed_state(info, followed.as_ref()))
+                .await;
         }
         None => {
             log::warn!(
