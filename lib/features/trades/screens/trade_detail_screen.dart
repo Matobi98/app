@@ -107,20 +107,15 @@ class _TradeDetailScreenState extends ConsumerState<TradeDetailScreen> {
     super.dispose();
   }
 
-  /// Fetches the real `expiresAt` from the order and resets [_remaining].
+  /// Resolves the real deadline and resets [_remaining].
   ///
-  /// Falls back to the default [_kCountdownSeconds] when the field is null or
-  /// the order is no longer available.
+  /// Falls back to the default [_kCountdownSeconds] when no deadline is known.
   Future<void> _loadExpiresAt() async {
     try {
-      final info = await orders_api.getOrder(orderId: widget.orderId);
-      final raw = info?.expiresAt;
-      if (raw == null || !mounted) return;
-      // PlatformInt64 = int on native, BigInt on web.
-      final expiresAtSeconds = raw is BigInt ? raw.toInt() : raw;
+      final deadline = await _resolveDeadline();
+      if (deadline == null || !mounted) return;
       final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-      final diff = expiresAtSeconds - now;
-      if (!mounted) return;
+      final diff = deadline - now;
       setState(() {
         _totalCountdownSeconds = diff > 0 ? diff : _kCountdownSeconds;
         _remaining = diff > 0 ? Duration(seconds: diff) : Duration.zero;
@@ -129,6 +124,25 @@ class _TradeDetailScreenState extends ConsumerState<TradeDetailScreen> {
       // Keep the default remaining time on error.
     }
   }
+
+  /// Absolute deadline in epoch seconds: the trade's own bond timeout while the
+  /// taker still owes a bond, otherwise the public listing expiry.
+  ///
+  /// The two can differ by hours, and the listing is often already gone for a
+  /// taken trade — reading it there would restart a fresh countdown on every
+  /// re-entry and present a payment window that does not exist.
+  Future<int?> _resolveDeadline() async {
+    final trades = await orders_api.listTrades();
+    final trade = trades.where((t) => t.order.id == widget.orderId).firstOrNull;
+    if (trade?.order.status == OrderStatus.waitingTakerBond) {
+      return _epochSeconds(trade?.timeoutAt);
+    }
+    final info = await orders_api.getOrder(orderId: widget.orderId);
+    return _epochSeconds(info?.expiresAt);
+  }
+
+  /// PlatformInt64 = int on native, BigInt on web.
+  int? _epochSeconds(Object? raw) => raw is BigInt ? raw.toInt() : raw as int?;
 
   void _startCountdown() {
     _countdownTimer = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -483,6 +497,14 @@ class _TradeDetailScreenState extends ConsumerState<TradeDetailScreen> {
     // Derive trade status from the polled order status.
     // Use TradeStatus.loading while the provider hasn't resolved so the UI
     // doesn't flash the pending CTA before the real status is known.
+    // Which deadline applies depends on the status, so re-resolve on change.
+    ref.listen<AsyncValue<OrderStatus>>(
+      tradeStatusProvider(widget.orderId),
+      (prev, next) {
+        if (prev?.valueOrNull != next.valueOrNull) _loadExpiresAt();
+      },
+    );
+
     final tradeStatusAsync = ref.watch(tradeStatusProvider(widget.orderId));
     final status = tradeStatusAsync.hasValue
         ? _mapOrderStatus(tradeStatusAsync.value!)
