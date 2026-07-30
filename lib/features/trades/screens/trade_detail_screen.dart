@@ -132,12 +132,12 @@ class _TradeDetailScreenState extends ConsumerState<TradeDetailScreen> {
   /// taken trade — reading it there would restart a fresh countdown on every
   /// re-entry and present a payment window that does not exist.
   Future<int?> _resolveDeadline() async {
-    final trades = await orders_api.listTrades();
+    final trades = await ref.read(bridgeListTradesProvider)();
     final trade = trades.where((t) => t.order.id == widget.orderId).firstOrNull;
     if (trade?.order.status == OrderStatus.waitingTakerBond) {
       return _epochSeconds(trade?.timeoutAt);
     }
-    final info = await orders_api.getOrder(orderId: widget.orderId);
+    final info = await ref.read(bridgeGetOrderProvider)(widget.orderId);
     return _epochSeconds(info?.expiresAt);
   }
 

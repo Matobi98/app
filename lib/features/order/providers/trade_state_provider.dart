@@ -3,6 +3,16 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:mostro/src/rust/api/orders.dart' as orders_api;
 import 'package:mostro/src/rust/api/types.dart';
 
+/// Seam over the Rust bridge: the accessors below are read through providers so
+/// tests can substitute them, since the bridge is uninitialised under
+/// `flutter test`.
+final bridgeListTradesProvider =
+    Provider<Future<List<TradeInfo>> Function()>((ref) => orders_api.listTrades);
+
+final bridgeGetOrderProvider = Provider<Future<OrderInfo?> Function(String)>(
+  (ref) => (orderId) => orders_api.getOrder(orderId: orderId),
+);
+
 /// Maps `orderId` → whether the local user is the buyer in that trade.
 ///
 /// Set this before navigating to [AddLightningInvoiceScreen] or
@@ -19,13 +29,14 @@ final tradeRoleProvider =
 /// polling with the wrong invoice amount. See [tradeStatusProvider].
 final tradeAmountProvider =
     StreamProvider.family.autoDispose<BigInt?, String>((ref, orderId) async* {
+  final listTrades = ref.read(bridgeListTradesProvider);
+  final getOrder = ref.read(bridgeGetOrderProvider);
   while (true) {
     try {
-      final trades = await orders_api.listTrades();
+      final trades = await listTrades();
       final trade = trades.where((t) => t.order.id == orderId).firstOrNull;
-      final sats = trade != null
-          ? trade.order.amountSats
-          : (await orders_api.getOrder(orderId: orderId))?.amountSats;
+      final sats =
+          trade != null ? trade.order.amountSats : (await getOrder(orderId))?.amountSats;
       yield sats;
       if (sats != null) return; // done — no need to keep polling
     } catch (e, st) {
