@@ -21,6 +21,9 @@ OrderInfo _publicOrder({int? amountSats}) => OrderInfo(
       createdAt: 0,
       isMine: false,
       amountSats: amountSats == null ? null : BigInt.from(amountSats),
+      rating: 0,
+      totalReviews: 0,
+      daysActive: 0,
     );
 
 void main() {
