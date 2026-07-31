@@ -2335,25 +2335,34 @@ fn status_for_action(action: &mostro_core::message::Action) -> Option<OrderStatu
     }
 }
 
-/// Whether a public Kind 38383 status may overwrite the status persisted for a
-/// trade we follow. The daemon publishes fine-grained states as coarse NIP-69
-/// buckets (`WaitingTakerBond` → `Pending`, `WaitingBuyerInvoice` /
-/// `WaitingPayment` → `InProgress`; see `mostro`'s `nip33::create_status_tags`),
-/// so a coarse bucket must never clobber the fine-grained status our gift-wrap
-/// DMs set. Terminal buckets are genuine endpoints and always win.
-fn public_status_supersedes(current: &OrderStatus, incoming: &OrderStatus) -> bool {
+/// The NIP-69 bucket the daemon publishes for a fine-grained status, mirroring
+/// `mostro`'s `nip33::create_status_tags`. `None` for states it does not
+/// advertise on the wire at all.
+fn public_bucket_of(status: &OrderStatus) -> Option<OrderStatus> {
     use OrderStatus as S;
-    match incoming {
-        S::Success
-        | S::Canceled
-        | S::CanceledByAdmin
-        | S::CooperativelyCanceled
-        | S::Expired
-        | S::CompletedByAdmin
-        | S::SettledByAdmin => true,
-        // Coarse buckets apply only before any fine-grained status exists.
-        _ => matches!(current, S::Pending),
+    Some(match status {
+        S::WaitingTakerBond | S::Pending => S::Pending,
+        S::WaitingBuyerInvoice | S::WaitingPayment => S::InProgress,
+        S::Canceled | S::CanceledByAdmin | S::CooperativelyCanceled | S::Expired => S::Canceled,
+        S::Success | S::CompletedByAdmin => status.clone(),
+        _ => return None,
+    })
+}
+
+/// Whether a public Kind 38383 status may overwrite the status persisted for a
+/// trade we follow.
+///
+/// The daemon collapses fine-grained states onto coarse buckets, so the bucket
+/// that already corresponds to what we hold carries no information and must not
+/// clobber it. Every *other* bucket is a real transition — in particular a
+/// return to `Pending`, which is how an unanswered `WaitingBuyerInvoice` or
+/// `WaitingPayment` goes back on the book when the taker times out. Matching on
+/// "coarse ⇒ ignore" instead would strand the maker on the stale status.
+fn public_status_supersedes(current: &OrderStatus, incoming: &OrderStatus) -> bool {
+    if current == incoming {
+        return true; // same state: nothing to lose, and the amount may be newer
     }
+    public_bucket_of(current).as_ref() != Some(incoming)
 }
 
 /// Authoritative `(status, amount_sats)` persisted for a trade we follow.
@@ -3902,33 +3911,33 @@ mod tests {
     /// A coarse public 38383 bucket must never overwrite a fine-grained trade
     /// status (regression for the taker-bond flow, PR #213 review).
     #[test]
-    fn public_status_never_downgrades_fine_grained_state() {
+    fn public_bucket_never_downgrades_its_own_fine_grained_state() {
         use crate::api::types::OrderStatus as S;
 
-        let fine_grained = [
-            S::WaitingTakerBond,
-            S::WaitingBuyerInvoice,
-            S::WaitingPayment,
-            S::Active,
-            S::FiatSent,
-            S::SettledHoldInvoice,
-            S::InProgress,
-            S::Dispute,
-        ];
-        for cur in &fine_grained {
+        // The bucket the daemon publishes for a state carries no information
+        // about it, so it must never overwrite it.
+        for (fine, bucket) in [
+            (S::WaitingTakerBond, S::Pending),
+            (S::WaitingBuyerInvoice, S::InProgress),
+            (S::WaitingPayment, S::InProgress),
+        ] {
             assert!(
-                !public_status_supersedes(cur, &S::Pending),
-                "public Pending must not overwrite {cur:?}"
-            );
-            assert!(
-                !public_status_supersedes(cur, &S::InProgress),
-                "public InProgress must not overwrite {cur:?}"
+                !public_status_supersedes(&fine, &bucket),
+                "public {bucket:?} must not overwrite {fine:?}"
             );
         }
 
-        // Coarse buckets apply while still at the initial Pending.
-        assert!(public_status_supersedes(&S::Pending, &S::Pending));
+        // Any other bucket is a real transition. A taker who never answers
+        // sends the order back on the book, and the maker must follow
+        // (PR #213 review, Catrya).
+        for stalled in [S::WaitingBuyerInvoice, S::WaitingPayment] {
+            assert!(
+                public_status_supersedes(&stalled, &S::Pending),
+                "a timed-out {stalled:?} must return to Pending"
+            );
+        }
         assert!(public_status_supersedes(&S::Pending, &S::InProgress));
+        assert!(public_status_supersedes(&S::Pending, &S::Pending));
 
         // Terminal buckets always win, even over an in-flight status.
         for term in [
@@ -4059,6 +4068,54 @@ mod tests {
                 .map(|t| t.order.status),
             Some(S::Canceled)
         );
+    }
+
+    /// A taker who never answers sends the order back on the book, and the
+    /// maker must follow instead of staying on the stale fine-grained status
+    /// (PR #213 review, Catrya).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn unanswered_take_returns_the_maker_to_pending() {
+        use crate::api::types::OrderStatus as S;
+        use crate::db::Storage;
+
+        init_test_db().await;
+        let db = crate::db::app_db::db().expect("db initialised");
+
+        for stalled in [S::WaitingBuyerInvoice, S::WaitingPayment] {
+            let order_id = format!("stalled-{}-{}", stalled_slug(&stalled), uuid::Uuid::new_v4());
+            let mut trade = bond_trade(&order_id, TradeRole::Seller);
+            trade.order.status = stalled.clone();
+            trade.order.is_mine = true; // maker's own listing
+            db.save_trade(&trade).await.unwrap();
+
+            // The daemon returns the order to the book and republishes it.
+            let mut public = dummy_order_info(&order_id);
+            public.status = S::Pending;
+            sync_public_order_update(public).await;
+
+            assert_eq!(
+                db.get_trade_by_order_id(&order_id)
+                    .await
+                    .unwrap()
+                    .map(|t| t.order.status),
+                Some(S::Pending),
+                "{stalled:?} must follow the order back to Pending"
+            );
+            assert_eq!(
+                order_book().get_order(&order_id).await.map(|o| o.status),
+                Some(S::Pending),
+                "{stalled:?} must show as available again in the book"
+            );
+        }
+    }
+
+    fn stalled_slug(s: &OrderStatus) -> &'static str {
+        match s {
+            OrderStatus::WaitingBuyerInvoice => "invoice",
+            OrderStatus::WaitingPayment => "payment",
+            _ => "other",
+        }
     }
 
     /// Once our trade reaches a terminal status the listing regains authority:
