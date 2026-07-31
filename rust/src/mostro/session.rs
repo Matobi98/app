@@ -124,11 +124,14 @@ impl SessionManager {
             created_at: now,
         };
 
-        let mut sessions = self.sessions.write().await;
-        if sessions.contains_key(&order_id) {
-            return Err(anyhow!("SessionAlreadyExists: {}", order_id));
+        {
+            let mut sessions = self.sessions.write().await;
+            if sessions.contains_key(&order_id) {
+                return Err(anyhow!("SessionAlreadyExists: {}", order_id));
+            }
+            sessions.insert(order_id.clone(), session.clone());
         }
-        sessions.insert(order_id, session.clone());
+        self.deferred_removals.write().await.remove(&order_id);
         Ok(session)
     }
 
@@ -384,6 +387,30 @@ mod tests {
             mgr.get_session(order_id).await.is_some(),
             "a live trade must not lose its session to an unrelated bond-slashed"
         );
+    }
+
+    /// Retaking the same order inside the grace window must not lose the fresh
+    /// session to the canceled take's timer.
+    #[tokio::test]
+    async fn a_retake_survives_the_previous_deferral() {
+        let order_id = "order-retaken";
+        let mgr = manager_with_session(order_id).await;
+
+        mgr.defer_removal(order_id, BOND_SLASH_GRACE_SECS).await;
+        mgr.resolve_deferred_removal(order_id).await;
+        mgr.create_session(
+            order_id.to_string(),
+            TradeRole::Seller,
+            7,
+            dummy_order_info(order_id),
+        )
+        .await
+        .expect("retake creates a fresh session");
+
+        mgr.reconcile_deferred_removals().await;
+
+        let session = mgr.get_session(order_id).await.expect("session kept");
+        assert_eq!(session.trade_key_index, 7);
     }
 
     #[tokio::test]

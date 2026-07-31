@@ -1141,6 +1141,11 @@ pub async fn take_order(
     // Subscribe to d-tag K38383 updates for this specific order so we
     // receive status changes (pending → in-progress → waiting-payment …).
     subscribe_single_order(&order_id).await;
+    // Retaking within the grace window: drop the canceled order's deferred
+    // session so this take gets a fresh one under its own trade key.
+    crate::mostro::session::session_manager()
+        .resolve_deferred_removal(&order_id)
+        .await;
     // Create a session so the chat API can look up keys immediately.
     let _ = crate::mostro::session::session_manager()
         .create_session(
