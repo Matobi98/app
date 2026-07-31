@@ -75,11 +75,18 @@ pub fn cancel_cleanup(status: Option<&OrderStatus>) -> CancelCleanup {
     }
 }
 
+/// Sessions and their pending removals share one lock: a retake racing the
+/// grace deadline must never observe one map mid-update against the other.
+#[derive(Default)]
+struct SessionState {
+    sessions: HashMap<String, Session>,
+    /// Order id -> unix deadline past which the deferred session is dropped.
+    deferred_removals: HashMap<String, i64>,
+}
+
 /// In-memory session store.
 pub struct SessionManager {
-    sessions: Arc<RwLock<HashMap<String, Session>>>,
-    /// Order id -> unix deadline past which the deferred session is dropped.
-    deferred_removals: Arc<RwLock<HashMap<String, i64>>>,
+    state: Arc<RwLock<SessionState>>,
 }
 
 impl Default for SessionManager {
@@ -89,8 +96,7 @@ impl Default for SessionManager {
 impl SessionManager {
     pub fn new() -> Self {
         Self {
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            deferred_removals: Arc::new(RwLock::new(HashMap::new())),
+            state: Arc::new(RwLock::new(SessionState::default())),
         }
     }
 
@@ -124,14 +130,16 @@ impl SessionManager {
             created_at: now,
         };
 
-        {
-            let mut sessions = self.sessions.write().await;
-            if sessions.contains_key(&order_id) {
-                return Err(anyhow!("SessionAlreadyExists: {}", order_id));
-            }
-            sessions.insert(order_id.clone(), session.clone());
+        let mut state = self.state.write().await;
+        // A session awaiting deferred removal belongs to the canceled take;
+        // this one supersedes it, deadline included.
+        if state.deferred_removals.remove(&order_id).is_some() {
+            state.sessions.remove(&order_id);
         }
-        self.deferred_removals.write().await.remove(&order_id);
+        if state.sessions.contains_key(&order_id) {
+            return Err(anyhow!("SessionAlreadyExists: {}", order_id));
+        }
+        state.sessions.insert(order_id, session.clone());
         Ok(session)
     }
 
@@ -144,45 +152,43 @@ impl SessionManager {
                 session.order_id
             ));
         }
-        let mut sessions = self.sessions.write().await;
-        if !sessions.contains_key(order_id) {
+        let mut state = self.state.write().await;
+        if !state.sessions.contains_key(order_id) {
             return Err(anyhow!("SessionNotFound"));
         }
-        sessions.insert(order_id.to_string(), session);
+        state.sessions.insert(order_id.to_string(), session);
         Ok(())
     }
 
     /// Get a session by order ID.
     pub async fn get_session(&self, order_id: &str) -> Option<Session> {
-        self.sessions.read().await.get(order_id).cloned()
+        self.state.read().await.sessions.get(order_id).cloned()
     }
 
     /// Remove a session (on completion, cancellation, or timeout).
     pub async fn remove_session(&self, order_id: &str) {
-        self.deferred_removals.write().await.remove(order_id);
-        self.sessions.write().await.remove(order_id);
+        let mut state = self.state.write().await;
+        state.deferred_removals.remove(order_id);
+        state.sessions.remove(order_id);
     }
 
     /// Defer this session's removal until `delay_secs` from now.
     pub async fn defer_removal(&self, order_id: &str, delay_secs: i64) {
         let deadline = crate::rt::unix_now() + delay_secs;
-        self.deferred_removals
+        self.state
             .write()
             .await
+            .deferred_removals
             .insert(order_id.to_string(), deadline);
     }
 
     /// Settle a deferred removal early. Reports whether one was pending; a
     /// session with no deferred removal is left untouched.
     pub async fn resolve_deferred_removal(&self, order_id: &str) -> bool {
-        let was_deferred = self
-            .deferred_removals
-            .write()
-            .await
-            .remove(order_id)
-            .is_some();
+        let mut state = self.state.write().await;
+        let was_deferred = state.deferred_removals.remove(order_id).is_some();
         if was_deferred {
-            self.sessions.write().await.remove(order_id);
+            state.sessions.remove(order_id);
         }
         was_deferred
     }
@@ -190,24 +196,16 @@ impl SessionManager {
     /// Drop every session whose deferred deadline has elapsed.
     pub async fn reconcile_deferred_removals(&self) {
         let now = crate::rt::unix_now();
-        let due: Vec<String> = {
-            let mut deferred = self.deferred_removals.write().await;
-            let due: Vec<String> = deferred
-                .iter()
-                .filter(|(_, &deadline)| now >= deadline)
-                .map(|(order_id, _)| order_id.clone())
-                .collect();
-            for order_id in &due {
-                deferred.remove(order_id);
-            }
-            due
-        };
-        if due.is_empty() {
-            return;
-        }
-        let mut sessions = self.sessions.write().await;
+        let mut state = self.state.write().await;
+        let due: Vec<String> = state
+            .deferred_removals
+            .iter()
+            .filter(|(_, &deadline)| now >= deadline)
+            .map(|(order_id, _)| order_id.clone())
+            .collect();
         for order_id in &due {
-            sessions.remove(order_id);
+            state.deferred_removals.remove(order_id);
+            state.sessions.remove(order_id);
         }
     }
 
@@ -221,8 +219,9 @@ impl SessionManager {
         order_id: &str,
         key: [u8; 32],
     ) -> Result<()> {
-        let mut sessions = self.sessions.write().await;
-        let session = sessions
+        let mut state = self.state.write().await;
+        let session = state
+            .sessions
             .get_mut(order_id)
             .ok_or_else(|| anyhow!("SessionNotFound: {order_id}"))?;
         session.admin_shared_key = Some(key);
@@ -234,8 +233,8 @@ impl SessionManager {
     pub async fn cleanup_stale_sessions(&self, timeout_secs: i64) {
         let now = crate::rt::unix_now();
 
-        let mut sessions = self.sessions.write().await;
-        sessions.retain(|_, s| {
+        let mut state = self.state.write().await;
+        state.sessions.retain(|_, s| {
             s.shared_key.is_some() || (now - s.created_at) < timeout_secs
         });
     }
@@ -389,15 +388,7 @@ mod tests {
         );
     }
 
-    /// Retaking the same order inside the grace window must not lose the fresh
-    /// session to the canceled take's timer.
-    #[tokio::test]
-    async fn a_retake_survives_the_previous_deferral() {
-        let order_id = "order-retaken";
-        let mgr = manager_with_session(order_id).await;
-
-        mgr.defer_removal(order_id, BOND_SLASH_GRACE_SECS).await;
-        mgr.resolve_deferred_removal(order_id).await;
+    async fn retake(mgr: &SessionManager, order_id: &str) -> Result<Session> {
         mgr.create_session(
             order_id.to_string(),
             TradeRole::Seller,
@@ -405,12 +396,49 @@ mod tests {
             dummy_order_info(order_id),
         )
         .await
-        .expect("retake creates a fresh session");
+    }
+
+    /// Retaking the same order inside the grace window must not lose the fresh
+    /// session to the canceled take's timer.
+    #[tokio::test]
+    async fn a_retake_supersedes_the_deferred_session() {
+        let order_id = "order-retaken";
+        let mgr = manager_with_session(order_id).await;
+
+        mgr.defer_removal(order_id, BOND_SLASH_GRACE_SECS).await;
+        retake(&mgr, order_id).await.expect("retake");
 
         mgr.reconcile_deferred_removals().await;
 
         let session = mgr.get_session(order_id).await.expect("session kept");
         assert_eq!(session.trade_key_index, 7);
+    }
+
+    /// A retake landing on an already-elapsed deadline — the window a separate
+    /// deferral and session lock left open — still ends up with a live session.
+    #[tokio::test]
+    async fn a_retake_at_the_deadline_keeps_its_session() {
+        let order_id = "order-retaken-late";
+        let mgr = manager_with_session(order_id).await;
+
+        mgr.defer_removal(order_id, 0).await;
+        retake(&mgr, order_id).await.expect("retake");
+
+        mgr.reconcile_deferred_removals().await;
+
+        let session = mgr.get_session(order_id).await.expect("session kept");
+        assert_eq!(session.trade_key_index, 7);
+    }
+
+    /// A live session is not a stale deferral: the duplicate guard still holds.
+    #[tokio::test]
+    async fn a_retake_over_a_live_session_is_still_refused() {
+        let order_id = "order-live-take";
+        let mgr = manager_with_session(order_id).await;
+
+        let err = retake(&mgr, order_id).await.expect_err("duplicate take");
+
+        assert!(err.to_string().contains("SessionAlreadyExists"));
     }
 
     #[tokio::test]
