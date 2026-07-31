@@ -328,6 +328,13 @@ with no deferral armed it leaves the session untouched. Retaking the same order
 inside the window clears the deferral first, so the new take gets a fresh
 session under its own trade key.
 
+Both actions are gated on the recipient trade key before anything else. An
+order id is reused across retakes, so a delivery addressed to the previous
+take's key is dropped before it can reach the order book, the persisted trade
+or the session. Deferrals carry the trade key index they were armed for, and
+neither the trailing notice nor the timer removes a session of another
+generation.
+
 Deliberate divergence from v1 (`.specify/v1-reference/ANTI_ABUSE_BOND.md` §8),
 which keys off `!userInitiated && hadBond`: v2 keys off the pre-cancel status,
 so it needs neither an outbound cancel marker nor a bond-policy lookup. It

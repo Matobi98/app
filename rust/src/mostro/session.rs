@@ -75,13 +75,21 @@ pub fn cancel_cleanup(status: Option<&OrderStatus>) -> CancelCleanup {
     }
 }
 
+/// A pending removal, bound to the session that earned it. An order id is
+/// reused across retakes, so the trade key index is what tells the canceled
+/// take apart from the one that replaced it.
+#[derive(Clone, Copy)]
+struct DeferredRemoval {
+    deadline: i64,
+    trade_key_index: u32,
+}
+
 /// Sessions and their pending removals share one lock: a retake racing the
 /// grace deadline must never observe one map mid-update against the other.
 #[derive(Default)]
 struct SessionState {
     sessions: HashMap<String, Session>,
-    /// Order id -> unix deadline past which the deferred session is dropped.
-    deferred_removals: HashMap<String, i64>,
+    deferred_removals: HashMap<String, DeferredRemoval>,
 }
 
 /// In-memory session store.
@@ -172,40 +180,88 @@ impl SessionManager {
         state.sessions.remove(order_id);
     }
 
-    /// Defer this session's removal until `delay_secs` from now.
-    pub async fn defer_removal(&self, order_id: &str, delay_secs: i64) {
-        let deadline = crate::rt::unix_now() + delay_secs;
-        self.state
-            .write()
-            .await
-            .deferred_removals
-            .insert(order_id.to_string(), deadline);
+    /// Whether `trade_key_index` still names the live session for this order.
+    ///
+    /// An order id outlives the take that used it: after a retake, a delivery
+    /// addressed to the previous trade key must not act on the fresh session.
+    /// An order with no session — a maker canceling their own listing — has no
+    /// generation to contradict.
+    pub async fn is_current_generation(&self, order_id: &str, trade_key_index: u32) -> bool {
+        match self.state.read().await.sessions.get(order_id) {
+            Some(session) => session.trade_key_index == trade_key_index,
+            None => true,
+        }
     }
 
-    /// Settle a deferred removal early. Reports whether one was pending; a
-    /// session with no deferred removal is left untouched.
-    pub async fn resolve_deferred_removal(&self, order_id: &str) -> bool {
+    /// Remove the session only while `trade_key_index` still names it.
+    pub async fn remove_session_if_current(&self, order_id: &str, trade_key_index: u32) {
         let mut state = self.state.write().await;
-        let was_deferred = state.deferred_removals.remove(order_id).is_some();
-        if was_deferred {
+        if state
+            .sessions
+            .get(order_id)
+            .is_some_and(|s| s.trade_key_index == trade_key_index)
+        {
+            state.deferred_removals.remove(order_id);
             state.sessions.remove(order_id);
         }
-        was_deferred
     }
 
-    /// Drop every session whose deferred deadline has elapsed.
+    /// Defer this session's removal until `delay_secs` from now.
+    pub async fn defer_removal(&self, order_id: &str, trade_key_index: u32, delay_secs: i64) {
+        let deadline = crate::rt::unix_now() + delay_secs;
+        self.state.write().await.deferred_removals.insert(
+            order_id.to_string(),
+            DeferredRemoval {
+                deadline,
+                trade_key_index,
+            },
+        );
+    }
+
+    /// Settle a deferred removal early. Reports whether one was pending for
+    /// this generation; anything else is left untouched. The session is only
+    /// dropped while it is still the one the deferral was armed against — a
+    /// retake in between keeps its own.
+    pub async fn resolve_deferred_removal(&self, order_id: &str, trade_key_index: u32) -> bool {
+        let mut state = self.state.write().await;
+        let matches = state
+            .deferred_removals
+            .get(order_id)
+            .is_some_and(|d| d.trade_key_index == trade_key_index);
+        if !matches {
+            return false;
+        }
+        state.deferred_removals.remove(order_id);
+        if state
+            .sessions
+            .get(order_id)
+            .is_some_and(|s| s.trade_key_index == trade_key_index)
+        {
+            state.sessions.remove(order_id);
+        }
+        true
+    }
+
+    /// Drop every session whose deferred deadline has elapsed. A deadline whose
+    /// session has since been replaced is dropped without touching the new one.
     pub async fn reconcile_deferred_removals(&self) {
         let now = crate::rt::unix_now();
         let mut state = self.state.write().await;
-        let due: Vec<String> = state
+        let due: Vec<(String, u32)> = state
             .deferred_removals
             .iter()
-            .filter(|(_, &deadline)| now >= deadline)
-            .map(|(order_id, _)| order_id.clone())
+            .filter(|(_, d)| now >= d.deadline)
+            .map(|(order_id, d)| (order_id.clone(), d.trade_key_index))
             .collect();
-        for order_id in &due {
-            state.deferred_removals.remove(order_id);
-            state.sessions.remove(order_id);
+        for (order_id, trade_key_index) in due {
+            state.deferred_removals.remove(&order_id);
+            if state
+                .sessions
+                .get(&order_id)
+                .is_some_and(|s| s.trade_key_index == trade_key_index)
+            {
+                state.sessions.remove(&order_id);
+            }
         }
     }
 
@@ -255,8 +311,10 @@ pub fn session_manager() -> &'static SessionManager {
 ///
 /// Registration is awaited so a `bond-slashed` arriving right after the cancel
 /// always finds the deferral armed; only the deadline runs in the background.
-pub async fn defer_session_removal(order_id: String, delay_secs: i64) {
-    session_manager().defer_removal(&order_id, delay_secs).await;
+pub async fn defer_session_removal(order_id: String, trade_key_index: u32, delay_secs: i64) {
+    session_manager()
+        .defer_removal(&order_id, trade_key_index, delay_secs)
+        .await;
     crate::rt::spawn(async move {
         crate::rt::time::sleep(crate::rt::time::Duration::from_secs(
             delay_secs.max(0) as u64
@@ -293,12 +351,17 @@ mod tests {
         }
     }
 
+    /// Trade key indices standing in for the take that got canceled and the
+    /// retake that reused its order id.
+    const TAKE: u32 = 0;
+    const RETAKE: u32 = 7;
+
     async fn manager_with_session(order_id: &str) -> SessionManager {
         let mgr = SessionManager::new();
         mgr.create_session(
             order_id.to_string(),
             TradeRole::Buyer,
-            0,
+            TAKE,
             dummy_order_info(order_id),
         )
         .await
@@ -345,7 +408,7 @@ mod tests {
         let order_id = "order-deferred";
         let mgr = manager_with_session(order_id).await;
 
-        mgr.defer_removal(order_id, BOND_SLASH_GRACE_SECS).await;
+        mgr.defer_removal(order_id, TAKE, BOND_SLASH_GRACE_SECS).await;
         mgr.reconcile_deferred_removals().await;
 
         assert!(
@@ -359,7 +422,7 @@ mod tests {
         let order_id = "order-expired";
         let mgr = manager_with_session(order_id).await;
 
-        mgr.defer_removal(order_id, 0).await;
+        mgr.defer_removal(order_id, TAKE, 0).await;
         mgr.reconcile_deferred_removals().await;
 
         assert!(mgr.get_session(order_id).await.is_none());
@@ -370,9 +433,9 @@ mod tests {
         let order_id = "order-slashed";
         let mgr = manager_with_session(order_id).await;
 
-        mgr.defer_removal(order_id, BOND_SLASH_GRACE_SECS).await;
+        mgr.defer_removal(order_id, TAKE, BOND_SLASH_GRACE_SECS).await;
 
-        assert!(mgr.resolve_deferred_removal(order_id).await);
+        assert!(mgr.resolve_deferred_removal(order_id, TAKE).await);
         assert!(mgr.get_session(order_id).await.is_none());
     }
 
@@ -381,7 +444,7 @@ mod tests {
         let order_id = "order-live";
         let mgr = manager_with_session(order_id).await;
 
-        assert!(!mgr.resolve_deferred_removal(order_id).await);
+        assert!(!mgr.resolve_deferred_removal(order_id, TAKE).await);
         assert!(
             mgr.get_session(order_id).await.is_some(),
             "a live trade must not lose its session to an unrelated bond-slashed"
@@ -392,7 +455,7 @@ mod tests {
         mgr.create_session(
             order_id.to_string(),
             TradeRole::Seller,
-            7,
+            RETAKE,
             dummy_order_info(order_id),
         )
         .await
@@ -405,13 +468,13 @@ mod tests {
         let order_id = "order-retaken";
         let mgr = manager_with_session(order_id).await;
 
-        mgr.defer_removal(order_id, BOND_SLASH_GRACE_SECS).await;
+        mgr.defer_removal(order_id, TAKE, BOND_SLASH_GRACE_SECS).await;
         retake(&mgr, order_id).await.expect("retake");
 
         mgr.reconcile_deferred_removals().await;
 
         let session = mgr.get_session(order_id).await.expect("session kept");
-        assert_eq!(session.trade_key_index, 7);
+        assert_eq!(session.trade_key_index, RETAKE);
     }
 
     /// A retake landing on an already-elapsed deadline — the window a separate
@@ -421,13 +484,13 @@ mod tests {
         let order_id = "order-retaken-late";
         let mgr = manager_with_session(order_id).await;
 
-        mgr.defer_removal(order_id, 0).await;
+        mgr.defer_removal(order_id, TAKE, 0).await;
         retake(&mgr, order_id).await.expect("retake");
 
         mgr.reconcile_deferred_removals().await;
 
         let session = mgr.get_session(order_id).await.expect("session kept");
-        assert_eq!(session.trade_key_index, 7);
+        assert_eq!(session.trade_key_index, RETAKE);
     }
 
     /// A live session is not a stale deferral: the duplicate guard still holds.
@@ -446,9 +509,59 @@ mod tests {
         let order_id = "order-removed";
         let mgr = manager_with_session(order_id).await;
 
-        mgr.defer_removal(order_id, BOND_SLASH_GRACE_SECS).await;
+        mgr.defer_removal(order_id, TAKE, BOND_SLASH_GRACE_SECS).await;
         mgr.remove_session(order_id).await;
 
-        assert!(!mgr.resolve_deferred_removal(order_id).await);
+        assert!(!mgr.resolve_deferred_removal(order_id, TAKE).await);
+    }
+
+    // ── Generation binding ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn only_the_live_trade_key_is_the_current_generation() {
+        let order_id = "order-generation";
+        let mgr = manager_with_session(order_id).await;
+
+        assert!(mgr.is_current_generation(order_id, TAKE).await);
+        assert!(!mgr.is_current_generation(order_id, RETAKE).await);
+        assert!(
+            mgr.is_current_generation("order-never-taken", TAKE).await,
+            "an order we never took has no generation to contradict"
+        );
+    }
+
+    /// The full delayed-delivery sequence: the old take's `canceled` and its
+    /// trailing `bond-slashed` both land after the retake replaced the session.
+    #[tokio::test]
+    async fn a_delayed_cancel_from_the_old_key_spares_the_retaken_session() {
+        let order_id = "order-superseded";
+        let mgr = manager_with_session(order_id).await;
+
+        mgr.defer_removal(order_id, TAKE, BOND_SLASH_GRACE_SECS).await;
+        retake(&mgr, order_id).await.expect("retake");
+
+        // Delayed `canceled` from the old trade key: the dispatcher's gate
+        // rejects it before it can arm a deferral against the new session.
+        assert!(!mgr.is_current_generation(order_id, TAKE).await);
+        // Even if one were armed, neither the trailing notice nor the timer
+        // may claim a session of another generation.
+        mgr.defer_removal(order_id, TAKE, 0).await;
+        mgr.resolve_deferred_removal(order_id, TAKE).await;
+        mgr.reconcile_deferred_removals().await;
+
+        let session = mgr.get_session(order_id).await.expect("retake survives");
+        assert_eq!(session.trade_key_index, RETAKE);
+    }
+
+    #[tokio::test]
+    async fn an_immediate_removal_spares_a_session_of_another_generation() {
+        let order_id = "order-immediate";
+        let mgr = manager_with_session(order_id).await;
+
+        mgr.remove_session_if_current(order_id, RETAKE).await;
+        assert!(mgr.get_session(order_id).await.is_some());
+
+        mgr.remove_session_if_current(order_id, TAKE).await;
+        assert!(mgr.get_session(order_id).await.is_none());
     }
 }
