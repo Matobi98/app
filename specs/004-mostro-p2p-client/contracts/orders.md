@@ -89,6 +89,9 @@ created: the TradeInfo is built from the reply's real data (status,
 calculated `amount_sats`, `hold_invoice`), persisted to My Trades, the
 order book entry is synced, and the trade session/subscriptions start.
 On rejection or timeout **nothing is persisted** — no phantom trade.
+Retaking an order whose previous take was canceled inside the bond grace
+window clears the pending session deletion first (see *Session lifecycle
+on cancel*).
 
 **Errors**: `OrderNotFound`, `CannotTakeOwnOrder`, `OrderAlreadyTaken`,
 `InvalidRole`, `FiatAmountRequired`/`OutOfRange` (range orders),
@@ -303,3 +306,30 @@ The seller pay-invoice flow uses two complementary providers from
   advancing past the pay-invoice screen; the NWC widget's local
   `onPaymentSuccess` callback only flips a spinner flag and does not
   navigate.
+
+---
+
+## Session lifecycle on cancel
+
+`bond-slashed` trails the daemon's `canceled` by ~150 ms. Dropping the session
+on `canceled` would take the trade key out of the subscription filter and
+discard its decryption key, so the notice could never be received or decrypted.
+`process_gift_wrap_rumor` therefore reads the order's status **before** syncing
+`Canceled`, and applies:
+
+| Status before the cancel             | Session                                       |
+|--------------------------------------|-----------------------------------------------|
+| `Pending`                            | removed at once — the cancel returns the bond  |
+| `Dispute` / any admin-resolved state | kept — the admin chat still needs its keys    |
+| anything else, including unknown     | removed after `BOND_SLASH_GRACE_SECS` (60 s)  |
+
+`BondSlashed` settles a pending deferral and drops the session immediately;
+with no deferral armed it leaves the session untouched. Retaking the same order
+inside the window clears the deferral first, so the new take gets a fresh
+session under its own trade key.
+
+Deliberate divergence from v1 (`.specify/v1-reference/ANTI_ABUSE_BOND.md` §8),
+which keys off `!userInitiated && hadBond`: v2 keys off the pre-cancel status,
+so it needs neither an outbound cancel marker nor a bond-policy lookup. It
+defers in cases v1 would not; the cost is a session held 60 s longer. Sessions
+are in-memory only, so v1's restart reconciliation does not apply.
