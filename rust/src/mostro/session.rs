@@ -108,11 +108,8 @@ impl SessionManager {
         }
     }
 
-    /// Create a new session for a trade. Returns an error if a session
-    /// already exists for this order (indicates duplicate processing).
-    pub async fn create_session(
-        &self,
-        order_id: String,
+    fn build_session(
+        order_id: &str,
         role: TradeRole,
         trade_key_index: u32,
         order: OrderInfo,
@@ -124,19 +121,28 @@ impl SessionManager {
                 order.id
             ));
         }
-
-        let now = crate::rt::unix_now();
-
-        let session = Session {
-            order_id: order_id.clone(),
+        Ok(Session {
+            order_id: order_id.to_string(),
             role,
             trade_key_index,
             shared_key: None,
             admin_shared_key: None,
             peer_pubkey: None,
             order,
-            created_at: now,
-        };
+            created_at: crate::rt::unix_now(),
+        })
+    }
+
+    /// Create a new session for a trade. Returns an error if a session
+    /// already exists for this order (indicates duplicate processing).
+    pub async fn create_session(
+        &self,
+        order_id: String,
+        role: TradeRole,
+        trade_key_index: u32,
+        order: OrderInfo,
+    ) -> Result<Session> {
+        let session = Self::build_session(&order_id, role, trade_key_index, order)?;
 
         let mut state = self.state.write().await;
         // A session awaiting deferred removal belongs to the canceled take;
@@ -148,6 +154,32 @@ impl SessionManager {
             return Err(anyhow!("SessionAlreadyExists: {}", order_id));
         }
         state.sessions.insert(order_id, session.clone());
+        Ok(session)
+    }
+
+    /// Install the session for a take the daemon has already confirmed.
+    ///
+    /// Unlike [`Self::create_session`] this never yields to what it finds: the
+    /// take is accepted, so anything left under this order id belongs to an
+    /// earlier one and would otherwise leave the new trade session-less.
+    pub async fn install_session(
+        &self,
+        order_id: String,
+        role: TradeRole,
+        trade_key_index: u32,
+        order: OrderInfo,
+    ) -> Result<Session> {
+        let session = Self::build_session(&order_id, role, trade_key_index, order)?;
+
+        let mut state = self.state.write().await;
+        state.deferred_removals.remove(&order_id);
+        if let Some(previous) = state.sessions.insert(order_id.clone(), session.clone()) {
+            log::warn!(
+                "[session] order={order_id}: replaced a stale session (trade key idx {} -> {})",
+                previous.trade_key_index,
+                trade_key_index
+            );
+        }
         Ok(session)
     }
 
@@ -502,6 +534,46 @@ mod tests {
         let err = retake(&mgr, order_id).await.expect_err("duplicate take");
 
         assert!(err.to_string().contains("SessionAlreadyExists"));
+    }
+
+    /// What `create_session` refuses above, an accepted take must not: the
+    /// daemon confirmed it, so it takes the order id over whatever it finds.
+    #[tokio::test]
+    async fn an_accepted_take_installs_its_session_over_a_live_one() {
+        let order_id = "order-installed";
+        let mgr = manager_with_session(order_id).await;
+
+        mgr.install_session(
+            order_id.to_string(),
+            TradeRole::Seller,
+            RETAKE,
+            dummy_order_info(order_id),
+        )
+        .await
+        .expect("install");
+
+        let session = mgr.get_session(order_id).await.expect("session installed");
+        assert_eq!(session.trade_key_index, RETAKE);
+    }
+
+    #[tokio::test]
+    async fn an_installed_session_does_not_inherit_a_pending_deferral() {
+        let order_id = "order-installed-deferred";
+        let mgr = manager_with_session(order_id).await;
+
+        mgr.defer_removal(order_id, TAKE, 0).await;
+        mgr.install_session(
+            order_id.to_string(),
+            TradeRole::Seller,
+            RETAKE,
+            dummy_order_info(order_id),
+        )
+        .await
+        .expect("install");
+
+        mgr.reconcile_deferred_removals().await;
+
+        assert!(mgr.get_session(order_id).await.is_some());
     }
 
     #[tokio::test]

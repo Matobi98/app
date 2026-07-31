@@ -1142,14 +1142,17 @@ pub async fn take_order(
     // receive status changes (pending → in-progress → waiting-payment …).
     subscribe_single_order(&order_id).await;
     // Create a session so the chat API can look up keys immediately.
-    let _ = crate::mostro::session::session_manager()
-        .create_session(
+    if let Err(e) = crate::mostro::session::session_manager()
+        .install_session(
             order_id.clone(),
             trade.role.clone(),
             trade_index,
             trade.order.clone(),
         )
-        .await;
+        .await
+    {
+        log::error!("[orders] no session for accepted take on order={order_id}: {e}");
+    }
 
     Ok(trade)
 }
