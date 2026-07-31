@@ -1831,6 +1831,16 @@ async fn dispatch_mostro_message(
             if let Some(order_id) = &kind.id {
                 let oid = order_id.to_string();
                 order_book().remove_order(&oid).await;
+                // Read before the sync below overwrites it with Canceled.
+                let prev_status = match crate::db::app_db::db() {
+                    Some(db) => db
+                        .get_trade_by_order_id(&oid)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|t| t.order.status),
+                    None => None,
+                };
                 // Sync the Canceled status into the trade DB so My Trades
                 // reflects the cancellation immediately.
                 if let Some(db) = crate::db::app_db::db() {
@@ -1846,6 +1856,7 @@ async fn dispatch_mostro_message(
                         log::warn!("[orders] failed to sync Canceled status for {oid}: {e}");
                     }
                 }
+                apply_cancel_cleanup(&oid, prev_status.as_ref()).await;
             }
         }
         // Seller receives BuyerTookOrder → peer is buyer_trade_pubkey.
@@ -2151,6 +2162,9 @@ async fn dispatch_mostro_message(
             log::info!(
                 "[orders] gift-wrap BondSlashed: order={order_id} amount={amount_sats} cause={cause:?}"
             );
+            crate::mostro::session::session_manager()
+                .resolve_deferred_removal(&order_id)
+                .await;
             crate::api::bond::emit_bond_slashed(crate::api::types::BondSlashedEvent {
                 event_id: event_id.to_string(),
                 order_id,
@@ -2163,6 +2177,22 @@ async fn dispatch_mostro_message(
         }
         action => {
             log::debug!("[orders] gift-wrap unhandled action={action:?}");
+        }
+    }
+}
+
+/// A cancel that may be followed by a `bond-slashed` keeps its session alive
+/// for the grace period, so the trailing notice still decrypts.
+async fn apply_cancel_cleanup(order_id: &str, prev_status: Option<&OrderStatus>) {
+    use crate::mostro::session::{
+        cancel_cleanup, defer_session_removal, session_manager, CancelCleanup,
+        BOND_SLASH_GRACE_SECS,
+    };
+    match cancel_cleanup(prev_status) {
+        CancelCleanup::Keep => {}
+        CancelCleanup::Immediate => session_manager().remove_session(order_id).await,
+        CancelCleanup::Defer => {
+            defer_session_removal(order_id.to_string(), BOND_SLASH_GRACE_SECS).await;
         }
     }
 }
@@ -3727,6 +3757,65 @@ mod tests {
 
         assert!(session.peer_pubkey.is_none());
         assert!(session.shared_key.is_none());
+    }
+
+    // ── Cancel cleanup ────────────────────────────────────────────────────────
+
+    async fn session_for_cleanup() -> String {
+        let order_id = uuid::Uuid::new_v4().to_string();
+        session_manager()
+            .create_session(
+                order_id.clone(),
+                TradeRole::Buyer,
+                0,
+                dummy_order_info(&order_id),
+            )
+            .await
+            .expect("create_session");
+        order_id
+    }
+
+    #[tokio::test]
+    async fn a_committed_cancel_keeps_the_session_for_the_slash_notice() {
+        let order_id = session_for_cleanup().await;
+
+        apply_cancel_cleanup(&order_id, Some(&OrderStatus::WaitingBuyerInvoice)).await;
+
+        assert!(session_manager().get_session(&order_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_pending_cancel_drops_the_session_at_once() {
+        let order_id = session_for_cleanup().await;
+
+        apply_cancel_cleanup(&order_id, Some(&OrderStatus::Pending)).await;
+
+        assert!(session_manager().get_session(&order_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_disputed_cancel_keeps_the_session_for_the_admin_chat() {
+        let order_id = session_for_cleanup().await;
+
+        apply_cancel_cleanup(&order_id, Some(&OrderStatus::Dispute)).await;
+
+        assert!(session_manager().get_session(&order_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_trailing_bond_slashed_settles_the_deferred_session() {
+        let order_id = session_for_cleanup().await;
+
+        apply_cancel_cleanup(&order_id, Some(&OrderStatus::WaitingPayment)).await;
+        assert!(session_manager().get_session(&order_id).await.is_some());
+
+        assert!(
+            session_manager()
+                .resolve_deferred_removal(&order_id)
+                .await,
+            "the cancel must have left a deferred removal for the notice to settle"
+        );
+        assert!(session_manager().get_session(&order_id).await.is_none());
     }
 
     // ── Peer-pubkey resolution ────────────────────────────────────────────────
