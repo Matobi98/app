@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::api::types::{OrderInfo, TradeRole};
+use crate::api::types::{OrderInfo, OrderStatus, TradeRole};
 
 /// Per-trade session state.
 #[derive(Clone)]
@@ -44,9 +44,42 @@ impl std::fmt::Debug for Session {
     }
 }
 
+// ── Cancel cleanup policy ───────────────────────────────────────────────────
+
+/// On a timeout slash the daemon sends `canceled` first and `bond-slashed`
+/// milliseconds later. Dropping the session on `canceled` would take the trade
+/// key out of the subscription filter and discard its decryption key, so the
+/// trailing notice could never be received.
+pub const BOND_SLASH_GRACE_SECS: i64 = 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelCleanup {
+    Immediate,
+    Defer,
+    /// Dispute and admin states still need the session's keys for the admin chat.
+    Keep,
+}
+
+/// Decides a session's fate from the order status recorded *before* the cancel
+/// was applied.
+pub fn cancel_cleanup(status: Option<&OrderStatus>) -> CancelCleanup {
+    match status {
+        Some(
+            OrderStatus::Dispute
+            | OrderStatus::CanceledByAdmin
+            | OrderStatus::SettledByAdmin
+            | OrderStatus::CompletedByAdmin,
+        ) => CancelCleanup::Keep,
+        Some(OrderStatus::Pending) => CancelCleanup::Immediate,
+        _ => CancelCleanup::Defer,
+    }
+}
+
 /// In-memory session store.
 pub struct SessionManager {
     sessions: Arc<RwLock<HashMap<String, Session>>>,
+    /// Order id -> unix deadline past which the deferred session is dropped.
+    deferred_removals: Arc<RwLock<HashMap<String, i64>>>,
 }
 
 impl Default for SessionManager {
@@ -57,6 +90,7 @@ impl SessionManager {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            deferred_removals: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -122,7 +156,56 @@ impl SessionManager {
 
     /// Remove a session (on completion, cancellation, or timeout).
     pub async fn remove_session(&self, order_id: &str) {
+        self.deferred_removals.write().await.remove(order_id);
         self.sessions.write().await.remove(order_id);
+    }
+
+    /// Defer this session's removal until `delay_secs` from now.
+    pub async fn defer_removal(&self, order_id: &str, delay_secs: i64) {
+        let deadline = crate::rt::unix_now() + delay_secs;
+        self.deferred_removals
+            .write()
+            .await
+            .insert(order_id.to_string(), deadline);
+    }
+
+    /// Settle a deferred removal early. Reports whether one was pending; a
+    /// session with no deferred removal is left untouched.
+    pub async fn resolve_deferred_removal(&self, order_id: &str) -> bool {
+        let was_deferred = self
+            .deferred_removals
+            .write()
+            .await
+            .remove(order_id)
+            .is_some();
+        if was_deferred {
+            self.sessions.write().await.remove(order_id);
+        }
+        was_deferred
+    }
+
+    /// Drop every session whose deferred deadline has elapsed.
+    pub async fn reconcile_deferred_removals(&self) {
+        let now = crate::rt::unix_now();
+        let due: Vec<String> = {
+            let mut deferred = self.deferred_removals.write().await;
+            let due: Vec<String> = deferred
+                .iter()
+                .filter(|(_, &deadline)| now >= deadline)
+                .map(|(order_id, _)| order_id.clone())
+                .collect();
+            for order_id in &due {
+                deferred.remove(order_id);
+            }
+            due
+        };
+        if due.is_empty() {
+            return;
+        }
+        let mut sessions = self.sessions.write().await;
+        for order_id in &due {
+            sessions.remove(order_id);
+        }
     }
 
     /// Store the ECDH admin shared key derived from `adminTookDispute`.
@@ -164,4 +247,153 @@ static SESSION_MGR: OnceLock<SessionManager> = OnceLock::new();
 /// Get the global session manager.
 pub fn session_manager() -> &'static SessionManager {
     SESSION_MGR.get_or_init(SessionManager::new)
+}
+
+/// Register a deferred removal and arm the timer that enforces it.
+///
+/// Registration is awaited so a `bond-slashed` arriving right after the cancel
+/// always finds the deferral armed; only the deadline runs in the background.
+pub async fn defer_session_removal(order_id: String, delay_secs: i64) {
+    session_manager().defer_removal(&order_id, delay_secs).await;
+    crate::rt::spawn(async move {
+        crate::rt::time::sleep(crate::rt::time::Duration::from_secs(
+            delay_secs.max(0) as u64
+        ))
+        .await;
+        session_manager().reconcile_deferred_removals().await;
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::types::OrderKind;
+
+    fn dummy_order_info(id: &str) -> OrderInfo {
+        OrderInfo {
+            id: id.to_string(),
+            kind: OrderKind::Buy,
+            status: OrderStatus::Pending,
+            fiat_code: "USD".to_string(),
+            fiat_amount: Some(100.0),
+            fiat_amount_min: None,
+            fiat_amount_max: None,
+            payment_method: "Bank".to_string(),
+            premium: 0.0,
+            is_mine: false,
+            created_at: 0,
+            expires_at: None,
+            amount_sats: None,
+            creator_pubkey: String::new(),
+            rating: 0.0,
+            total_reviews: 0,
+            days_active: 0,
+        }
+    }
+
+    async fn manager_with_session(order_id: &str) -> SessionManager {
+        let mgr = SessionManager::new();
+        mgr.create_session(
+            order_id.to_string(),
+            TradeRole::Buyer,
+            0,
+            dummy_order_info(order_id),
+        )
+        .await
+        .expect("create_session");
+        mgr
+    }
+
+    #[test]
+    fn dispute_and_admin_states_keep_the_session() {
+        for status in [
+            OrderStatus::Dispute,
+            OrderStatus::CanceledByAdmin,
+            OrderStatus::SettledByAdmin,
+            OrderStatus::CompletedByAdmin,
+        ] {
+            assert_eq!(cancel_cleanup(Some(&status)), CancelCleanup::Keep);
+        }
+    }
+
+    #[test]
+    fn a_pending_cancel_returns_the_bond_and_drops_the_session() {
+        assert_eq!(
+            cancel_cleanup(Some(&OrderStatus::Pending)),
+            CancelCleanup::Immediate
+        );
+    }
+
+    #[test]
+    fn committed_and_unknown_states_defer() {
+        for status in [
+            Some(OrderStatus::WaitingBuyerInvoice),
+            Some(OrderStatus::WaitingPayment),
+            Some(OrderStatus::Active),
+            Some(OrderStatus::FiatSent),
+            Some(OrderStatus::InProgress),
+            None,
+        ] {
+            assert_eq!(cancel_cleanup(status.as_ref()), CancelCleanup::Defer);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deferred_session_survives_until_its_deadline() {
+        let order_id = "order-deferred";
+        let mgr = manager_with_session(order_id).await;
+
+        mgr.defer_removal(order_id, BOND_SLASH_GRACE_SECS).await;
+        mgr.reconcile_deferred_removals().await;
+
+        assert!(
+            mgr.get_session(order_id).await.is_some(),
+            "the session must outlive the cancel so a trailing bond-slashed can be decrypted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deferred_session_is_dropped_once_the_deadline_passes() {
+        let order_id = "order-expired";
+        let mgr = manager_with_session(order_id).await;
+
+        mgr.defer_removal(order_id, 0).await;
+        mgr.reconcile_deferred_removals().await;
+
+        assert!(mgr.get_session(order_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolving_a_deferral_drops_the_session_immediately() {
+        let order_id = "order-slashed";
+        let mgr = manager_with_session(order_id).await;
+
+        mgr.defer_removal(order_id, BOND_SLASH_GRACE_SECS).await;
+
+        assert!(mgr.resolve_deferred_removal(order_id).await);
+        assert!(mgr.get_session(order_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolving_without_a_deferral_leaves_the_session_alone() {
+        let order_id = "order-live";
+        let mgr = manager_with_session(order_id).await;
+
+        assert!(!mgr.resolve_deferred_removal(order_id).await);
+        assert!(
+            mgr.get_session(order_id).await.is_some(),
+            "a live trade must not lose its session to an unrelated bond-slashed"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_session_clears_its_pending_deferral() {
+        let order_id = "order-removed";
+        let mgr = manager_with_session(order_id).await;
+
+        mgr.defer_removal(order_id, BOND_SLASH_GRACE_SECS).await;
+        mgr.remove_session(order_id).await;
+
+        assert!(!mgr.resolve_deferred_removal(order_id).await);
+    }
 }
