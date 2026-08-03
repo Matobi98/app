@@ -229,7 +229,7 @@ call — it arrives as a Kind 14 (NIP-44) message from mostrod. This
 section documents the full chain so Flutter providers and screens know
 what to listen to. Reference: <https://mostro.network/protocol/seller_pay_hold_invoice.html>.
 
-### Inbound gift-wrap actions consumed by `process_gift_wrap_rumor`
+### Inbound gift-wrap actions consumed by `dispatch_mostro_message`
 
 | Action                             | Payload variant                                     | Effect on the seller's trade row                                                 |
 |------------------------------------|-----------------------------------------------------|----------------------------------------------------------------------------------|
@@ -241,7 +241,7 @@ what to listen to. Reference: <https://mostro.network/protocol/seller_pay_hold_i
 | `CooperativeCancelAccepted`        | (status sync)                                       | `status → CooperativelyCanceled`                                                 |
 | `AdminSettled` / `AdminCanceled`   | (status sync)                                       | `status → SettledByAdmin` / `CanceledByAdmin`                                    |
 
-`process_gift_wrap_rumor` MUST update **both** the in-memory order book
+`dispatch_mostro_message` MUST update **both** the in-memory order book
 (`order_book().update_order_status`) **and** the persisted trade row
 (`db.update_trade_fields`) on every status transition, otherwise UI
 screens reading from the DB (e.g. `tradeInfoStreamProvider`) will miss
@@ -311,11 +311,9 @@ The seller pay-invoice flow uses two complementary providers from
 
 ## Session lifecycle on cancel
 
-`bond-slashed` trails the daemon's `canceled` by ~150 ms. Dropping the session
-on `canceled` would take the trade key out of the subscription filter and
-discard its decryption key, so the notice could never be received or decrypted.
-`process_gift_wrap_rumor` therefore reads the order's status **before** syncing
-`Canceled`, and applies:
+Cancel is where a session's life ends, and a `bond-slashed` can trail the
+daemon's `canceled` by ~150 ms. `dispatch_mostro_message` reads the order's
+status **before** syncing `Canceled`, and applies:
 
 | Status before the cancel             | Session                                       |
 |--------------------------------------|-----------------------------------------------|
@@ -328,12 +326,20 @@ with no deferral armed it leaves the session untouched. Retaking the same order
 inside the window clears the deferral first, so the new take gets a fresh
 session under its own trade key.
 
-Both actions are gated on the recipient trade key before anything else. An
-order id is reused across retakes, so a delivery addressed to the previous
-take's key is dropped before it can reach the order book, the persisted trade
-or the session. Deferrals carry the trade key index they were armed for, and
-neither the trailing notice nor the timer removes a session of another
-generation.
+Both actions are gated on the recipient trade key. An order id is reused across
+retakes, so a delivery addressed to the previous take's key is rejected rather
+than acting on the current trade. Deferrals carry the trade key index they were
+armed for, and neither the trailing notice nor the timer removes a session of
+another generation. The gate is a read, not a lock: serializing it with the
+order-book and DB writes is tracked separately in #259.
+
+**What the grace period is not.** In v1 it is what makes the notice arrive at
+all — there, deleting the session drops the trade key from the subscription
+filter and discards its decryption key. That does not hold here: the per-trade
+receiver captures its own trade keys, and `ensure_global_dm_coverage` retains
+them for the life of the process, so reception and decryption never depend on
+the session. The window is a conservative margin for handling that needs
+session state, and parity with v1's policy — not a transport guarantee.
 
 Deliberate divergence from v1 (`.specify/v1-reference/ANTI_ABUSE_BOND.md` §8),
 which keys off `!userInitiated && hadBond`: v2 keys off the pre-cancel status,

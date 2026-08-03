@@ -46,10 +46,12 @@ impl std::fmt::Debug for Session {
 
 // ── Cancel cleanup policy ───────────────────────────────────────────────────
 
-/// On a timeout slash the daemon sends `canceled` first and `bond-slashed`
-/// milliseconds later. Dropping the session on `canceled` would take the trade
-/// key out of the subscription filter and discard its decryption key, so the
-/// trailing notice could never be received.
+/// How long a session outlives a cancel a `bond-slashed` may still trail.
+///
+/// Unlike v1, this is not what makes the notice arrive: the per-trade receiver
+/// captures its own trade keys and `ensure_global_dm_coverage` retains them for
+/// the life of the process, so neither reception nor decryption depends on the
+/// session. It is a margin for handling that needs session state.
 pub const BOND_SLASH_GRACE_SECS: i64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
