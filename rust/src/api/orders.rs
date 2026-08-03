@@ -3138,37 +3138,12 @@ async fn ingest_order_event(event: &nostr_sdk::Event) {
                     }
                 }
             }
-            // Sync trade status in DB for own orders so My Trades
-            // reflects status changes even without gift-wrap delivery.
-            let followed = followed_trade_state(&info.id).await;
-            let supersedes = match &followed {
-                Some((cur, _)) => public_status_supersedes(cur, &info.status),
-                None => true,
-            };
-            if info.is_mine
-                && info.status != crate::api::types::OrderStatus::Pending
-                && supersedes
-            {
-                if let Some(db) = crate::db::app_db::db() {
-                    if let Err(e) = db
-                        .update_trade_fields(
-                            &info.id,
-                            Some(info.status.clone()),
-                            None,
-                            info.amount_sats,
-                        )
-                        .await
-                    {
-                        log::warn!(
-                            "[orders] failed to sync trade status for order={}: {e}",
-                            info.id
-                        );
-                    }
-                }
-            }
-            order_book()
-                .upsert_order(merge_followed_state(info, followed.as_ref()))
-                .await;
+            // Same policy as the per-order d-tag path. This is the only
+            // ingestion a maker gets — `subscribe_single_order` runs for takes
+            // alone — so diverging here stranded them on a stale status when
+            // an unanswered take sent the order back to Pending (PR #213
+            // review, Catrya).
+            sync_public_order_update(info).await;
         }
         None => {
             log::warn!(
