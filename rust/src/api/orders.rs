@@ -3937,6 +3937,154 @@ mod tests {
         // Clean up the leftover non-restore record so we don't leak global state.
         let _ = remove_pending_request(&other_key, 9);
     }
+
+    // ── Dispatcher: canceled → bond-slashed ───────────────────────────────────
+
+    /// A daemon message as `dispatch_mostro_message` receives it, already
+    /// unwrapped. Authored by the active Mostro pubkey so it clears the
+    /// daemon-auth gate.
+    fn daemon_message(
+        action: mostro_core::message::Action,
+        order_id: uuid::Uuid,
+        payload: Option<mostro_core::message::Payload>,
+    ) -> mostro_core::nip59::UnwrappedMessage {
+        let sender = nostr_sdk::PublicKey::from_hex(&crate::config::active_mostro_pubkey())
+            .expect("active mostro pubkey");
+        mostro_core::nip59::UnwrappedMessage {
+            message: mostro_core::message::Message::new_order(
+                Some(order_id),
+                None,
+                None,
+                action,
+                payload,
+            ),
+            signature: None,
+            sender,
+            identity: sender,
+            created_at: nostr_sdk::Timestamp::now(),
+        }
+    }
+
+    /// The `bond-slashed` payload: a bond-sized amount and a null status.
+    fn slashed_bond_payload(
+        order_id: uuid::Uuid,
+        amount_sats: i64,
+    ) -> mostro_core::message::Payload {
+        mostro_core::message::Payload::Order(mostro_core::order::SmallOrder {
+            id: Some(order_id),
+            kind: None,
+            status: None,
+            amount: amount_sats,
+            fiat_code: "USD".to_string(),
+            min_amount: None,
+            max_amount: None,
+            fiat_amount: 100,
+            payment_method: "Bank".to_string(),
+            premium: 0,
+            buyer_trade_pubkey: None,
+            seller_trade_pubkey: None,
+            buyer_invoice: None,
+            created_at: None,
+            expires_at: None,
+        })
+    }
+
+    /// The sequence #197 is about, driven through the real dispatcher: the
+    /// session survives `canceled` so the trailing `bond-slashed` is still
+    /// handled, and the notice reaches the Dart-facing stream.
+    #[tokio::test]
+    async fn a_canceled_then_bond_slashed_sequence_is_handled_end_to_end() {
+        let order_id = uuid::Uuid::new_v4();
+        let oid = order_id.to_string();
+        let trade_pubkey = nostr_sdk::Keys::generate().public_key().to_hex();
+        session_manager()
+            .create_session(oid.clone(), TradeRole::Buyer, TAKE, dummy_order_info(&oid))
+            .await
+            .expect("create_session");
+
+        let mut notices = crate::api::bond::on_bond_slashed();
+
+        dispatch_mostro_message(
+            daemon_message(mostro_core::message::Action::Canceled, order_id, None),
+            "cancel-event",
+            &trade_pubkey,
+            TAKE,
+        )
+        .await;
+        assert!(
+            session_manager().get_session(&oid).await.is_some(),
+            "the cancel must not drop the session while a slash may still trail it"
+        );
+
+        dispatch_mostro_message(
+            daemon_message(
+                mostro_core::message::Action::BondSlashed,
+                order_id,
+                Some(slashed_bond_payload(order_id, 21_000)),
+            ),
+            "slash-event",
+            &trade_pubkey,
+            TAKE,
+        )
+        .await;
+
+        let notice = await_bond_slashed(&mut notices, &oid).await;
+        assert_eq!(notice.amount_sats, 21_000);
+        assert!(
+            session_manager().get_session(&oid).await.is_none(),
+            "the notice settles the deferral"
+        );
+    }
+
+    /// A `canceled` delivered to the previous take's trade key must not reach
+    /// the order book entry or the session of the retake that replaced it.
+    #[tokio::test]
+    async fn a_canceled_from_a_superseded_trade_key_leaves_the_retake_alone() {
+        let order_id = uuid::Uuid::new_v4();
+        let oid = order_id.to_string();
+        let trade_pubkey = nostr_sdk::Keys::generate().public_key().to_hex();
+        session_manager()
+            .create_session(oid.clone(), TradeRole::Seller, RETAKE, dummy_order_info(&oid))
+            .await
+            .expect("create_session");
+        order_book().upsert_order(dummy_order_info(&oid)).await;
+
+        dispatch_mostro_message(
+            daemon_message(mostro_core::message::Action::Canceled, order_id, None),
+            "cancel-event",
+            &trade_pubkey,
+            TAKE,
+        )
+        .await;
+
+        assert!(
+            order_book().get_order(&oid).await.is_some(),
+            "an old key's cancel must not remove the retake's order book entry"
+        );
+        assert!(
+            session_manager().get_session(&oid).await.is_some(),
+            "nor arm a deferral against its session"
+        );
+    }
+
+    /// Reads from the shared broadcast until the notice for `order_id` shows up,
+    /// so a concurrent test's notice cannot be mistaken for this one.
+    async fn await_bond_slashed(
+        stream: &mut crate::api::bond::BondSlashedStream,
+        order_id: &str,
+    ) -> crate::api::types::BondSlashedEvent {
+        let deadline = std::time::Duration::from_secs(5);
+        tokio::time::timeout(deadline, async {
+            loop {
+                let event = stream.next().await.expect("bond-slashed stream");
+                if event.order_id == order_id {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("bond-slashed notice never arrived")
+    }
 }
 
 #[cfg(test)]
