@@ -185,13 +185,17 @@ use crate::rt::unix_now;
 
 /// Initiate a dispute on an active trade.
 ///
-/// Sends a `Dispute` action to the Mostro daemon via NIP-59 Gift Wrap and
-/// creates a local `Dispute` record.
+/// Sends a `Dispute` action to the Mostro daemon, waits for its reply, and
+/// creates the local `Dispute` record **only** once the daemon has accepted
+/// it. A publish is not an acceptance: the daemon rejects a dispute the trade
+/// is not eligible for with `CantDo`, and persisting on publish left that
+/// rejection unreconciled — the dispute stayed locally Open forever (#202).
 ///
 /// **Preconditions**: Trade MUST be disputable (funds in escrow). No existing
 /// open dispute for this trade.
 ///
-/// **Errors**: `TradeNotDisputable`, `DisputeAlreadyOpen`, `ProtocolError`.
+/// **Errors**: `TradeNotDisputable`, `DisputeAlreadyOpen`, `ProtocolError`,
+/// `NoDaemonResponse`, plus daemon `CantDo` reasons passed through.
 pub async fn open_dispute(trade_id: String, reason: Option<String>) -> Result<Dispute> {
     if trade_id.trim().is_empty() {
         bail!("TradeNotDisputable: trade_id must not be empty");
@@ -216,13 +220,21 @@ pub async fn open_dispute(trade_id: String, reason: Option<String>) -> Result<Di
     let _pending = PendingOpenGuard(trade_id.clone());
 
     // Dispatch Action::Dispute to Mostro BEFORE creating the local record so
-    // that a failed publish does not leave an un-retryable "open" slot in the
-    // dispute store.  Only on a successful publish do we persist the dispute.
+    // that a request the daemon never accepted does not leave an un-retryable
+    // "open" slot in the dispute store.
     let trade_index = crate::api::orders::trade_key_for_order(&trade_id)
         .await
         .ok_or_else(|| anyhow!("TradeNotDisputable: no trade key for trade {trade_id}"))?;
 
-    let event_json: String = async {
+    // Correlation nonce for this request. The daemon echoes it in its reply —
+    // DisputeInitiatedByYou on acceptance, CantDo on rejection — and only a
+    // reply carrying it may resolve the wait below.
+    let request_id: u64 = {
+        use rand::RngCore;
+        rand::rngs::OsRng.next_u64().max(1) // 0 is indistinguishable from "unset"
+    };
+
+    let (trade_pk_hex, event_json) = async {
         let sender_keys =
             crate::api::identity::get_active_trade_keys(trade_index).await?;
         let identity_keys =
@@ -230,27 +242,64 @@ pub async fn open_dispute(trade_id: String, reason: Option<String>) -> Result<Di
         let mostro_pubkey =
             nostr_sdk::PublicKey::from_hex(&crate::config::active_mostro_pubkey())
                 .map_err(|e| anyhow!("invalid mostro pubkey: {e}"))?;
-        crate::mostro::actions::dispute(
+        let event_json = crate::mostro::actions::dispute(
             &identity_keys,
             &sender_keys,
             &mostro_pubkey,
             &trade_id,
             trade_index,
+            request_id,
         )
-        .await
+        .await?;
+        Ok::<_, anyhow::Error>((sender_keys.public_key().to_hex(), event_json))
     }
     .await
     .map_err(|e| anyhow!("ProtocolError: could not build Dispute message: {e}"))?;
 
-    crate::api::orders::publish_event(&event_json)
-        .await
-        .map_err(|e| anyhow!("ProtocolError: publish failed: {e}"))?;
+    // Register the pending record BEFORE publishing so the reply cannot race
+    // the bookkeeping. The trade key is already subscribed — the trade is
+    // active — so no new subscription is needed here.
+    let reply_rx =
+        crate::api::orders::register_dispute_request(trade_pk_hex.clone(), request_id, trade_index);
 
-    log::info!("[disputes] Dispute dispatched for trade={trade_id}");
+    if let Err(e) = crate::api::orders::publish_event(&event_json).await {
+        crate::api::orders::remove_pending_request(&trade_pk_hex, request_id);
+        return Err(anyhow!("ProtocolError: publish failed: {e}"));
+    }
 
-    // Publish succeeded — persist the dispute record.
+    log::info!("[disputes] Dispute dispatched for trade={trade_id} — waiting for daemon");
+
+    // Timeout detaches only the waiter: the record survives so a genuine late
+    // reply is still recognized as this attempt's, and a stale replay still is
+    // not.
+    let reply = crate::rt::time::timeout(std::time::Duration::from_secs(10), reply_rx).await;
+    if !matches!(reply, Ok(Ok(_))) {
+        crate::api::orders::detach_request_waiter(&trade_pk_hex, request_id);
+    }
+
+    let dispute_id = match reply {
+        Ok(Ok(crate::api::orders::DaemonReply::DisputeAccepted { dispute_id })) => dispute_id,
+        Ok(Ok(crate::api::orders::DaemonReply::Rejected { reason, message })) => {
+            log::warn!("[disputes] open_dispute rejected for trade={trade_id}: {reason}");
+            bail!("{message}");
+        }
+        Ok(Ok(_)) => bail!("ProtocolError: unexpected daemon reply to Dispute"),
+        // The daemon answers a rejected dispute with CantDo, but only for
+        // MostroCantDo causes: a duplicate dispute or a DB failure is an
+        // internal error it merely logs (mostro src/app.rs, manage_errors),
+        // so silence is a real outcome here and not only a lost event.
+        _ => {
+            log::warn!("[disputes] open_dispute: no daemon response within 10s for trade={trade_id}");
+            bail!("NoDaemonResponse");
+        }
+    };
+
+    // The daemon accepted it — persist the dispute under the id it assigned,
+    // which is what the solver and the daemon's Kind 38386 dispute event refer
+    // to. Falling back to a local uuid keeps the record addressable if the
+    // acceptance carried no payload.
     let dispute = Dispute {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: dispute_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         trade_id: trade_id.clone(),
         status: DisputeStatus::Open,
         initiated_by_me: true,
