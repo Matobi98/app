@@ -13,10 +13,26 @@ Initiate a dispute on an active trade.
 completion (i.e., funds are in escrow). No existing open dispute on
 this trade.
 
-**Side effects**: Sends Dispute action to Mostro daemon via NIP-44 (Kind 14).
-Creates local Dispute record. Updates trade step to `Disputed`.
+**Side effects**: Sends the Dispute action to the Mostro daemon via NIP-44
+(Kind 14), carrying a random u64 `request_id` nonce, and waits up to 10 s for
+the reply the daemon echoes it in — `DisputeInitiatedByYou` on acceptance,
+`CantDo` on rejection. Only the correlated acceptance creates the local
+Dispute record; that reply also carries the daemon's dispute UUID, which is
+the id the solver and the daemon's Kind 38386 dispute event refer to, so the
+record is stored under it. The reply doubles as the status update that moves
+the trade to `Disputed` and is processed normally. On rejection or timeout
+**nothing is persisted** — a publish is not an acceptance, and the caller
+surfaces the error instead of showing a dispute that does not exist.
 
-**Errors**: `TradeNotDisputable`, `DisputeAlreadyOpen`, `ProtocolError`.
+The nonce gate is the dispatcher's, shared with the order requests — see
+[orders.md](orders.md) "Daemon confirmation & request correlation".
+
+Note: the daemon replies `CantDo` only for `MostroCantDo` causes. A duplicate
+dispute or a daemon-side DB failure is an internal error it merely logs, so
+those surface as `NoDaemonResponse` rather than a precise reason.
+
+**Errors**: `TradeNotDisputable`, `DisputeAlreadyOpen`, `ProtocolError`,
+`NoDaemonResponse`, plus daemon `CantDo` reasons passed through as errors.
 
 ---
 
