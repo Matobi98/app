@@ -3295,6 +3295,22 @@ mod tests {
         assert_eq!(admin_pubkey_from_payload(Some(&Payload::Amount(42))), None);
     }
 
+    #[test]
+    fn the_daemon_dispute_id_is_read_from_a_dispute_payload() {
+        use mostro_core::message::Payload;
+
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(
+            dispute_id_from_payload(Some(&Payload::Dispute(id, None))).as_deref(),
+            Some(id.to_string().as_str())
+        );
+
+        // An acceptance carrying no dispute payload leaves the id unknown
+        // rather than inventing one — open_dispute falls back to a local uuid.
+        assert_eq!(dispute_id_from_payload(None), None);
+        assert_eq!(dispute_id_from_payload(Some(&Payload::Amount(42))), None);
+    }
+
     fn insert_pending_create(key: &str, request_id: u64) -> tokio::sync::oneshot::Receiver<DaemonReply> {
         let (tx, rx) = tokio::sync::oneshot::channel::<DaemonReply>();
         pending_requests().lock().unwrap().insert(
@@ -3492,6 +3508,56 @@ mod tests {
         assert!(!pending_requests().lock().unwrap().contains_key(ai_key));
 
         pending_requests().lock().unwrap().remove(take_key);
+    }
+
+    /// `take_matching_dispute` mirrors the take rules for its own kind: only
+    /// Dispute records, only with the exact nonce.
+    #[tokio::test]
+    async fn take_matching_dispute_only_consumes_dispute_records() {
+        let take_key = "test-dispute-take-pubkey";
+        let dispute_key = "test-dispute-dispute-pubkey";
+        let _rx_t = insert_pending_take(take_key, 71);
+        let _rx_d = register_dispute_request(dispute_key.to_string(), 72, 5);
+
+        // A Take record is never consumed here, even with its exact nonce.
+        assert!(take_matching_dispute(take_key, Some(71)).is_none());
+        assert!(pending_requests().lock().unwrap().contains_key(take_key));
+
+        assert!(take_matching_dispute(dispute_key, None).is_none());
+        assert!(take_matching_dispute(dispute_key, Some(99)).is_none());
+        let pending = take_matching_dispute(dispute_key, Some(72)).expect("must match");
+        assert!(matches!(pending.kind, PendingRequestKind::Dispute));
+        assert_eq!(pending.trade_index, 5);
+        assert!(!pending_requests().lock().unwrap().contains_key(dispute_key));
+
+        pending_requests().lock().unwrap().remove(take_key);
+    }
+
+    /// #202: the CantDo arm resolves whatever request the nonce identifies, so
+    /// a registered dispute is rejected through the same path as any other
+    /// request. Before the dispute registered one, its rejection matched no
+    /// pending request and was dropped — leaving a local dispute Open forever.
+    #[tokio::test]
+    async fn a_cantdo_rejection_reaches_the_waiting_open_dispute() {
+        let key = "test-dispute-cantdo-pubkey";
+        let mut rx = register_dispute_request(key.to_string(), 73, 6);
+
+        // Exactly what the Action::CantDo arm does to find its caller.
+        let pending = take_matching_restore(key)
+            .or_else(|| take_matching_request(key, Some(73)))
+            .expect("the rejection must find the dispute record");
+        assert!(matches!(pending.kind, PendingRequestKind::Dispute));
+
+        let sent = pending
+            .tx
+            .expect("the waiter is still attached")
+            .send(DaemonReply::Rejected {
+                reason: "NotAllowedByStatus".to_string(),
+                message: "rejected".to_string(),
+            });
+        assert!(sent.is_ok(), "the caller must still be listening");
+
+        assert!(matches!(rx.try_recv(), Ok(DaemonReply::Rejected { .. })));
     }
 
     /// Same-key overlap (send_invoice reuses the take's trade key): a newer
