@@ -85,6 +85,13 @@ impl DisputeStore {
                 // InReview, not ours, no reason, solver known. Claim it
                 // instead of failing: keep the solver and the InReview status
                 // it already learned, restore our initiator metadata.
+                //
+                // The id is part of that metadata (PR #275 review). The
+                // placeholder was minted locally because the peer path never
+                // sees the daemon's id, while an accepted open carries it; the
+                // window this race lives in is now the whole reply wait, so
+                // keeping the placeholder's id would routinely discard the
+                // daemon's.
                 Some(existing)
                     if existing.status == DisputeStatus::InReview
                         && !existing.initiated_by_me
@@ -95,6 +102,7 @@ impl DisputeStore {
                             .map(|set| set.contains(&dispute.trade_id))
                             .unwrap_or(false) =>
                 {
+                    existing.id = dispute.id;
                     existing.initiated_by_me = true;
                     existing.reason = dispute.reason;
                     existing.clone()
@@ -803,9 +811,11 @@ mod tests {
         pending_opens().lock().unwrap().insert(trade_id.clone());
         let _pending = PendingOpenGuard(trade_id.clone());
 
-        // Exactly what open_dispute persists after a successful publish.
+        // Exactly what open_dispute persists after the daemon accepts: the id
+        // is the daemon's, the placeholder's was minted locally.
+        let daemon_dispute_id = uuid::Uuid::new_v4().to_string();
         let own = Dispute {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: daemon_dispute_id.clone(),
             trade_id: trade_id.clone(),
             status: DisputeStatus::Open,
             initiated_by_me: true,
@@ -829,6 +839,11 @@ mod tests {
             "the solver assignment must survive the claim"
         );
         assert_eq!(stored.admin_pubkey.as_deref(), Some(admin_pk));
+        // PR #275 review: the claim must not discard the daemon's id.
+        assert_eq!(
+            stored.id, daemon_dispute_id,
+            "the claimed placeholder must adopt the daemon's dispute id"
+        );
     }
 
     /// PR #253 race, direction 2: the initiator's record already exists when
