@@ -213,10 +213,19 @@ pub async fn open_dispute(trade_id: String, reason: Option<String>) -> Result<Di
     // Mark this process's concrete in-flight open attempt: only while the
     // marker is held may the post-publish insert claim an admin-took
     // placeholder as ours. Dropped on every exit path.
-    pending_opens()
+    //
+    // Claiming it is also what makes the open single-flight (PR #275 review).
+    // The entry check above cannot see a concurrent attempt — neither has
+    // persisted anything yet — and both would derive the same trade key, so
+    // the second registration would replace the first one's pending record and
+    // strand its waiter on a NoDaemonResponse the daemon never caused.
+    let fresh = pending_opens()
         .lock()
         .expect("pending_opens poisoned")
         .insert(trade_id.clone());
+    if !fresh {
+        bail!("DisputeAlreadyOpen: an open_dispute for trade {trade_id} is already in flight");
+    }
     let _pending = PendingOpenGuard(trade_id.clone());
 
     // Dispatch Action::Dispute to Mostro BEFORE creating the local record so
@@ -635,6 +644,23 @@ mod tests {
             .try_insert_if_absent_or_resolved(dispute)
             .await
             .expect("seed_dispute: insert failed")
+    }
+
+    /// PR #275 review: a second open for the same trade while the first is
+    /// still awaiting the daemon must be refused. Both would derive the same
+    /// trade key, so letting it through would replace the first attempt's
+    /// pending record and strand its waiter.
+    #[tokio::test]
+    async fn a_second_open_is_refused_while_one_is_in_flight() {
+        let trade_id = format!("t-{}", uuid::Uuid::new_v4());
+        pending_opens().lock().unwrap().insert(trade_id.clone());
+        let _pending = PendingOpenGuard(trade_id.clone());
+
+        let err = open_dispute(trade_id, None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("already in flight"),
+            "expected the in-flight guard to reject it, got: {err}"
+        );
     }
 
     #[tokio::test]
