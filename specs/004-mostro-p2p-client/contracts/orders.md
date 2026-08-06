@@ -196,6 +196,20 @@ Returns null if URI is not a valid Mostro deep link.
 Emits whenever the order list changes (new orders, status updates,
 expirations). Used to keep the UI order list in sync.
 
+### on_trade_updated() → Stream<TradeUpdate>
+Push channel for trade lifecycle changes the 2s status polling cannot
+observe: a never-active trade is **wiped** from the DB on the daemon's
+`Canceled` (no row left to poll), and after a taker-timeout republish
+the book reads `pending` again. Emitted by the `Canceled` gift-wrap
+handler and the stale-state sweep. Screens filter by `order_id`.
+
+```text
+TradeUpdate {
+  order_id: String
+  status: OrderStatus   # Canceled on wipe; Pending on maker resync
+}
+```
+
 ### on_order_status_changed(order_id: String) → Stream<OrderStatus>
 Emits when a specific order's status changes.
 
@@ -238,12 +252,64 @@ what to listen to. Reference: <https://mostro.network/protocol/seller_pay_hold_i
 | `HoldInvoicePaymentSettled` / `Released` / `PurchaseCompleted` | (status sync)             | `status → SettledHoldInvoice`                                                    |
 | `CooperativeCancelAccepted`        | (status sync)                                       | `status → CooperativelyCanceled`                                                 |
 | `AdminSettled` / `AdminCanceled`   | (status sync)                                       | `status → SettledByAdmin` / `CanceledByAdmin`                                    |
+| `Canceled`                         | (none)                                              | Never-active trade (pending/waiting): row + in-memory session **deleted**; otherwise `status → Canceled` (history kept). Emits `TradeUpdate` either way. See below. |
+
+### Daemon cancellation semantics
+
+- A trade still in `Pending` / `WaitingBuyerInvoice` / `WaitingPayment` when
+  the daemon's `Canceled` arrives never went active — no peer, no chat, no
+  exchange (typically a waiting-state timeout). Its trade row and in-memory
+  session are **deleted**, mirroring v1's session cleanup; chat messages are
+  untouched (none can exist before Active). Trades that progressed keep
+  their row (and chat) as history, marked `Canceled`. `InProgress` rows are
+  conservatively kept: that status only enters via the Kind 38383 sync,
+  where mostrod masks both waiting AND active phases as `in-progress`.
+- The handler MUST NOT remove the order from the in-memory book: on a
+  taker-responsible timeout mostrod republishes the order as `pending`
+  BEFORE sending `Canceled`, so a blind remove races the republish and
+  loses the order until restart. The book is fed only by Kind 38383 events;
+  a genuine cancel arrives as a status update and the UI filters it out.
+
+### Stale-state sweep
+
+Covers cancellations whose gift wrap the app never received (closed or
+offline when the daemon's waiting window expired). Runs 60s after the
+order subscription starts, then every 30 minutes: waiting trades past
+their window (`timeout_at`, else `started_at + 900`) are checked against
+the public book — `pending` republish wipes taker rows and resyncs maker
+rows to `Pending`; an outright cancel wipes; absence from the book or the
+ambiguous `in-progress` marker changes nothing. Every action requires a
+positive daemon signal; the clock only triggers the check. The sweep also
+drops keyless in-memory sessions older than 24h and logs counters.
 
 `process_gift_wrap_rumor` MUST update **both** the in-memory order book
 (`order_book().update_order_status`) **and** the persisted trade row
 (`db.update_trade_fields`) on every status transition, otherwise UI
 screens reading from the DB (e.g. `tradeInfoStreamProvider`) will miss
 transitions that only affected in-memory state.
+
+### Public status vs. trade status
+
+The `s` tag of a Kind 38383 event is NIP-69's four-bucket view of an order
+(`pending`, `in-progress`, `success`, `canceled`), not its protocol status.
+mostrod publishes `in-progress` when an order leaves the book and then stops
+publishing altogether while the trade is private: `Active`, `FiatSent`,
+`Dispute` and `SettledHoldInvoice` never reach the wire (`create_status_tags`
+returns `create_event = false`, so no event is emitted at all). `WaitingTakerBond`
+publishes as `pending`; `WaitingMakerBond` publishes nothing.
+
+Therefore `OrderStatus::InProgress` on this client means **taken, real state
+unknown** — never that the escrow is locked. The fine-grained states are only
+ever learned from daemon messages, so:
+
+- Both wire ingest paths (`ingest_order_event`, `subscribe_single_order`) MUST
+  gate the status through `wire_status_applies`: a wire status may only fill an
+  unknown or still-`Pending` local status, or announce a terminal one. It MUST
+  NOT overwrite a status already learned from a daemon message, in the trade row
+  or in the order book.
+- UI MUST NOT treat `InProgress` as `Active`. Actions the daemon gates on
+  `Active`/`FiatSent` (dispute, fiat-sent) are rejected with `CantDo` in that
+  state (issue #203).
 
 ### `update_trade_fields(order_id, status?, hold_invoice?, amount_sats?)` (DB contract)
 

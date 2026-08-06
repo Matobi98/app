@@ -13,6 +13,16 @@ Initiate a dispute on an active trade.
 completion (i.e., funds are in escrow). No existing open dispute on
 this trade.
 
+The daemon accepts a dispute only on an `Active` or `FiatSent` order and
+answers anything earlier with `CantDo`, so the status already held locally is
+checked before publishing. `InProgress` passes: it is the public bucket, i.e. a
+trade whose real state is unknown, and that call belongs to the daemon.
+
+The open is **single-flight per trade**: a second call while one is still
+awaiting the daemon is refused. Both would derive the same trade key, so the
+second registration would replace the first one's pending record and strand its
+caller on a timeout the daemon never caused.
+
 **Side effects**: Sends the Dispute action to the Mostro daemon via NIP-44
 (Kind 14), carrying a random u64 `request_id` nonce, and waits up to 10 s for
 the reply the daemon echoes it in — `DisputeInitiatedByYou` on acceptance,
@@ -23,6 +33,10 @@ record is stored under it. The reply doubles as the status update that moves
 the trade to `Disputed` and is processed normally. On rejection or timeout
 **nothing is persisted** — a publish is not an acceptance, and the caller
 surfaces the error instead of showing a dispute that does not exist.
+
+The local status check and the reply correlation are two layers of the same
+concern: the check keeps most rejections off the wire, and the correlation
+reconciles the ones that still come back (issues #203 and #202).
 
 The nonce gate is the dispatcher's, shared with the order requests — see
 [orders.md](orders.md) "Daemon confirmation & request correlation".
