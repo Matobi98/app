@@ -331,10 +331,17 @@ pub async fn open_dispute(trade_id: String, reason: Option<String>) -> Result<Di
 
     // The daemon accepted it — persist the dispute under the id it assigned,
     // which is what the solver and the daemon's Kind 38386 dispute event refer
-    // to. Falling back to a local uuid keeps the record addressable if the
-    // acceptance carried no payload.
+    // to. An acceptance without that id is malformed and fails closed (PR #275
+    // review): `Dispute.id` is contractually the daemon's, and a locally minted
+    // one would be indistinguishable from it while being wrong. A conforming
+    // daemon always sends it (mostro src/app/dispute.rs,
+    // notify_dispute_to_users).
+    let Some(dispute_id) = dispute_id else {
+        bail!("ProtocolError: daemon accepted the dispute without a dispute id");
+    };
+
     let dispute = Dispute {
-        id: dispute_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        id: dispute_id,
         trade_id: trade_id.clone(),
         status: DisputeStatus::Open,
         initiated_by_me: true,
@@ -453,8 +460,16 @@ pub async fn submit_evidence(trade_id: String, text: String) -> Result<()> {
 /// The dispute's reason went with the timed-out call and is not recoverable
 /// here. An existing record — the placeholder from a solver already assigned,
 /// or a retry that succeeded — is left exactly as it is.
+///
+/// Fails closed on an acceptance carrying no dispute id, for the same reason
+/// `open_dispute` does: the record would claim a daemon id it does not have.
 pub(crate) async fn record_late_acceptance(trade_id: &str, dispute_id: Option<String>) {
-    let id = dispute_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let Some(id) = dispute_id else {
+        log::warn!(
+            "[disputes] late acceptance for trade={trade_id} carried no dispute id — not recorded"
+        );
+        return;
+    };
     let trade_id_for_new = trade_id.to_string();
 
     let result = dispute_store()
@@ -911,6 +926,21 @@ mod tests {
         assert_eq!(d.status, DisputeStatus::Open);
         assert!(d.initiated_by_me, "we did open it, late reply or not");
         assert!(!d.is_read, "the caller was told it failed — this is news");
+    }
+
+    /// PR #275 review: `Dispute.id` is contractually the daemon's, so an
+    /// acceptance that carries no dispute id is malformed and must persist
+    /// nothing rather than mint a local id indistinguishable from a real one.
+    #[tokio::test]
+    async fn a_late_acceptance_without_a_daemon_id_records_nothing() {
+        let trade_id = format!("t-{}", uuid::Uuid::new_v4());
+
+        record_late_acceptance(&trade_id, None).await;
+
+        assert!(
+            get_dispute(trade_id).await.unwrap().is_none(),
+            "a malformed acceptance must not create a record"
+        );
     }
 
     /// The reconciliation must never overwrite what is already there: a solver

@@ -34,13 +34,19 @@ the trade to `Disputed` and is processed normally. On rejection or timeout
 **the call persists nothing** — a publish is not an acceptance, and the caller
 surfaces the error instead of showing a dispute that does not exist.
 
+An acceptance **without** that dispute id is malformed and fails closed: it
+persists nothing and reports `ProtocolError`. `Dispute.id` is contractually the
+daemon's, and a locally minted id would be indistinguishable from a real one
+while being wrong. A conforming daemon always sends it, so this is a
+protocol-violation guard rather than a routine path.
+
 An acceptance that arrives **after** the caller timed out is still reconciled:
 the daemon did open the dispute, and its reply moves the trade to `Disputed`
 either way, so the record is created then (unread, and without the reason,
 which went with the timed-out call). Suppressing it would leave a disputed
-trade with no dispute to open and no solver to reach. An already-present
-record — a solver assignment that arrived first, or a retry that succeeded —
-is left untouched.
+trade with no dispute to open and no solver to reach. The same
+missing-id guard applies. An already-present record — a solver assignment that
+arrived first, or a retry that succeeded — is left untouched.
 
 The local status check and the reply correlation are two layers of the same
 concern: the check keeps most rejections off the wire, and the correlation
