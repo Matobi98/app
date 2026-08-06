@@ -44,9 +44,16 @@ An acceptance that arrives **after** the caller timed out is still reconciled:
 the daemon did open the dispute, and its reply moves the trade to `Disputed`
 either way, so the record is created then (unread, and without the reason,
 which went with the timed-out call). Suppressing it would leave a disputed
-trade with no dispute to open and no solver to reach. The same
-missing-id guard applies. An already-present record — a solver assignment that
-arrived first, or a retry that succeeded — is left untouched.
+trade with no dispute to open and no solver to reach. The same missing-id guard
+applies.
+
+A solver can be assigned inside that same window, in which case the record
+already exists as the peer-style placeholder `admin-took-dispute` writes
+(`InReview`, not ours, no reason, solver known, locally minted id). The
+reconciliation **claims** it — daemon id and initiator flag replace the local
+ones, solver and `InReview` survive — because the correlated acceptance proves
+the dispute is ours. Any other existing record (a retry that succeeded, a
+resolved dispute) is left untouched.
 
 The local status check and the reply correlation are two layers of the same
 concern: the check keeps most rejections off the wire, and the correlation

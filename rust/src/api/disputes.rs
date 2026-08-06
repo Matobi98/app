@@ -93,10 +93,7 @@ impl DisputeStore {
                 // keeping the placeholder's id would routinely discard the
                 // daemon's.
                 Some(existing)
-                    if existing.status == DisputeStatus::InReview
-                        && !existing.initiated_by_me
-                        && existing.reason.is_none()
-                        && existing.admin_pubkey.is_some()
+                    if is_peer_placeholder(existing)
                         && pending_opens()
                             .lock()
                             .map(|set| set.contains(&dispute.trade_id))
@@ -183,6 +180,21 @@ impl Drop for PendingOpenGuard {
 
 fn dispute_store() -> &'static DisputeStore {
     DISPUTE_STORE.get_or_init(DisputeStore::new)
+}
+
+/// Whether `dispute` is the record `handle_admin_took_dispute` writes when it
+/// is the first thing this side hears about the dispute: InReview, not ours,
+/// no reason, solver known, and an id minted locally because the peer path
+/// never sees the daemon's.
+///
+/// Both paths that learn a dispute is in fact ours — the post-acceptance
+/// insert and the late-acceptance reconciliation — test for exactly this shape
+/// before claiming it, so the predicate lives in one place.
+fn is_peer_placeholder(dispute: &Dispute) -> bool {
+    dispute.status == DisputeStatus::InReview
+        && !dispute.initiated_by_me
+        && dispute.reason.is_none()
+        && dispute.admin_pubkey.is_some()
 }
 
 // ── Helper ────────────────────────────────────────────────────────────────────
@@ -458,8 +470,16 @@ pub async fn submit_evidence(trade_id: String, text: String) -> Result<()> {
 /// `NoDaemonResponse`, so the record lands unread.
 ///
 /// The dispute's reason went with the timed-out call and is not recoverable
-/// here. An existing record — the placeholder from a solver already assigned,
-/// or a retry that succeeded — is left exactly as it is.
+/// here.
+///
+/// A solver can be assigned inside the same window, so the record may already
+/// exist as the peer-style placeholder — and then it is ours after all
+/// (PR #275 review): it is claimed exactly as the post-acceptance insert
+/// claims it, keeping the solver and InReview it learned while taking the
+/// daemon's id and the initiator flag. The claim needs no in-flight marker
+/// here the way that path does; a `DisputeInitiatedByYou` correlated to our
+/// own nonce is itself the proof the dispute is ours. Any other existing
+/// record — a retry that succeeded, a resolved dispute — is left untouched.
 ///
 /// Fails closed on an acceptance carrying no dispute id, for the same reason
 /// `open_dispute` does: the record would claim a daemon id it does not have.
@@ -471,6 +491,7 @@ pub(crate) async fn record_late_acceptance(trade_id: &str, dispute_id: Option<St
         return;
     };
     let trade_id_for_new = trade_id.to_string();
+    let id_for_claim = id.clone();
 
     let result = dispute_store()
         .upsert_or_update(
@@ -487,7 +508,13 @@ pub(crate) async fn record_late_acceptance(trade_id: &str, dispute_id: Option<St
                 resolved_at: None,
                 is_read: false,
             },
-            |_| Ok(()),
+            move |existing| {
+                if is_peer_placeholder(existing) {
+                    existing.id = id_for_claim;
+                    existing.initiated_by_me = true;
+                }
+                Ok(())
+            },
         )
         .await;
 
@@ -943,23 +970,47 @@ mod tests {
         );
     }
 
-    /// The reconciliation must never overwrite what is already there: a solver
-    /// assignment that arrived first, or a retry that succeeded.
+    /// PR #275 review round 2: `open_dispute` times out, a solver is assigned
+    /// inside the same window — writing the peer-style placeholder — and only
+    /// then does the correlated acceptance arrive. The placeholder is ours
+    /// after all, so the reconciliation must claim it: the daemon's id and the
+    /// initiator flag replace the locally minted ones, and the solver and
+    /// InReview it already learned survive.
     #[tokio::test]
-    async fn a_late_acceptance_leaves_an_existing_record_alone() {
+    async fn a_late_acceptance_claims_the_admin_took_placeholder() {
         let trade_id = format!("t-{}", uuid::Uuid::new_v4());
         let admin_pk = "000000000000000000000000000000000000000000000000000000000000000a";
+        let daemon_dispute_id = uuid::Uuid::new_v4().to_string();
+
         handle_admin_took_dispute(trade_id.clone(), admin_pk.to_string())
             .await
             .unwrap();
-        let before = get_dispute(trade_id.clone()).await.unwrap().unwrap();
+        let placeholder_id = get_dispute(trade_id.clone()).await.unwrap().unwrap().id;
+
+        record_late_acceptance(&trade_id, Some(daemon_dispute_id.clone())).await;
+
+        let d = get_dispute(trade_id).await.unwrap().unwrap();
+        assert_ne!(d.id, placeholder_id, "the local id must not survive");
+        assert_eq!(d.id, daemon_dispute_id, "the daemon's id must be adopted");
+        assert!(d.initiated_by_me, "the acceptance proves the dispute is ours");
+        assert_eq!(d.status, DisputeStatus::InReview, "the assignment survives");
+        assert_eq!(d.admin_pubkey.as_deref(), Some(admin_pk));
+    }
+
+    /// Only the placeholder shape is claimable. A record that is already ours
+    /// — a retry that succeeded while the first attempt's reply was still in
+    /// flight — must survive the late reply untouched.
+    #[tokio::test]
+    async fn a_late_acceptance_leaves_a_successful_retry_alone() {
+        let trade_id = format!("t-{}", uuid::Uuid::new_v4());
+        let before = seed_dispute(&trade_id, Some("no payment".to_string())).await;
 
         record_late_acceptance(&trade_id, Some(uuid::Uuid::new_v4().to_string())).await;
 
         let after = get_dispute(trade_id).await.unwrap().unwrap();
-        assert_eq!(after.id, before.id);
-        assert_eq!(after.status, DisputeStatus::InReview);
-        assert_eq!(after.admin_pubkey.as_deref(), Some(admin_pk));
+        assert_eq!(after.id, before.id, "the retry's record owns the trade");
+        assert_eq!(after.reason.as_deref(), Some("no payment"));
+        assert_eq!(after.status, DisputeStatus::Open);
     }
 
     /// PR #253 race, direction 2: the initiator's record already exists when
