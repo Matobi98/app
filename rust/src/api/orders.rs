@@ -1803,14 +1803,21 @@ async fn dispatch_mostro_message(
                 } else {
                     // Genuine acceptance after the 10s timeout: the caller
                     // already returned NoDaemonResponse and persisted no
-                    // dispute. The record is only recreated by a fresh
-                    // open_dispute, which the daemon then rejects as a
-                    // duplicate — reconciling it here would resurrect state
-                    // the user was told had failed.
+                    // dispute. Record it now — the status arm below moves the
+                    // trade to Dispute regardless, and a disputed trade with
+                    // no dispute record has no solver to reach (PR #275
+                    // review).
                     crate::api::logging::blog_warn("gift-wrap", format!(
                         "DisputeInitiatedByYou: late acceptance for timed-out open_dispute on trade={}",
                         &trade_pubkey_hex[..8]
                     ));
+                    if let Some(order_id) = kind.id.map(|id| id.to_string()) {
+                        crate::api::disputes::record_late_acceptance(
+                            &order_id,
+                            dispute_id_from_payload(kind.payload.as_ref()),
+                        )
+                        .await;
+                    }
                 }
             }
         }

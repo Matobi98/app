@@ -439,6 +439,53 @@ pub async fn submit_evidence(trade_id: String, text: String) -> Result<()> {
     Ok(())
 }
 
+/// Record a dispute the daemon accepted after `open_dispute` had already
+/// stopped waiting for the reply.
+///
+/// The acceptance is genuine — the daemon opened the dispute, told the
+/// counterparty, and published its Kind 38386 event — so the reply's status
+/// update moves the trade to `Dispute` either way. Dropping the record while
+/// letting that through would leave a disputed trade with no dispute to open
+/// and no way to reach the solver, which is the same split state this whole
+/// change set exists to remove (PR #275 review). The caller saw
+/// `NoDaemonResponse`, so the record lands unread.
+///
+/// The dispute's reason went with the timed-out call and is not recoverable
+/// here. An existing record — the placeholder from a solver already assigned,
+/// or a retry that succeeded — is left exactly as it is.
+pub(crate) async fn record_late_acceptance(trade_id: &str, dispute_id: Option<String>) {
+    let id = dispute_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let trade_id_for_new = trade_id.to_string();
+
+    let result = dispute_store()
+        .upsert_or_update(
+            trade_id,
+            || Dispute {
+                id,
+                trade_id: trade_id_for_new,
+                status: DisputeStatus::Open,
+                initiated_by_me: true,
+                reason: None,
+                admin_pubkey: None,
+                resolution: None,
+                opened_at: unix_now(),
+                resolved_at: None,
+                is_read: false,
+            },
+            |_| Ok(()),
+        )
+        .await;
+
+    match result {
+        Ok(()) => log::info!(
+            "[disputes] reconciled late daemon acceptance for trade={trade_id}"
+        ),
+        Err(e) => log::warn!(
+            "[disputes] could not reconcile late acceptance for trade={trade_id}: {e}"
+        ),
+    }
+}
+
 /// Get dispute details for a trade.
 ///
 /// Returns `None` if no dispute exists.
@@ -844,6 +891,45 @@ mod tests {
             stored.id, daemon_dispute_id,
             "the claimed placeholder must adopt the daemon's dispute id"
         );
+    }
+
+    /// PR #275 review: the daemon's acceptance can land after `open_dispute`
+    /// gave up. The status arm that follows moves the trade to Dispute either
+    /// way, so the record must exist — otherwise the trade shows as disputed
+    /// with no dispute to open and no solver to reach.
+    #[tokio::test]
+    async fn a_late_acceptance_is_reconciled_into_a_record() {
+        let trade_id = format!("t-{}", uuid::Uuid::new_v4());
+        let daemon_dispute_id = uuid::Uuid::new_v4().to_string();
+
+        assert!(get_dispute(trade_id.clone()).await.unwrap().is_none());
+
+        record_late_acceptance(&trade_id, Some(daemon_dispute_id.clone())).await;
+
+        let d = get_dispute(trade_id).await.unwrap().expect("record created");
+        assert_eq!(d.id, daemon_dispute_id, "the daemon's id must be adopted");
+        assert_eq!(d.status, DisputeStatus::Open);
+        assert!(d.initiated_by_me, "we did open it, late reply or not");
+        assert!(!d.is_read, "the caller was told it failed — this is news");
+    }
+
+    /// The reconciliation must never overwrite what is already there: a solver
+    /// assignment that arrived first, or a retry that succeeded.
+    #[tokio::test]
+    async fn a_late_acceptance_leaves_an_existing_record_alone() {
+        let trade_id = format!("t-{}", uuid::Uuid::new_v4());
+        let admin_pk = "000000000000000000000000000000000000000000000000000000000000000a";
+        handle_admin_took_dispute(trade_id.clone(), admin_pk.to_string())
+            .await
+            .unwrap();
+        let before = get_dispute(trade_id.clone()).await.unwrap().unwrap();
+
+        record_late_acceptance(&trade_id, Some(uuid::Uuid::new_v4().to_string())).await;
+
+        let after = get_dispute(trade_id).await.unwrap().unwrap();
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.status, DisputeStatus::InReview);
+        assert_eq!(after.admin_pubkey.as_deref(), Some(admin_pk));
     }
 
     /// PR #253 race, direction 2: the initiator's record already exists when

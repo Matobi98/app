@@ -31,8 +31,16 @@ Dispute record; that reply also carries the daemon's dispute UUID, which is
 the id the solver and the daemon's Kind 38386 dispute event refer to, so the
 record is stored under it. The reply doubles as the status update that moves
 the trade to `Disputed` and is processed normally. On rejection or timeout
-**nothing is persisted** — a publish is not an acceptance, and the caller
+**the call persists nothing** — a publish is not an acceptance, and the caller
 surfaces the error instead of showing a dispute that does not exist.
+
+An acceptance that arrives **after** the caller timed out is still reconciled:
+the daemon did open the dispute, and its reply moves the trade to `Disputed`
+either way, so the record is created then (unread, and without the reason,
+which went with the timed-out call). Suppressing it would leave a disputed
+trade with no dispute to open and no solver to reach. An already-present
+record — a solver assignment that arrived first, or a retry that succeeded —
+is left untouched.
 
 The local status check and the reply correlation are two layers of the same
 concern: the check keeps most rejections off the wire, and the correlation
