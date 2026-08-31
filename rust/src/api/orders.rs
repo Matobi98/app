@@ -299,6 +299,27 @@ impl OrderBook {
         }
     }
 
+    /// Apply an order parsed from a Kind 38383 event.
+    ///
+    /// A finished order that is not ours is dropped rather than stored: the
+    /// book filters to `Pending` for display, so nothing can ever show it, and
+    /// nothing can act on it — but it would sit in the vector for the life of
+    /// the process, inflating every snapshot clone and every bridge payload.
+    ///
+    /// Own orders are kept whatever their status. The trade-detail and
+    /// take-order screens look them up in the book by id after the trade
+    /// finishes, and `local_trade_status` falls back to it.
+    pub(crate) async fn apply_ingested_order(&self, order: OrderInfo) {
+        if !order.is_mine && crate::mostro::status::is_hard_terminal(&order.status) {
+            // No-op when it was never in the book, and `remove_order` only
+            // publishes when it actually removed something — so the common
+            // case (a stranger's order finishing, unseen) costs nothing.
+            self.remove_order(&order.id).await;
+            return;
+        }
+        self.upsert_order(order).await;
+    }
+
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<Vec<OrderInfo>> {
         self.tx.subscribe()
     }
@@ -3213,7 +3234,7 @@ async fn ingest_order_event(event: &nostr_sdk::Event) {
                     }
                 }
             }
-            order_book().upsert_order(info).await;
+            order_book().apply_ingested_order(info).await;
         }
         None => {
             log::warn!(
@@ -3706,6 +3727,45 @@ mod tests {
     use super::*;
     use crate::api::types::TradeRole;
     use crate::mostro::session::session_manager;
+
+    /// Nothing ever displays a stranger's finished order — the book filters to
+    /// Pending for display — but every one of them was kept for the life of
+    /// the process, inflating every snapshot clone and every bridge payload.
+    #[tokio::test]
+    async fn a_strangers_finished_order_leaves_the_book() {
+        let book = OrderBook::new();
+        let mut done = dummy_order_info("stranger-done");
+        done.is_mine = false;
+        done.status = crate::api::types::OrderStatus::Pending;
+        book.upsert_order(done.clone()).await;
+        assert!(book.get_order("stranger-done").await.is_some());
+
+        done.status = crate::api::types::OrderStatus::Success;
+        book.apply_ingested_order(done).await;
+
+        assert!(
+            book.get_order("stranger-done").await.is_none(),
+            "a finished order nobody can act on should not be retained"
+        );
+    }
+
+    /// Own orders stay: the trade detail and take-order screens look them up
+    /// in the book by id after the trade finishes, and `local_trade_status`
+    /// falls back to it.
+    #[tokio::test]
+    async fn an_own_finished_order_stays_in_the_book() {
+        let book = OrderBook::new();
+        let mut mine = dummy_order_info("mine-done");
+        mine.is_mine = true;
+        mine.status = crate::api::types::OrderStatus::Success;
+
+        book.apply_ingested_order(mine).await;
+
+        assert!(
+            book.get_order("mine-done").await.is_some(),
+            "own history must remain addressable by id"
+        );
+    }
 
     #[test]
     fn the_solver_pubkey_is_read_from_a_peer_payload() {
