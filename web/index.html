@@ -52,6 +52,39 @@
   <link rel="manifest" href="manifest.json">
 </head>
 <body>
+  <script>
+    // Sanitize navigator.language(s) before Flutter's engine bootstrap reads it.
+    //
+    // The Flutter web engine builds a Locale from navigator.language(s) while
+    // CanvasKit is initializing, using JS's own Intl constructors. A tag that
+    // isn't valid BCP 47 (POSIX-style "C"/"POSIX", underscored "en_US", or an
+    // empty string — all things a container/CI/kiosk browser with no locale
+    // configured can report) throws an uncaught RangeError there, before
+    // runApp — an unrecoverable blank page with nothing logged. No mainstream
+    // browser reports a tag like this, so real users never hit it; CI and
+    // headless/embedded environments do. See issue #227.
+    (function () {
+      function isValidBcp47(tag) {
+        try { new Intl.DateTimeFormat(tag); return true; }
+        catch (e) { return false; }
+      }
+      function sanitize(tag) {
+        if (typeof tag !== 'string' || !tag) return null;
+        var hyphenated = tag.replace(/_/g, '-');
+        return isValidBcp47(hyphenated) ? hyphenated : null;
+      }
+      var fallback = 'en-US';
+      var raw = (navigator.languages && navigator.languages.length)
+        ? navigator.languages
+        : [navigator.language];
+      var sanitized = raw.map(sanitize).filter(Boolean);
+      if (sanitized.length === 0) sanitized = [fallback];
+      if (sanitized.join(',') !== raw.join(',')) {
+        Object.defineProperty(navigator, 'language', { get: function () { return sanitized[0]; }, configurable: true });
+        Object.defineProperty(navigator, 'languages', { get: function () { return sanitized; }, configurable: true });
+      }
+    })();
+  </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>

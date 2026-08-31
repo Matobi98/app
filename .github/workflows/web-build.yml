@@ -190,6 +190,20 @@ jobs:
           BUNDLE_DIR: ${{ github.workspace }}/build/web
         run: BASE_PATH="/${GITHUB_REPOSITORY#*/}/" node smoke.mjs
 
+      # Regression guard for issue #227: an unparseable browser locale (POSIX
+      # "C", underscored "en_US", empty) crashed the Flutter web engine's own
+      # bootstrap before runApp, with no error path — an unrecoverable blank
+      # page. Fixed by the locale sanitizer in web/index.html, which runs
+      # before flutter_bootstrap.js and normalizes navigator.language(s). This
+      # reruns the same smoke test forcing that invalid locale so the fix
+      # can't silently regress.
+      - name: Smoke test the release bundle under an invalid locale (#227)
+        working-directory: test/web/smoke
+        env:
+          BUNDLE_DIR: ${{ github.workspace }}/build/web
+          SMOKE_LOCALE: "C"
+        run: BASE_PATH="/${GITHUB_REPOSITORY#*/}/" node smoke.mjs
+
       - name: Upload smoke test failure screenshot
         if: failure()
         uses: actions/upload-artifact@v4
