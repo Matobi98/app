@@ -158,6 +158,57 @@ impl SessionManager {
         Ok(session)
     }
 
+    /// Create or replace the session for a trade. Unlike [`create_session`],
+    /// an existing session for `order_id` is overwritten rather than
+    /// rejected — a confirmed retake (fresh `trade_key_index`) must always
+    /// win over whatever a prior failed/timed-out take left behind (#335).
+    ///
+    /// Replaces the whole session, so it **discards peer material**:
+    /// `peer_pubkey`, `shared_key` and `admin_shared_key` all reset to `None`.
+    /// That is correct for the case this exists for — a retake derives a fresh
+    /// trade key, which invalidates any shared key derived from the old one —
+    /// but it means this is **only for a confirmed take**. Calling it once peer
+    /// material is present would drop the chat keys silently.
+    pub async fn install_session(
+        &self,
+        order_id: String,
+        role: TradeRole,
+        trade_key_index: u32,
+        order: OrderInfo,
+    ) -> Result<Session> {
+        if order_id != order.id {
+            return Err(anyhow!(
+                "order_id mismatch: param='{}' vs order.id='{}'",
+                order_id,
+                order.id
+            ));
+        }
+
+        let session = Session {
+            order_id: order_id.clone(),
+            role,
+            trade_key_index,
+            shared_key: None,
+            admin_shared_key: None,
+            peer_pubkey: None,
+            order,
+            created_at: crate::rt::unix_now(),
+        };
+
+        let mut sessions = self.sessions.write().await;
+        crate::api::logging::blog_info(
+            "session",
+            format!(
+                "installed order={} idx={} role={:?}",
+                crate::api::logging::short_id(&order_id),
+                session.trade_key_index,
+                session.role,
+            ),
+        );
+        sessions.insert(order_id, session.clone());
+        Ok(session)
+    }
+
     /// Update an existing session.
     pub async fn update_session(&self, order_id: &str, session: Session) -> Result<()> {
         if session.order_id != order_id {
