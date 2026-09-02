@@ -57,12 +57,17 @@
     //
     // The Flutter web engine builds a Locale from navigator.language(s) while
     // CanvasKit is initializing, using JS's own Intl constructors. A tag that
-    // isn't valid BCP 47 (POSIX-style "C"/"POSIX", underscored "en_US", or an
+    // isn't valid BCP 47 (the POSIX "C" locale, an underscored "en_US", or an
     // empty string — all things a container/CI/kiosk browser with no locale
     // configured can report) throws an uncaught RangeError there, before
     // runApp — an unrecoverable blank page with nothing logged. No mainstream
     // browser reports a tag like this, so real users never hit it; CI and
     // headless/embedded environments do. See issue #227.
+    //
+    // Note "POSIX", the other name of that same Unix locale, is NOT one of
+    // them: unlike "C" it is a structurally valid five-letter language subtag,
+    // so Intl accepts it and it passes through untouched — correctly, since it
+    // never crashed anything.
     (function () {
       function isValidBcp47(tag) {
         try { new Intl.DateTimeFormat(tag); return true; }
@@ -79,9 +84,18 @@
         : [navigator.language];
       var sanitized = raw.map(sanitize).filter(Boolean);
       if (sanitized.length === 0) sanitized = [fallback];
-      if (sanitized.join(',') !== raw.join(',')) {
+      if (sanitized.join(',') === raw.join(',')) return;
+      // Shadowing these is not guaranteed: a browser may expose them as
+      // non-configurable. Never let that throw — this script runs before the
+      // engine, in exactly the locked-down environments it exists to rescue,
+      // and an uncaught error here would be the blank page it is preventing.
+      // Both writes go together so a partial shadow can't leave language and
+      // languages disagreeing.
+      try {
         Object.defineProperty(navigator, 'language', { get: function () { return sanitized[0]; }, configurable: true });
         Object.defineProperty(navigator, 'languages', { get: function () { return sanitized; }, configurable: true });
+      } catch (e) {
+        console.warn('locale sanitizer: could not override navigator.language(s)', e);
       }
     })();
   </script>

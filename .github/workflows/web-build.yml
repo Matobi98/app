@@ -190,13 +190,25 @@ jobs:
           BUNDLE_DIR: ${{ github.workspace }}/build/web
         run: BASE_PATH="/${GITHUB_REPOSITORY#*/}/" node smoke.mjs
 
-      # Regression guard for issue #227: an unparseable browser locale (POSIX
-      # "C", underscored "en_US", empty) crashed the Flutter web engine's own
-      # bootstrap before runApp, with no error path — an unrecoverable blank
-      # page. Fixed by the locale sanitizer in web/index.html, which runs
-      # before flutter_bootstrap.js and normalizes navigator.language(s). This
-      # reruns the same smoke test forcing that invalid locale so the fix
-      # can't silently regress.
+      # Regression guard for issue #227: an unparseable browser locale (the
+      # POSIX "C" locale, an underscored "en_US", empty) crashed the Flutter
+      # web engine's own bootstrap before runApp, with no error path — an
+      # unrecoverable blank page. Fixed by the locale sanitizer in
+      # web/index.html, which runs before flutter_bootstrap.js and normalizes
+      # navigator.language(s). This reruns the same smoke test forcing an
+      # invalid locale so the fix can't silently regress.
+      #
+      # Only "C" is actually covered here: Playwright normalizes the locale it
+      # is given before the page sees it, so "en_US" reaches the browser as a
+      # valid "en-US" and "" falls back to the default. The sanitizer handles
+      # all three; CI can only exercise the first.
+      #
+      # The crash itself only exists on Flutter >= 3.38, where the engine's
+      # parseBrowserLanguages started building the locale through
+      # Intl.Locale (@JS binding) instead of a pure-Dart ui.Locale that
+      # validated nothing. If FLUTTER_VERSION ever moves back below that, or
+      # the engine stops using Intl, this step passes for the wrong reason —
+      # revalidate it against a build without the sanitizer before trusting it.
       - name: Smoke test the release bundle under an invalid locale (#227)
         working-directory: test/web/smoke
         env:
