@@ -166,7 +166,11 @@ async function main() {
     // script once with SMOKE_LOCALE=C: a regression guard for issue #227,
     // fixed by the locale sanitizer in web/index.html. The pin stays for
     // determinism; it is no longer load-bearing for that bug.
-    const page = await browser.newPage({ locale: process.env.SMOKE_LOCALE || 'en-US' });
+    //
+    // `??`, not `||`: the empty string is one of the broken tags this guards
+    // against, and `||` would silently turn SMOKE_LOCALE='' into 'en-US' —
+    // the one case the knob exists for, passing green without testing it.
+    const page = await browser.newPage({ locale: process.env.SMOKE_LOCALE ?? 'en-US' });
 
     const record = (origin, text) => {
       (isIgnorable(text) ? ignored : errors).push(`[${origin}] ${text}`);

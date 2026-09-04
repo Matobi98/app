@@ -52,6 +52,10 @@
   <link rel="manifest" href="manifest.json">
 </head>
 <body>
+  <!-- locale-sanitizer: must stay between the isolation shim and
+       flutter_bootstrap.js. test/web/pages_bundle_test.dart anchors on this
+       marker to assert that ordering statically — do not remove or rename it
+       without updating that test. -->
   <script>
     // Sanitize navigator.language(s) before Flutter's engine bootstrap reads it.
     //
@@ -89,8 +93,23 @@
       // non-configurable. Never let that throw — this script runs before the
       // engine, in exactly the locked-down environments it exists to rescue,
       // and an uncaught error here would be the blank page it is preventing.
-      // Both writes go together so a partial shadow can't leave language and
-      // languages disagreeing.
+      //
+      // A try/catch is not a transaction: if the first defineProperty applies
+      // and the second throws, the first cannot be undone, and the engine
+      // reads navigator.languages only — so a partial shadow can both leave
+      // the two properties disagreeing and fail to fix the crash. Check that
+      // both are writable before touching either, and do nothing at all if
+      // one is locked. Normally neither is an own property (both live on
+      // Navigator.prototype), and defining an own accessor shadows them; an
+      // absent descriptor is therefore the writable case.
+      function isLockedDown(name) {
+        var d = Object.getOwnPropertyDescriptor(navigator, name);
+        return !!d && !d.configurable;
+      }
+      if (isLockedDown('language') || isLockedDown('languages')) {
+        console.warn('locale sanitizer: navigator.language(s) is not configurable, leaving it alone');
+        return;
+      }
       try {
         Object.defineProperty(navigator, 'language', { get: function () { return sanitized[0]; }, configurable: true });
         Object.defineProperty(navigator, 'languages', { get: function () { return sanitized; }, configurable: true });
