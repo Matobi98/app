@@ -416,13 +416,55 @@ impl OrderBook {
     /// Remove the order with the given ID from the cache and notify listeners.
     /// No-op if the ID is not present.
     pub async fn remove_order(&self, order_id: &str) {
+        if self.remove_order_deferred(order_id).await {
+            self.publish().await;
+        }
+    }
+
+    /// Remove without notifying, reporting whether anything was there.
+    ///
+    /// The return value is what keeps a removal that changed nothing from
+    /// publishing a whole-book snapshot.
+    pub(crate) async fn remove_order_deferred(&self, order_id: &str) -> bool {
         let mut orders = self.orders.write().await;
         let before = orders.len();
         orders.retain(|o| o.id != order_id);
-        if orders.len() != before {
-            let snapshot = orders.clone();
-            drop(orders);
-            let _ = self.tx.send(snapshot);
+        orders.len() != before
+    }
+
+    /// Apply an order parsed from a Kind 38383 event.
+    ///
+    /// A finished order that is not ours is dropped rather than stored: the
+    /// book filters to `Pending` for display, so nothing can ever show it, and
+    /// nothing can act on it — but it would sit in the vector for the life of
+    /// the process, inflating every snapshot clone and every bridge payload.
+    ///
+    /// Orders of ours are kept whatever their status, because the trade-detail
+    /// screen looks them up in the book by id *after* the trade finishes.
+    /// `ours` covers both roles — see the call site for why `is_mine` does not.
+    ///
+    /// Publishing follows the same rule as an upsert: a removal during a bulk
+    /// ingest waits for the batch's single emission, and one from the relay
+    /// firehose joins the coalescing window instead of sending a whole-book
+    /// snapshot of its own.
+    pub(crate) async fn apply_ingested_order(
+        &self,
+        order: OrderInfo,
+        ours: bool,
+        publish: Publish,
+    ) {
+        if !ours && crate::mostro::status::is_hard_terminal(&order.status) {
+            // The removal is a no-op when the order was never in the book —
+            // the common case, a stranger's order finishing unseen — and then
+            // nothing is published either.
+            if self.remove_order_deferred(&order.id).await && publish == Publish::Coalesced {
+                self.schedule_publish();
+            }
+            return;
+        }
+        match publish {
+            Publish::Coalesced => self.upsert_order_coalesced(order).await,
+            Publish::WhenBatchEnds => self.upsert_order_deferred(order).await,
         }
     }
 
@@ -3436,7 +3478,7 @@ fn dispute_id_from_payload(
 /// paths populate the book identically.
 /// When an ingested event reaches subscribers.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Publish {
+pub(crate) enum Publish {
     /// At most one emission per coalescing window — the relay firehose, where
     /// events arrive faster than the UI can consume whole-book snapshots.
     Coalesced,
@@ -3556,10 +3598,24 @@ async fn ingest_order_event_with(event: &nostr_sdk::prelude::Event, publish: Pub
                     }
                 }
             }
-            match publish {
-                Publish::Coalesced => order_book().upsert_order_coalesced(info).await,
-                Publish::WhenBatchEnds => order_book().upsert_order_deferred(info).await,
-            }
+            // Whether this order is *ours*, which is not what `is_mine`
+            // answers: that flag means "I am the maker". `parse_order_event`
+            // hardcodes it to false, and the fingerprint restoration above only
+            // recovers maker orders, so an order we *took* arrives with
+            // `is_mine == false` and is indistinguishable from a stranger's at
+            // this layer. What both roles do have is a trade-key binding for
+            // the order id, so that is the question asked.
+            //
+            // Asked only when the answer can change what happens — a
+            // hard-terminal order — so the firehose of pending updates never
+            // pays for the lookup. It is answered from the in-memory map or the
+            // negative cache in the common case, which also keeps it correct on
+            // web, where the trade store is a stub (#233) and a DB-only test
+            // would call every trade of ours a stranger's.
+            let ours = info.is_mine
+                || (is_hard_terminal(&info.status)
+                    && lookup_trade_key_index(&info.id).await.is_some());
+            order_book().apply_ingested_order(info, ours, publish).await;
         }
         None => {
             log::warn!(
@@ -4066,6 +4122,127 @@ mod tests {
     use crate::api::types::TradeRole;
     use crate::mostro::pending::register_dispute_request;
     use crate::mostro::session::session_manager;
+
+    /// Nothing ever displays a stranger's finished order — the book filters to
+    /// Pending for display — but every one of them was kept for the life of
+    /// the process, inflating every snapshot clone and every bridge payload.
+    #[tokio::test]
+    async fn a_strangers_finished_order_leaves_the_book() {
+        let book = OrderBook::new();
+        let mut done = dummy_order_info("stranger-done");
+        done.is_mine = false;
+        done.status = crate::api::types::OrderStatus::Pending;
+        book.upsert_order(done.clone()).await;
+        assert!(book.get_order("stranger-done").await.is_some());
+
+        done.status = crate::api::types::OrderStatus::Success;
+        book.apply_ingested_order(done, false, Publish::Coalesced).await;
+
+        assert!(
+            book.get_order("stranger-done").await.is_none(),
+            "a finished order nobody can act on should not be retained"
+        );
+    }
+
+    /// Orders of ours stay: the trade detail screen looks them up in the book
+    /// by id after the trade finishes.
+    #[tokio::test]
+    async fn our_own_finished_order_stays_in_the_book() {
+        let book = OrderBook::new();
+        let mut mine = dummy_order_info("mine-done");
+        mine.status = crate::api::types::OrderStatus::Success;
+
+        book.apply_ingested_order(mine, true, Publish::Coalesced).await;
+
+        assert!(
+            book.get_order("mine-done").await.is_some(),
+            "our own history must remain addressable by id"
+        );
+    }
+
+    /// Build a signed Kind 38383 event for `order_id` at `status`, the shape
+    /// the relay feed delivers.
+    fn book_event(order_id: &str, status: &str) -> nostr_sdk::prelude::Event {
+        use nostr::event::FinalizeEvent;
+        use nostr_sdk::prelude::{EventBuilder, Keys, Kind, Tag};
+        EventBuilder::new(Kind::from(38383u16), "")
+            .tags([
+                Tag::parse(["d", order_id]).unwrap(),
+                Tag::parse(["k", "sell"]).unwrap(),
+                Tag::parse(["s", status]).unwrap(),
+                Tag::parse(["f", "USD"]).unwrap(),
+                Tag::parse(["pm", "cashapp"]).unwrap(),
+                Tag::parse(["premium", "1"]).unwrap(),
+                Tag::parse(["amt", "0"]).unwrap(),
+                Tag::parse(["fa", "20"]).unwrap(),
+                Tag::parse(["z", "order"]).unwrap(),
+            ])
+            .finalize(&Keys::generate())
+            .unwrap()
+    }
+
+    /// The regression this PR was one predicate away from shipping: an order we
+    /// **took** arrives with `is_mine == false` — `parse_order_event` hardcodes
+    /// it and the fingerprint restoration only recovers *maker* orders — so a
+    /// prune keyed on `is_mine` alone drops it the moment the trade succeeds,
+    /// and the trade-detail screen the app navigates to right afterwards loses
+    /// the amount, the currency and the created-at line it reads from the book.
+    ///
+    /// The trade-key binding is what both roles have, so that is what decides.
+    #[tokio::test]
+    async fn a_finished_order_we_took_survives_ingest() {
+        // Arrange — in the book as pending, with a trade key of ours bound to
+        // it, which is what taking an order leaves behind.
+        let order_id = uuid::Uuid::new_v4().to_string();
+        order_book().upsert_order(dummy_order_info(&order_id)).await;
+        store_trade_key_index(&order_id, 7).await;
+
+        // Act — the daemon publishes the finished order.
+        ingest_order_event_with(&book_event(&order_id, "success"), Publish::WhenBatchEnds).await;
+
+        // Assert
+        assert!(
+            order_book().get_order(&order_id).await.is_some(),
+            "an order we took must stay addressable once it finishes"
+        );
+        order_book().remove_order(&order_id).await;
+    }
+
+    /// The other half: with no binding and no `is_mine`, the same event is a
+    /// stranger's finished order and leaves.
+    #[tokio::test]
+    async fn a_finished_order_of_a_strangers_is_dropped_by_ingest() {
+        // Arrange
+        let order_id = uuid::Uuid::new_v4().to_string();
+        order_book().upsert_order(dummy_order_info(&order_id)).await;
+
+        // Act
+        ingest_order_event_with(&book_event(&order_id, "success"), Publish::WhenBatchEnds).await;
+
+        // Assert
+        assert!(
+            order_book().get_order(&order_id).await.is_none(),
+            "nothing can ever act on a stranger's finished order"
+        );
+    }
+
+    /// A removal that removed nothing must not publish: a stranger's order
+    /// finishing unseen is the common case on a busy node, and every emission
+    /// carries the whole book across the bridge.
+    #[tokio::test]
+    async fn dropping_an_order_that_was_never_in_the_book_publishes_nothing() {
+        let book = OrderBook::new();
+        let mut stream = book.subscribe();
+        let mut unseen = dummy_order_info("never-seen");
+        unseen.status = crate::api::types::OrderStatus::Canceled;
+
+        book.apply_ingested_order(unseen, false, Publish::Coalesced).await;
+
+        assert!(
+            stream.try_recv().is_err(),
+            "a no-op removal must not send a whole-book snapshot"
+        );
+    }
 
     /// A cached miss that outlived the key being created would make the order
     /// look like somebody else's, and every later action on it would be signed
