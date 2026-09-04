@@ -13,7 +13,7 @@
 /// arguments — see `api::identity::get_transport_identity_keys`, which
 /// applies the runtime privacy toggle.
 use anyhow::Result;
-use mostro_core::message::{Action, Message, Payload};
+use mostro_core::message::{Action, Message, MessageKind, Payload};
 use nostr_sdk::prelude::*;
 use uuid::Uuid;
 
@@ -426,6 +426,39 @@ pub async fn restore_session(
     wrap_message_first_contact(identity_keys, trade_keys, mostro_pubkey, &msg).await
 }
 
+/// Build and wrap a `LastTradeIndex` request (#328).
+///
+/// Key split per <https://mostro.network/protocol/key_management.html>: the
+/// rumor is authored by an ephemeral trade key, and the identity travels only
+/// inside the encrypted proof — the outer kind-14 must never be authored by
+/// the master identity pubkey, which would publish a permanent
+/// identity→Mostro link on every relay. The daemon conforms: it resolves the
+/// account from `event.identity` and uses the rumor author (`event.sender`)
+/// only as the reply address (`mostro/src/app/last_trade_index.rs`).
+/// mostro-cli departs from the spec here, signing both seal and rumor with
+/// the identity keys (`src/cli/last_trade_index.rs`).
+///
+/// The reply carries the counter in `MessageKind::trade_index`. Payload must be
+/// `None` (enforced by mostro-core).
+///
+/// `request_id` is the correlation nonce the daemon echoes in its reply — the
+/// caller uses it to reject replayed replies from earlier requests.
+pub async fn last_trade_index(
+    identity_keys: &Keys,
+    trade_keys: &Keys,
+    mostro_pubkey: &PublicKey,
+    request_id: u64,
+) -> Result<String> {
+    let msg = Message::Restore(MessageKind::new(
+        None,
+        Some(request_id),
+        None,
+        Action::LastTradeIndex,
+        None,
+    ));
+    wrap_message_first_contact(identity_keys, trade_keys, mostro_pubkey, &msg).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,6 +790,67 @@ mod tests {
         assert_eq!(unwrapped.sender, trade_keys.public_key());
         // The Seal carries the identity key: that is what the daemon uses to
         // locate the user's trades. Both halves of the key split matter.
+        assert_eq!(unwrapped.identity, identity_keys.public_key());
+    }
+
+    /// #328 wire contract — and the regression guard for this PR's own
+    /// history: the first version of `last_trade_index` signed the rumor with
+    /// the identity keys, publishing a permanent identity→Mostro link as the
+    /// kind-14 author on every relay (review round 1, Major). The suite
+    /// stayed green with that leak in place, so pin the key split here: the
+    /// rumor must be authored by the ephemeral trade key, with the identity
+    /// only inside the encrypted proof the daemon resolves the account from.
+    #[tokio::test]
+    async fn last_trade_index_payload_none_rumor_by_trade_key() {
+        let identity_keys = Keys::generate();
+        let trade_keys = Keys::generate();
+        let mostro_keys = Keys::generate();
+
+        // First-contact wrapping fails closed until this node's capabilities
+        // are published — a test double for the Kind 38385 fetch.
+        let _pow = crate::mostro::pow::test_support::lock_pow();
+        crate::mostro::pow::set_pows(&mostro_keys.public_key().to_hex(), 0, None);
+        crate::mostro::protocol_version::set_protocol_version(
+            &mostro_keys.public_key().to_hex(),
+            Some(2),
+        );
+
+        let json = last_trade_index(
+            &identity_keys,
+            &trade_keys,
+            &mostro_keys.public_key(),
+            4242,
+        )
+        .await
+        .unwrap();
+        let event = Event::from_json(&json).unwrap();
+        assert_eq!(
+            event.pubkey,
+            trade_keys.public_key(),
+            "the outer kind-14 author must be the trade key — an identity-\
+             authored event is the relay-visible leak this guards against"
+        );
+        let unwrapped = transport::unwrap_mostro_message(&mostro_keys, &event)
+            .await
+            .unwrap()
+            .expect("message must decrypt for the recipient");
+        let kind = unwrapped.message.get_inner_message_kind();
+        assert!(matches!(kind.action, Action::LastTradeIndex));
+        assert!(kind.payload.is_none(), "LastTradeIndex payload must be None");
+        assert_eq!(
+            kind.trade_index, None,
+            "the request consumes no trade index — the counter only travels \
+             in the reply"
+        );
+        // The correlation nonce the daemon echoes; the caller rejects replies
+        // that do not carry it back.
+        assert_eq!(kind.request_id, Some(4242));
+        // The rumor is authored by the trade key: the daemon replies to
+        // event.sender, and the reply loop correlates on that pubkey.
+        assert_eq!(unwrapped.sender, trade_keys.public_key());
+        // The identity travels only inside the encrypted proof — it is what
+        // the daemon looks the account up by (event.identity), never the
+        // public author.
         assert_eq!(unwrapped.identity, identity_keys.public_key());
     }
 }
