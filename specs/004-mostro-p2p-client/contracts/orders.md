@@ -8,13 +8,30 @@ Mostro daemon via Kind 38383 Nostr events and cached locally.
 ### Daemon confirmation & request correlation
 
 Every request that expects a daemon reply (`create_order`, `take_order`,
-`send_invoice`) carries a random u64 `request_id` nonce. The daemon echoes
+`send_invoice`, and `open_dispute` from the [disputes](disputes.md) API)
+carries a random u64 `request_id` nonce. The daemon echoes
 it in its reply (success or `CantDo`), and **only a reply echoing the exact
 nonce may resolve or consume the pending request** — stale events replayed
 by relays carry a different (or no) `request_id` and touch nothing. Each
 call waits up to 10 s; on timeout it returns `NoDaemonResponse` and nothing
-is persisted. A genuine late reply is still reconciled where meaningful
-(create), or logged and dropped (take / add-invoice).
+is persisted.
+
+What happens to a genuine reply that arrives **after** that timeout depends on
+the request. The pending record survives the timeout in every case — only its
+waiter detaches — so the late reply is still recognized as ours rather than as
+a stale replay:
+
+- **create**: reconciled — the daemon UUID is bound to the attempt's trade
+  index, and the Kind 38383 fingerprint path restores maker ownership.
+- **take / add-invoice**: logged and dropped; the reply's own status update is
+  processed by the per-action arms as usual.
+- **dispute**: reconciled — `record_late_acceptance` persists the accepted
+  dispute under the daemon-assigned id (unread, and without the reason, which
+  went with the timed-out call). So a `NoDaemonResponse` from `open_dispute` is
+  **not** proof that no dispute can appear for that trade later. Retrying after
+  the timeout does not break this: the retry takes the trade key over but
+  carries every superseded attempt's nonce forward, so a reply to any of them
+  is still correlated. See [disputes.md](disputes.md) for the full behavior.
 
 ## Functions
 
@@ -63,6 +80,21 @@ NewOrderParams {
 - If range: `fiat_amount_min` MUST be > 0 and < `fiat_amount_max`
 - `fiat_code` MUST be valid ISO 4217
 - `payment_method` MUST not be empty
+- The amount is checked against the node's advertised `min_order_amount` /
+  `max_order_amount` before anything is sent: directly for a fixed
+  `amount_sats` (#282), and for a market-price order by converting every fiat
+  amount the daemon will price — both ends of a range order — at the rate the
+  node publishes (`fetch_exchange_rate` in `nostr.md`), truncating as the
+  daemon does (#337). The fiat amount is first normalised to the whole unit the
+  wire carries (`new_order` casts it to `i64`), so the check judges the amount
+  the daemon actually receives rather than the decimal the user typed
+
+**Fail-open**: that range check blocks nothing it cannot judge — no rate, no
+advertised bounds, an amount that is not yet a finite positive number. The
+order is submitted and the daemon stays the authority, answering
+`OutOfRangeSatsAmount` if it disagrees. Blocking instead would make
+market-price orders unusable against every node that leaves rate publishing
+off, which the protocol allows.
 
 **Side effects**: Sends the new-order message to the Mostro daemon and waits for its confirmation. The order is created only once the daemon confirms it; the public order book is populated exclusively from the daemon's Kind 38383 event (the order is **not** inserted optimistically). On no confirmation within the timeout the order is treated as not created — nothing is persisted to My Trades and nothing is added to the book.
 
@@ -91,6 +123,20 @@ order book entry is synced, and the trade session/subscriptions start.
 That persistence half runs under the per-order lock (see *Per-order
 serialization*), acquired after the reply and never around the wait for it.
 On rejection or timeout **nothing is persisted** — no phantom trade.
+
+The row is created with an **empty `counterparty_pubkey`**: a book
+order's `creator_pubkey` is the Mostro node (the 38383 event author),
+never the peer, and seeding it there poisons the durable peer record
+(#334). The real peer arrives via the peer-reveal capture (see *Inbound
+Kind 14 actions*), which may already have run on the take's first reply —
+in that case the session **pre-exists** with peer and shared key set, the
+`create_session` here fails duplicate-create as an expected error, and,
+because the reveal ran before the row existed, its durable write was a
+no-op: the persistence block replays it from the session and mirrors the
+peer onto the returned `TradeInfo` (the field the UI gates the chat room
+on). The durable half applies to backends with a trades store — on web
+(#233) the write is a stub and only the session and the returned struct
+carry the peer.
 
 **Errors**: `OrderNotFound`, `CannotTakeOwnOrder`, `OrderAlreadyTaken`,
 `InvalidRole`, `FiatAmountRequired`/`OutOfRange` (range orders),
@@ -285,33 +331,101 @@ Coverage invariants:
 - The temporary 30-minute per-trade receivers (see #182) are an
   additional delivery path, not a substitute: they exist only for trades
   touched this session and mask coverage gaps while they run.
+- **The bulk filter is unbounded on purpose** — no `since`, no `limit`, so
+  after any downtime it replays the node's full stored history instead of a
+  window, and nothing is lost to a cutoff derived from an unreliable local
+  clock. The cost is that relays serve that backlog **newest-first**;
+  ordering is settled downstream, by the per-order `status_cursor:`
+  high-water mark described under the status-sync rules, not by narrowing
+  the filter. Only the ephemeral per-trade subscription carries a cutoff
+  (`limit(0)`, live-only).
 
 ### Inbound Kind 14 actions consumed by `dispatch_mostro_message`
+
+**Peer-reveal capture (#334), before the per-action arms.** Any message —
+whatever its action — whose payload carries a `SmallOrder` naming **both**
+trade pubkeys (an `Order` payload or a `PaymentRequest`) reveals the
+counterparty: our trade key is matched against the two and the other side
+is taken, symmetrically, with no per-action role table. The peer is then
+persisted to the trade row (`update_trade_counterparty` — the row is the
+durable peer record, the session a cache of it; on web the write is a
+stub, #233, and the session is the only holder) and the session is
+updated **or created**: no session is the maker's *normal* case, since
+`take_order` is the only other session creator. Ordering is load-bearing:
+the capture runs after the generation gate and the local→daemon UUID
+reconciliation (it writes by the daemon's order id) but **before the
+take-waiter interception**, so a take's first reply — consumed there and
+never seen by the arms — still reveals. `BondSlashed` is exempt for the
+same reason it skips the generation gate: it may address a superseded
+generation and must not write order state. Empty or unparsable pubkeys do
+not qualify, the terminal-status guard applies (a stale replay over a
+finished trade must not respawn chat state), and an already-complete
+capture (session holds peer + shared key) short-circuits — the capture
+runs for every replayed message on each restart, and that replay is also
+what rebuilds sessions after one.
 
 | Action                             | Payload variant                                     | Effect on the local trade row                                                    |
 |------------------------------------|-----------------------------------------------------|----------------------------------------------------------------------------------|
 | `WaitingBuyerInvoice`              | (status sync)                                       | `status → WaitingBuyerInvoice`                                                   |
 | `AddInvoice`                       | `Payload::Order(small_order)`                       | Maker-buyer path (a taker's nonce-correlated copy is consumed by the take interception, even when late): `status → WaitingBuyerInvoice` (payload status, fallback `status_for_action`), `amount_sats ← small_order.amount` when > 0 — synced to book **and** DB so `tradeAmountProvider` sees the sats. Keyed by the message's order id (`trade_index` is `None`). The follow-up `AddInvoice` with a `Payload::Peer` (counterparty reputation) is ignored. |
 | `PayInvoice`                       | `Payload::PaymentRequest(small_order, bolt11, amt)` | `hold_invoice ← bolt11`, `amount_sats ← amt ?? small_order.amount`, `status → WaitingPayment` |
-| `BuyerTookOrder` / `HoldInvoicePaymentAccepted` | `SmallOrder` with `status = active`      | `status → Active` (routed through `map_core_status` kebab-case)                  |
+| `BuyerTookOrder` / `HoldInvoicePaymentAccepted` | `SmallOrder` with `status = active`      | `status → Active` (routed through `map_core_status` kebab-case). The peer reveal happens in the pre-dispatch capture above, not in this arm. |
 | `FiatSentOk`                       | (status sync)                                       | `status → FiatSent`                                                              |
 | `HoldInvoicePaymentSettled` / `Released` / `PurchaseCompleted` | (status sync)             | `status → SettledHoldInvoice`                                                    |
 | `CooperativeCancelAccepted`        | (status sync)                                       | `status → CooperativelyCanceled`                                                 |
 | `AdminSettled` / `AdminCanceled`   | (status sync)                                       | `status → SettledByAdmin` / `CanceledByAdmin`                                    |
 | `Canceled`                         | (none)                                              | Never-active trade (pending/waiting): row + in-memory session **deleted**; otherwise `status → Canceled` (history kept). See below. |
 
-A sync that would move a trade out of a **hard-terminal** status
-(`Canceled` / `CanceledByAdmin` / `CooperativelyCanceled` / `Expired` /
-`Success` / `SettledByAdmin` / `CompletedByAdmin`) is skipped entirely —
-no book/DB write, no emission, and no session side effect either (the
-guard runs before the peer-key/chat setup of the escrow-locked arm). Relays deliver the startup backlog
-newest-first, so such a message is an out-of-order replay, not a real
-transition; mostrod never reopens a finished trade. `SettledHoldInvoice`
-and `Dispute` still progress and are deliberately not in the set.
-`Canceled` applies the same guard — a stale timeout-cancel replayed over
-an order that was later re-taken and completed must not overwrite the
-outcome; its wipe path is unaffected, since it starts from non-terminal
-waiting states.
+Two rules gate every status sync in the table, and both exist for the
+same reason: the global kind-14 subscription carries no `since`, so every
+start replays the node's whole history for an order, and relays serve
+stored events **newest-first**. A skipped sync is skipped entirely — no
+book write, no DB write, no `TradeUpdate`, and no session side effect
+either (both guards run before the peer-key/chat setup of the
+escrow-locked arm).
+
+**Ordering.** Each order carries a persisted high-water mark,
+`status_cursor:<order_id>` — the `created_at` of the newest daemon
+message whose status write was applied, stored **raw, in the node's time
+domain**, which is the domain the comparison uses. It is deliberately not
+clamped to the local clock the way the chat cursor is: there the value is
+a subscription `since`, where a low one only asks for more than needed,
+while here it is an ordering comparator, and a local clock behind the
+node's would make a newest event store a smaller mark that the next older
+one then outranks. The mark is instead not advanced at all by an event
+dated beyond the clock-skew tolerance, so one malformed timestamp cannot
+silence an order for good; a node genuinely further ahead makes the rule
+inert for that order rather than wrong, and says so in the log. Ordering
+between the node's own events survives any uniform skew — they share one
+clock. A message **strictly older** than the mark is skipped. Strictly older: the daemon emits several messages for one
+order inside the same second (the `PayInvoice` reputation follow-up, for
+one) and those are genuine in-order traffic. Without this rule the oldest
+message of the backlog is applied last and wins — a disputed trade came
+back as `waiting-buyer-invoice` on the next start, with every state in
+between emitted to the UI on the way down.
+
+The mark is deliberately **not** cleared with the trade row: a `Canceled`
+before the trade went active wipes that row, which is exactly where the
+terminal rule below goes blind, and the mark is what still refuses the
+replay afterwards. One settings row per order ever traded, the same shape
+and lifetime as the `chat_cursor:` that bounds the other channel.
+
+**Terminal status.** A sync that would move a trade out of a
+**hard-terminal** status (`Canceled` / `CanceledByAdmin` /
+`CooperativelyCanceled` / `Expired` / `Success` / `SettledByAdmin` /
+`CompletedByAdmin`) is skipped: mostrod never reopens a finished trade,
+so such a message is an out-of-order replay whatever its timestamp says.
+This is not redundant with the ordering rule — it reads the in-memory
+book, so it is the only one of the two that still holds where there is no
+durable store (web, #233). `Canceled` applies it too: a stale
+timeout-cancel replayed over an order that was later re-taken and
+completed must not overwrite the outcome; its wipe path is unaffected,
+since it starts from non-terminal waiting states.
+
+`SettledHoldInvoice` and `Dispute` are deliberately **not** in the
+terminal set — they still progress, to `Success` and to admin
+resolutions respectively — so it is the ordering rule, not this one, that
+keeps a replay from walking them backwards.
 
 Every arm above that syncs a status also emits a `TradeUpdate` (see
 `on_trade_updated`) after the in-memory book update and the DB
@@ -391,7 +505,7 @@ Invariants:
 
 ### Stale-state sweep
 
-Covers cancellations whose gift wrap the app never received (closed or
+Covers cancellations whose daemon message the app never received (closed or
 offline when the daemon's waiting window expired). Runs 60s after the
 order subscription starts, then every 30 minutes: waiting trades past
 their window (`timeout_at`, else `started_at + 900`) are checked against

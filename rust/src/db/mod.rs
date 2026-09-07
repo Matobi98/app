@@ -51,6 +51,39 @@ pub mod settings_keys {
     pub fn dispute_admin(order_id: &str) -> String {
         format!("{DISPUTE_ADMIN_PREFIX}{order_id}")
     }
+
+    /// Per-order marker that *this* side opened the dispute.
+    pub const DISPUTE_MINE_PREFIX: &str = "dispute_mine:";
+
+    /// Build the settings key marking the dispute on `order_id` as opened by
+    /// this side. Like the solver pubkey, the origin is not re-derivable from
+    /// daemon events after a restart (PR #256 review), so it is persisted
+    /// alongside and read back by rehydration. Presence is the value.
+    pub fn dispute_mine(order_id: &str) -> String {
+        format!("{DISPUTE_MINE_PREFIX}{order_id}")
+    }
+
+    /// Per-order status replay cursor — the `created_at` (unix seconds,
+    /// decimal string) of the newest daemon message whose status write was
+    /// applied, clamped to the local clock. Full key is
+    /// `status_cursor:<order_id>`; build it with [`status_cursor`].
+    pub const STATUS_CURSOR_PREFIX: &str = "status_cursor:";
+
+    /// Build the settings key holding the status replay cursor for `order_id`.
+    ///
+    /// Same shape and purpose as [`chat_cursor`], for the other channel: the
+    /// global kind-14 subscription carries no `since`, so every start replays
+    /// the node's full history, and relays serve stored events newest-first.
+    /// Without a durable high-water mark the oldest message in that backlog is
+    /// applied last and wins, walking a trade's status back to where it began.
+    ///
+    /// Deliberately **not** cleared with the trade row: a cancel before the
+    /// trade went active wipes that row (`cancellation_wipes_history`), and the
+    /// cursor is precisely what still refuses the older messages afterwards.
+    /// One tiny row per order ever traded, like the chat cursor.
+    pub fn status_cursor(order_id: &str) -> String {
+        format!("{STATUS_CURSOR_PREFIX}{order_id}")
+    }
 }
 
 /// Storage trait — implemented by both SQLite (native) and IndexedDB (WASM).
@@ -208,4 +241,16 @@ pub trait Storage: Send + Sync {
     /// duplicate-rating guard survive a restart. No-op when no matching trade
     /// exists.
     async fn mark_trade_rated(&self, order_id: &str, rated_at: i64) -> Result<()>;
+
+    /// Persist the counterparty's trade pubkey on the trade identified by
+    /// `order.id` (issue #334). Written when a daemon message reveals it, for
+    /// both roles — the trade row is the durable peer record; the in-memory
+    /// session is only a cache. Callers must pass a non-empty pubkey: this
+    /// method never clears an already-known counterparty. No-op when no
+    /// matching trade exists.
+    async fn update_trade_counterparty(
+        &self,
+        order_id: &str,
+        counterparty_pubkey: &str,
+    ) -> Result<()>;
 }
