@@ -3449,8 +3449,15 @@ fn orders_subscription_id() -> nostr_sdk::prelude::SubscriptionId {
 ///
 /// Stable so the task can drop the relay-side REQ when it exits. Keyed by
 /// trade pubkey, so unsubscribing one trade cannot close another's feed.
+///
+/// NIP-01 caps subscription ids at 64 characters and relays enforce it
+/// (`relay.mostro.network` answers CLOSED with "max length 64 chars"); the
+/// full 64-hex pubkey would push the id to 78. The first 32 hex characters
+/// (128 bits) keep it at 46 and rule out any realistic cross-trade collision.
+/// [`subscription_ids_fit_nip01`] pins the bound.
 fn daemon_message_subscription_id(trade_pubkey_hex: &str) -> nostr_sdk::prelude::SubscriptionId {
-    nostr_sdk::prelude::SubscriptionId::new(format!("mostro-daemon-{trade_pubkey_hex}"))
+    let key = trade_pubkey_hex.get(..32).unwrap_or(trade_pubkey_hex);
+    nostr_sdk::prelude::SubscriptionId::new(format!("mostro-daemon-{key}"))
 }
 
 /// Stable id for a single order's d-tag update subscription.
@@ -4825,10 +4832,47 @@ mod tests {
             single_order_subscription_id(&a),
             single_order_subscription_id(&b),
             orders_subscription_id(),
+            recent_orders_subscription_id(),
+            relay_list_subscription_id(),
             mostro_dm_subscription_id(),
         ];
         let unique: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(unique.len(), ids.len(), "subscription ids collided: {ids:?}");
+    }
+
+    /// NIP-01 caps subscription ids at 64 characters and relays enforce it
+    /// with an asynchronous CLOSED that the client only logs — so an id past
+    /// the cap is a subscription that silently never exists. A stable id that
+    /// no relay accepts is worse than the auto-generated one it replaced.
+    #[test]
+    fn subscription_ids_fit_nip01() {
+        const NIP01_MAX_SUBSCRIPTION_ID_LEN: usize = 64;
+        let trade_pubkey_hex = "ab".repeat(32);
+        let order_id = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+
+        for id in [
+            daemon_message_subscription_id(&trade_pubkey_hex),
+            single_order_subscription_id(order_id),
+            orders_subscription_id(),
+            recent_orders_subscription_id(),
+            relay_list_subscription_id(),
+            mostro_dm_subscription_id(),
+        ] {
+            let len = id.to_string().len();
+            assert!(
+                len <= NIP01_MAX_SUBSCRIPTION_ID_LEN,
+                "subscription id {id} is {len} chars; NIP-01 relays reject anything over 64"
+            );
+        }
+    }
+
+    /// The truncation that keeps the daemon id under the cap must not merge
+    /// two trade keys that share a prefix shorter than what is kept.
+    #[test]
+    fn daemon_ids_stay_distinct_past_the_truncation_point() {
+        let a = "ab".repeat(32);
+        let b = "ab".repeat(15) + "cd" + &"ab".repeat(16);
+        assert_ne!(daemon_message_subscription_id(&a), daemon_message_subscription_id(&b));
     }
 
     /// Nothing ever displays a stranger's finished order — the book filters to
