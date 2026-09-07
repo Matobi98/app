@@ -1430,18 +1430,20 @@ pub(crate) async fn subscribe_daemon_messages(trade_pubkey: nostr_sdk::prelude::
         .author(mostro_pubkey)
         .pubkey(trade_pubkey)
         .limit(0);
-    if let Err(e) = client.subscribe(filter).await {
+    let trade_pubkey_hex = trade_pubkey.to_hex();
+    let sub_id = daemon_message_subscription_id(&trade_pubkey_hex);
+    if let Err(e) = client.subscribe(filter).with_id(sub_id.clone()).await {
         log::warn!("[orders] subscribe_daemon_messages subscribe failed: {e}");
         return;
     }
 
-    let trade_pubkey_hex = trade_pubkey.to_hex();
     crate::api::logging::blog_info("orders", format!(
         "daemon-message subscription active for trade={}",
         &trade_pubkey_hex[..8]
     ));
 
     // ── Event loop: spawned as a background task ──
+    let unsub_client = client.clone();
     crate::rt::spawn(async move {
         use nostr_sdk::prelude::{ClientNotification, StreamExt};
         use crate::rt::time::{timeout, Duration};
@@ -1515,6 +1517,17 @@ pub(crate) async fn subscribe_daemon_messages(trade_pubkey: nostr_sdk::prelude::
                 Err(_) => break, // idle timeout
                 Ok(Some(_)) => continue,
             }
+        }
+
+        // Drop the relay-side REQ. Without this the task exits but the
+        // subscription lives on: relays cap concurrent REQs, and once past the
+        // cap they answer CLOSED — which can take the order-book feed down
+        // with it.
+        if let Err(e) = unsub_client.unsubscribe(&sub_id).await {
+            crate::api::logging::blog_warn("orders", format!(
+                "daemon-message unsubscribe failed for trade={}: {e}",
+                &trade_pubkey_hex[..8]
+            ));
         }
 
         // The subscription bounds the pending record's lifetime: once no
@@ -2972,7 +2985,8 @@ async fn subscribe_single_order(order_id: &str) {
 
         let mut rx = client.notifications();
         let filter = crate::nostr::order_events::trade_order_filter(&mostro_pubkey, &order_id);
-        if let Err(e) = client.subscribe(filter).await {
+        let sub_id = single_order_subscription_id(&order_id);
+        if let Err(e) = client.subscribe(filter).with_id(sub_id.clone()).await {
             log::warn!("[orders] subscribe_single_order subscribe failed: {e}");
             return;
         }
@@ -3049,6 +3063,11 @@ async fn subscribe_single_order(order_id: &str) {
                 Err(_) => break, // idle timeout
                 Ok(Some(_)) => continue,
             }
+        }
+
+        // Drop the relay-side REQ; see subscribe_daemon_messages.
+        if let Err(e) = client.unsubscribe(&sub_id).await {
+            log::warn!("[orders] subscribe_single_order unsubscribe failed for order={order_id}: {e}");
         }
     });
 }
@@ -3424,6 +3443,26 @@ async fn refetch_active_node_orders() {
 /// Stable subscription ID for the Kind 38383 pending order-book feed.
 fn orders_subscription_id() -> nostr_sdk::prelude::SubscriptionId {
     nostr_sdk::prelude::SubscriptionId::new("mostro-orders")
+}
+
+/// Stable id for a trade's daemon-message subscription.
+///
+/// Stable so the task can drop the relay-side REQ when it exits. Keyed by
+/// trade pubkey, so unsubscribing one trade cannot close another's feed.
+///
+/// NIP-01 caps subscription ids at 64 characters and relays enforce it
+/// (`relay.mostro.network` answers CLOSED with "max length 64 chars"); the
+/// full 64-hex pubkey would push the id to 78. The first 32 hex characters
+/// (128 bits) keep it at 46 and rule out any realistic cross-trade collision.
+/// [`subscription_ids_fit_nip01`] pins the bound.
+fn daemon_message_subscription_id(trade_pubkey_hex: &str) -> nostr_sdk::prelude::SubscriptionId {
+    let key = trade_pubkey_hex.get(..32).unwrap_or(trade_pubkey_hex);
+    nostr_sdk::prelude::SubscriptionId::new(format!("mostro-daemon-{key}"))
+}
+
+/// Stable id for a single order's d-tag update subscription.
+fn single_order_subscription_id(order_id: &str) -> nostr_sdk::prelude::SubscriptionId {
+    nostr_sdk::prelude::SubscriptionId::new(format!("mostro-order-{order_id}"))
 }
 
 /// Stable subscription ID for the windowed any-status Kind 38383 feed that
@@ -4772,6 +4811,69 @@ mod tests {
     use crate::api::types::TradeRole;
     use crate::mostro::pending::register_dispute_request;
     use crate::mostro::session::session_manager;
+
+    /// Unsubscribing is only safe if each id addresses exactly one feed: a
+    /// collision would have one trade's exit close another's subscription, or
+    /// the order-book feed itself.
+    #[test]
+    fn every_subscription_id_addresses_one_feed() {
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+
+        assert_eq!(
+            daemon_message_subscription_id(&a),
+            daemon_message_subscription_id(&a),
+            "the id must be stable, or the exit path unsubscribes nothing"
+        );
+
+        let ids = [
+            daemon_message_subscription_id(&a),
+            daemon_message_subscription_id(&b),
+            single_order_subscription_id(&a),
+            single_order_subscription_id(&b),
+            orders_subscription_id(),
+            recent_orders_subscription_id(),
+            relay_list_subscription_id(),
+            mostro_dm_subscription_id(),
+        ];
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "subscription ids collided: {ids:?}");
+    }
+
+    /// NIP-01 caps subscription ids at 64 characters and relays enforce it
+    /// with an asynchronous CLOSED that the client only logs — so an id past
+    /// the cap is a subscription that silently never exists. A stable id that
+    /// no relay accepts is worse than the auto-generated one it replaced.
+    #[test]
+    fn subscription_ids_fit_nip01() {
+        const NIP01_MAX_SUBSCRIPTION_ID_LEN: usize = 64;
+        let trade_pubkey_hex = "ab".repeat(32);
+        let order_id = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+
+        for id in [
+            daemon_message_subscription_id(&trade_pubkey_hex),
+            single_order_subscription_id(order_id),
+            orders_subscription_id(),
+            recent_orders_subscription_id(),
+            relay_list_subscription_id(),
+            mostro_dm_subscription_id(),
+        ] {
+            let len = id.to_string().len();
+            assert!(
+                len <= NIP01_MAX_SUBSCRIPTION_ID_LEN,
+                "subscription id {id} is {len} chars; NIP-01 relays reject anything over 64"
+            );
+        }
+    }
+
+    /// The truncation that keeps the daemon id under the cap must not merge
+    /// two trade keys that share a prefix shorter than what is kept.
+    #[test]
+    fn daemon_ids_stay_distinct_past_the_truncation_point() {
+        let a = "ab".repeat(32);
+        let b = "ab".repeat(15) + "cd" + &"ab".repeat(16);
+        assert_ne!(daemon_message_subscription_id(&a), daemon_message_subscription_id(&b));
+    }
 
     /// Nothing ever displays a stranger's finished order — the book filters to
     /// Pending for display — but every one of them was kept for the life of
