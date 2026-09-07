@@ -120,10 +120,14 @@ or a direct progression message. Only on a correlated reply is the trade
 created: the TradeInfo is built from the reply's real data (status,
 calculated `amount_sats`, `hold_invoice`), persisted to My Trades, the
 order book entry is synced, and the trade session/subscriptions start.
-A confirmed take **installs** that session, replacing whatever a prior
-failed or timed-out attempt left behind: each attempt derives a fresh trade
-key, so keeping the earlier session would leave chat key lookups reading a
-superseded `trade_key_index` (#335).
+A confirmed take **installs** that session. A session may already exist for
+two unrelated reasons, told apart by its `trade_key_index`: a prior failed or
+timed-out attempt left a stale one (different index — replaced, since each
+attempt derives a fresh trade key and keeping the earlier session would leave
+chat key lookups reading a superseded index, #335), or the peer reveal already
+created this take's own session with `peer_pubkey` and `shared_key` set (same
+index — kept, since replacing it would drop the chat keys that path exists to
+establish, #334).
 That persistence half runs under the per-order lock (see *Per-order
 serialization*), acquired after the reply and never around the wait for it.
 On rejection or timeout **nothing is persisted** — no phantom trade.

@@ -6792,6 +6792,66 @@ mod tests {
         );
     }
 
+    /// The mirror case, and the one #345/#347 made reachable: the session
+    /// `take_order` finds already belongs to *this* take, because
+    /// `apply_peer_reveal` created it when the daemon's first reply carried
+    /// both trade pubkeys. Same `trade_key_index`, but with peer material the
+    /// call site cannot rebuild — replacing it would silently drop the chat
+    /// keys the peer-reveal path exists to establish (#334).
+    ///
+    /// The index is what tells the two cases apart: a stale session from a
+    /// failed attempt always carries an older index, because every take
+    /// derives a fresh trade key.
+    #[tokio::test]
+    async fn install_session_keeps_this_takes_own_session_with_peer_material() {
+        let order_id = uuid::Uuid::new_v4().to_string();
+        let order = dummy_order_info(&order_id);
+        let mgr = session_manager();
+
+        // The peer reveal got there first, with the shared key already derived.
+        mgr.install_session(order_id.clone(), TradeRole::Buyer, 4, order.clone())
+            .await
+            .expect("peer-reveal install must succeed");
+        let mut revealed = mgr
+            .get_session(&order_id)
+            .await
+            .expect("session must exist");
+        revealed.peer_pubkey = Some("aabbccdd".to_string());
+        revealed.shared_key = Some([7u8; 32]);
+        mgr.update_session(&order_id, revealed)
+            .await
+            .expect("planting peer material must succeed");
+
+        // `take_order` now runs for the same take: same trade_key_index.
+        let returned = mgr
+            .install_session(order_id.clone(), TradeRole::Buyer, 4, order)
+            .await
+            .expect("install for the same index must succeed");
+
+        let session = mgr
+            .get_session(&order_id)
+            .await
+            .expect("session must exist");
+        assert_eq!(
+            session.trade_key_index, 4,
+            "the index must be unchanged — same take"
+        );
+        assert_eq!(
+            session.peer_pubkey.as_deref(),
+            Some("aabbccdd"),
+            "peer_pubkey established by the reveal must survive take_order"
+        );
+        assert_eq!(
+            session.shared_key,
+            Some([7u8; 32]),
+            "shared_key established by the reveal must survive take_order"
+        );
+        assert_eq!(
+            returned.peer_pubkey, session.peer_pubkey,
+            "the returned session must be the kept one, not a fresh empty one"
+        );
+    }
+
     /// After create_session the session has no peer pubkey or shared key yet.
     #[tokio::test]
     async fn new_session_has_no_peer_keys() {

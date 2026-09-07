@@ -158,17 +158,25 @@ impl SessionManager {
         Ok(session)
     }
 
-    /// Create or replace the session for a trade. Unlike [`create_session`],
-    /// an existing session for `order_id` is overwritten rather than
-    /// rejected — a confirmed retake (fresh `trade_key_index`) must always
-    /// win over whatever a prior failed/timed-out take left behind (#335).
+    /// Create or replace the session for a trade.
     ///
-    /// Replaces the whole session, so it **discards peer material**:
-    /// `peer_pubkey`, `shared_key` and `admin_shared_key` all reset to `None`.
-    /// That is correct for the case this exists for — a retake derives a fresh
-    /// trade key, which invalidates any shared key derived from the old one —
-    /// but it means this is **only for a confirmed take**. Calling it once peer
-    /// material is present would drop the chat keys silently.
+    /// Unlike [`create_session`], an existing session is not a hard error —
+    /// but it is not blindly overwritten either. At a confirmed take a session
+    /// can already exist for two unrelated reasons, told apart by its index:
+    ///
+    /// * **different `trade_key_index`** — a prior failed or timed-out take
+    ///   left it behind. It is stale and must lose: each attempt derives a
+    ///   fresh trade key, so keeping it would leave chat key lookups reading
+    ///   a superseded index (#335). Replaced.
+    /// * **same `trade_key_index`** — this take's own session, created by
+    ///   `apply_peer_reveal` when the first reply already carried both trade
+    ///   pubkeys, with `peer_pubkey` and `shared_key` set (#334/#345). It is
+    ///   strictly richer than what this call would build. Left untouched.
+    ///
+    /// The replacement path resets `peer_pubkey`, `shared_key` and
+    /// `admin_shared_key` to `None`, which is correct rather than lossy: a
+    /// shared key derived from the superseded trade key is invalid, and
+    /// carrying it over would fail the chat silently instead of rebuilding it.
     pub async fn install_session(
         &self,
         order_id: String,
@@ -184,6 +192,26 @@ impl SessionManager {
             ));
         }
 
+        let mut sessions = self.sessions.write().await;
+
+        // Both the read and the write happen under this one lock: deciding
+        // outside it would let a peer reveal land in between and be discarded
+        // by a replacement that was decided when it did not yet exist.
+        if let Some(existing) = sessions.get(&order_id) {
+            if existing.trade_key_index == trade_key_index {
+                crate::api::logging::blog_info(
+                    "session",
+                    format!(
+                        "install kept existing order={} idx={} peer={}",
+                        crate::api::logging::short_id(&order_id),
+                        trade_key_index,
+                        existing.peer_pubkey.is_some(),
+                    ),
+                );
+                return Ok(existing.clone());
+            }
+        }
+
         let session = Session {
             order_id: order_id.clone(),
             role,
@@ -195,7 +223,6 @@ impl SessionManager {
             created_at: crate::rt::unix_now(),
         };
 
-        let mut sessions = self.sessions.write().await;
         crate::api::logging::blog_info(
             "session",
             format!(
