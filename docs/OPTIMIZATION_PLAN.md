@@ -28,8 +28,7 @@ regression protection.
 
 Independent one-to-few-line fixes. Land in any order.
 
-> **Status: in progress.** Merged: #349, #350, #351, #352, #353, #358. Still open: #355,
-> #356, #357.
+> **Status: implemented.** Merged: #349–#353, #355–#358.
 > **#354 (PR 1.6) was opened and then closed** after review showed the bound it added could
 > silently truncate the order book while protecting against nothing — see the entry below.
 > Two items were withdrawn after measurement rather than implemented — PR 1.10 entirely, and
@@ -175,7 +174,7 @@ Independent one-to-few-line fixes. Land in any order.
 
 Each PR stands alone; none requires Phase 3's redesign.
 
-> **Status: in progress.** #360 merged; #361–#369 open. All independent of each other except
+> **Status: implemented.** Merged: #360–#369. All independent of each other except
 > **PR 2.2 (#361), which is stacked on PR 2.1 (#360)** — it builds on the deferred-upsert
 > primitive introduced there, so the "fully independent" claim below is not quite true for
 > that pair. Two sub-items were withdrawn after inspection (2.3's `local_trade_status`
@@ -400,19 +399,32 @@ PR 3.8 is conditional (gated on the PR 5.2 measurements) and does not count towa
 - **Why this entry exists:** "infinite scroll" — fetch a page, show a skeleton, fetch the next
   page as the user scrolls — keeps being proposed for the order book, from the same static
   reading each time. Recorded here so the reasoning is not redone.
-- **The list is already lazy.** Home renders through `ListView.separated` with an
-  `itemBuilder` (`lib/features/home/screens/home_screen.dart:83`): Flutter builds only the
-  visible cards plus `cacheExtent` of look-ahead, which is exactly the "prefetch a bit more
-  than the viewport" behaviour. The initial skeleton exists too (`home_screen.dart:256`).
-  Ten thousand orders in memory do not slow the scroll itself.
-- **The network cannot be paged.** The book is one relay subscription on kind 38383 filtered
-  by author — `all_orders_filter` (`rust/src/nostr/order_events.rs:217`), subscribed under the
-  stable `mostro-orders` id by `subscribe_node_filters` (`rust/src/api/orders.rs:2858`).
-  Nostr has no offset or cursor; `.limit()` is a hint that truncates the market silently
-  (PR 1.6, withdrawn); `since`/`until` windows do not work either because the UI filters by
-  currency, payment method and side, and filtering needs the whole set. The payload is small
-  anyway — a thousand events is roughly 650 KB (50 live kind 38383 events from
-  `relay.mostro.network` averaged 653 B, max 905 B).
+- **The list is already lazy.** Home renders through `OrderBookList`
+  (`lib/features/home/widgets/order_book_list.dart`), a `ListView.separated` in one column
+  and a `GridView.builder` on wider layouts, both driven by an `itemBuilder`: Flutter builds
+  only the visible cards plus `cacheExtent` of look-ahead, which is exactly the "prefetch a
+  bit more than the viewport" behaviour. The initial skeleton exists too
+  (`OrderListSkeleton`, in `home_screen.dart`). Ten thousand orders in memory do not slow
+  the scroll itself.
+- **The network cannot be paged.** The book is two relay subscriptions on kind 38383, both
+  author-pinned, built by `order_book_filters` and subscribed by `subscribe_node_filters`
+  (`rust/src/api/orders.rs`): `pending_orders_filter` — NIP-69 `s=pending`, no `since`, no
+  `limit` — under the stable `mostro-orders` id, and `recent_orders_filter` —
+  `.since(now - RECENT_ORDERS_WINDOW_SECS)`, 48 h, status-agnostic — under
+  `mostro-orders-recent`, which carries the `in-progress` / `canceled` / `success` updates
+  that take an order *out* of the book. Both derive from `all_orders_filter`
+  (`rust/src/nostr/order_events.rs`). That split is scoping, not paging, and the reason for
+  it belongs in this entry: **relays cap how many stored events they replay per REQ** —
+  `relay.mostro.network` stops at 300 and, with no `limit`, hands back the *oldest* 300 — so
+  a bare `kind+author` filter comes back with the node's dead history and none of the live
+  book (#379). The book is therefore already truncatable from the relay side, and the answer
+  was to keep each query under the cap, not to page it. Nostr still has no offset or cursor;
+  `.limit()` is a hint that truncates the market silently (PR 1.6, withdrawn); and a time
+  window cannot carry the book either — the pending filter deliberately has no `since`,
+  because an order older than any window is still live, and the UI filters by currency,
+  payment method and side, which needs the whole set. The payload is small anyway — a
+  thousand events is roughly 650 KB (50 live kind 38383 events from `relay.mostro.network`
+  averaged 653 B, max 905 B).
 - **What actually hurts at 1k orders** is the root cause at the top of this document: full
   `Vec` clones and full-snapshot bridge emissions per mutation, O(N²) bulk ingest, and Dart
   re-mapping, re-filtering and re-sorting the entire book per emission. PR 2.1/2.2 make that
