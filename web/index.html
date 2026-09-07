@@ -86,8 +86,12 @@
       var raw = (navigator.languages && navigator.languages.length)
         ? navigator.languages
         : [navigator.language];
-      var sanitized = raw.map(sanitize).filter(Boolean);
-      if (sanitized.length === 0) sanitized = [fallback];
+      // Frozen to match the real thing: per the HTML spec navigator.languages
+      // returns a frozen array, so an unfrozen shadow would quietly accept a
+      // push() the genuine property rejects. Both assignments need it — the
+      // second is the one the "C" case actually ends up using.
+      var sanitized = Object.freeze(raw.map(sanitize).filter(Boolean));
+      if (sanitized.length === 0) sanitized = Object.freeze([fallback]);
       if (sanitized.join(',') === raw.join(',')) return;
       // Shadowing these is not guaranteed: a browser may expose them as
       // non-configurable. Never let that throw — this script runs before the
