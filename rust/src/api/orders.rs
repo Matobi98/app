@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
-use crate::api::types::{NewOrderParams, OrderInfo, OrderKind, OrderStatus};
+use crate::api::types::{NewOrderParams, OrderInfo, OrderKind, OrderStatus, TradeRole};
 use crate::config::active_mostro_pubkey;
 use crate::db::Storage;
 use crate::mostro::actions;
@@ -19,9 +19,9 @@ use crate::mostro::status::{
 use crate::mostro::pending::{
     classify_take_reply, detach_request_waiter, may_reconcile_stored_id, order_content_key,
     pending_local_uuid_for, pending_requests, purge_pending_request, remove_pending_request,
-    take_matching_add_invoice, take_matching_request, take_matching_restore,
-    take_matching_take, take_pending_create_by_content_key, DaemonReply, PendingRequest,
-    PendingRequestKind, Wake,
+    take_matching_add_invoice, take_matching_dispute, take_matching_request,
+    take_matching_restore, take_matching_take, take_pending_create_by_content_key, DaemonReply,
+    DisputeMatch, PendingRequest, PendingRequestKind, Wake,
 };
 use crate::nostr::order_events::parse_order_event;
 
@@ -38,6 +38,48 @@ fn trade_key_map() -> &'static std::sync::RwLock<HashMap<String, u32>> {
     TRADE_KEY_MAP.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
+/// Ids the DB has already been asked about and did not have.
+///
+/// The ingest path looks up a content fingerprint for every Kind 38383 event,
+/// and for every order belonging to somebody else that lookup misses — one
+/// storage round trip per event, which on web is an IndexedDB transaction.
+///
+/// Safe to cache only because absence is stable: `store_trade_key_index` is
+/// the sole path from absent to present, and it clears the entry.
+static TRADE_KEY_MISSES: OnceLock<std::sync::RwLock<std::collections::HashSet<String>>> =
+    OnceLock::new();
+
+/// Ceiling on remembered misses.
+const TRADE_KEY_MISS_CAPACITY: usize = 4096;
+
+fn trade_key_misses() -> &'static std::sync::RwLock<std::collections::HashSet<String>> {
+    TRADE_KEY_MISSES.get_or_init(|| std::sync::RwLock::new(std::collections::HashSet::new()))
+}
+
+/// Record `order_id` as absent, keeping the set within its ceiling.
+///
+/// Dropping everything when full is deliberate: this is a cache, so the worst
+/// an eviction costs is one extra storage read, and that is cheaper than
+/// tracking insertion order for entries nobody will ask about twice.
+fn record_miss(misses: &mut std::collections::HashSet<String>, order_id: &str) {
+    if misses.len() >= TRADE_KEY_MISS_CAPACITY {
+        misses.clear();
+    }
+    misses.insert(order_id.to_string());
+}
+
+fn note_trade_key_miss(order_id: &str) {
+    if let Ok(mut misses) = trade_key_misses().write() {
+        record_miss(&mut misses, order_id);
+    }
+}
+
+fn forget_trade_key_miss(order_id: &str) {
+    if let Ok(mut misses) = trade_key_misses().write() {
+        misses.remove(order_id);
+    }
+}
+
 /// Persist `index` for `order_id` in both the in-memory cache and the DB.
 ///
 /// The in-memory write is synchronous and always succeeds.  The DB write is
@@ -48,6 +90,9 @@ async fn store_trade_key_index(order_id: &str, index: u32) {
     if let Ok(mut map) = trade_key_map().write() {
         map.insert(order_id.to_string(), index);
     }
+    // This is the only way an id goes from absent to present, so it is the
+    // only place the negative cache has to be invalidated.
+    forget_trade_key_miss(order_id);
     if let Some(db) = crate::db::app_db::db() {
         if let Err(e) = db.save_trade_key(order_id, index).await {
             log::warn!("[orders] failed to persist trade key for order={order_id}: {e}");
@@ -85,6 +130,13 @@ async fn lookup_trade_key_index(order_id: &str) -> Option<u32> {
     {
         return Some(idx);
     }
+    // Known absent: skip the round trip.
+    if trade_key_misses()
+        .read()
+        .is_ok_and(|misses| misses.contains(order_id))
+    {
+        return None;
+    }
     // Slow path: DB (populates cache on hit for subsequent calls).
     if let Some(db) = crate::db::app_db::db() {
         match db.get_trade_key(order_id).await {
@@ -94,7 +146,9 @@ async fn lookup_trade_key_index(order_id: &str) -> Option<u32> {
                 }
                 return Some(idx);
             }
-            Ok(None) => {}
+            Ok(None) => note_trade_key_miss(order_id),
+            // Deliberately not cached: a failed read is not evidence of
+            // absence, and caching it would strand the order as "not ours".
             Err(e) => log::warn!("[orders] DB trade key lookup failed for order={order_id}: {e}"),
         }
     }
@@ -169,11 +223,31 @@ pub struct OrderFilters {
     pub payment_method: Option<String>,
 }
 
+/// How long relay-driven book updates are collected before one snapshot is
+/// published.
+///
+/// Short enough to read as immediate, long enough that a burst of 38383 events
+/// costs one emission instead of one each. Only the relay firehose goes
+/// through this: daemon-message handlers and user actions publish directly.
+const PUBLISH_COALESCE_MS: u64 = 200;
+
 /// Shared order cache + broadcast channel for UI updates.
 pub struct OrderBook {
     orders: Arc<RwLock<Vec<OrderInfo>>>,
     tx: broadcast::Sender<Vec<OrderInfo>>,
+    /// Set while a coalescing window is armed. Shared with the window's task,
+    /// which clears it.
+    publish_scheduled: Arc<AtomicBool>,
 }
+
+/// Snapshots retained for a subscriber that has fallen behind.
+///
+/// A cold-start or refetch burst publishes far more updates than the UI reads
+/// in the same instant, so this is sized for that burst rather than for steady
+/// state. While each message is a full snapshot, overflowing is survivable —
+/// the newest snapshot supersedes the dropped ones. That stops being true if
+/// this channel ever carries deltas.
+const ORDER_STREAM_CAPACITY: usize = 64;
 
 impl Default for OrderBook {
     fn default() -> Self {
@@ -183,10 +257,11 @@ impl Default for OrderBook {
 
 impl OrderBook {
     pub fn new() -> Self {
-        let (tx, _) = broadcast::channel(16);
+        let (tx, _) = broadcast::channel(ORDER_STREAM_CAPACITY);
         Self {
             orders: Arc::new(RwLock::new(Vec::new())),
             tx,
+            publish_scheduled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -208,14 +283,66 @@ impl OrderBook {
     /// Insert or update a single order and notify listeners.
     pub async fn upsert_order(&self, order: OrderInfo) {
         let mut orders = self.orders.write().await;
+        Self::apply_upsert(&mut orders, order);
+        let snapshot = orders.clone();
+        drop(orders);
+        let _ = self.tx.send(snapshot);
+    }
+
+    /// Insert or update a single order **without** notifying listeners.
+    ///
+    /// For bulk ingest, where the caller publishes once at the end. Every
+    /// message on this channel is a whole-book snapshot, so publishing per
+    /// event during a refetch of N orders costs N clones of an N-element
+    /// vector and N full payloads across the bridge.
+    pub(crate) async fn upsert_order_deferred(&self, order: OrderInfo) {
+        let mut orders = self.orders.write().await;
+        Self::apply_upsert(&mut orders, order);
+    }
+
+    /// Insert or update a single order, publishing at most once per
+    /// [`PUBLISH_COALESCE_MS`] window.
+    ///
+    /// For the relay firehose, where events arrive far faster than anyone can
+    /// read them and every emission carries the whole book. The window is
+    /// trailing: the burst that opens it is published when it closes, so the
+    /// subscriber sees the settled book rather than each intermediate state.
+    pub(crate) async fn upsert_order_coalesced(&self, order: OrderInfo) {
+        self.upsert_order_deferred(order).await;
+        self.schedule_publish();
+    }
+
+    /// Arm the coalescing window, unless one is already running.
+    fn schedule_publish(&self) {
+        if self.publish_scheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let orders = Arc::clone(&self.orders);
+        let scheduled = Arc::clone(&self.publish_scheduled);
+        let tx = self.tx.clone();
+        crate::rt::spawn(async move {
+            crate::rt::time::sleep(std::time::Duration::from_millis(PUBLISH_COALESCE_MS))
+                .await;
+            // Released before the snapshot is taken, so an update arriving
+            // during the read opens a new window instead of being swallowed.
+            scheduled.store(false, Ordering::Release);
+            let snapshot = orders.read().await.clone();
+            let _ = tx.send(snapshot);
+        });
+    }
+
+    /// Publish the current book to subscribers.
+    pub(crate) async fn publish(&self) {
+        let snapshot = self.orders.read().await.clone();
+        let _ = self.tx.send(snapshot);
+    }
+
+    fn apply_upsert(orders: &mut Vec<OrderInfo>, order: OrderInfo) {
         if let Some(existing) = orders.iter_mut().find(|o| o.id == order.id) {
             *existing = order;
         } else {
             orders.push(order);
         }
-        let snapshot = orders.clone();
-        drop(orders);
-        let _ = self.tx.send(snapshot);
     }
 
     /// Update the status of an existing cached order and notify listeners.
@@ -289,13 +416,55 @@ impl OrderBook {
     /// Remove the order with the given ID from the cache and notify listeners.
     /// No-op if the ID is not present.
     pub async fn remove_order(&self, order_id: &str) {
+        if self.remove_order_deferred(order_id).await {
+            self.publish().await;
+        }
+    }
+
+    /// Remove without notifying, reporting whether anything was there.
+    ///
+    /// The return value is what keeps a removal that changed nothing from
+    /// publishing a whole-book snapshot.
+    pub(crate) async fn remove_order_deferred(&self, order_id: &str) -> bool {
         let mut orders = self.orders.write().await;
         let before = orders.len();
         orders.retain(|o| o.id != order_id);
-        if orders.len() != before {
-            let snapshot = orders.clone();
-            drop(orders);
-            let _ = self.tx.send(snapshot);
+        orders.len() != before
+    }
+
+    /// Apply an order parsed from a Kind 38383 event.
+    ///
+    /// A finished order that is not ours is dropped rather than stored: the
+    /// book filters to `Pending` for display, so nothing can ever show it, and
+    /// nothing can act on it — but it would sit in the vector for the life of
+    /// the process, inflating every snapshot clone and every bridge payload.
+    ///
+    /// Orders of ours are kept whatever their status, because the trade-detail
+    /// screen looks them up in the book by id *after* the trade finishes.
+    /// `ours` covers both roles — see the call site for why `is_mine` does not.
+    ///
+    /// Publishing follows the same rule as an upsert: a removal during a bulk
+    /// ingest waits for the batch's single emission, and one from the relay
+    /// firehose joins the coalescing window instead of sending a whole-book
+    /// snapshot of its own.
+    pub(crate) async fn apply_ingested_order(
+        &self,
+        order: OrderInfo,
+        ours: bool,
+        publish: Publish,
+    ) {
+        if !ours && crate::mostro::status::is_hard_terminal(&order.status) {
+            // The removal is a no-op when the order was never in the book —
+            // the common case, a stranger's order finishing unseen — and then
+            // nothing is published either.
+            if self.remove_order_deferred(&order.id).await && publish == Publish::Coalesced {
+                self.schedule_publish();
+            }
+            return;
+        }
+        match publish {
+            Publish::Coalesced => self.upsert_order_coalesced(order).await,
+            Publish::WhenBatchEnds => self.upsert_order_deferred(order).await,
         }
     }
 
@@ -310,30 +479,59 @@ use tokio::sync::OnceCell;
 
 // ── Daemon-message deduplication ─────────────────────────────────────────────
 
-/// Tracks recently processed daemon-message event IDs to avoid duplicate processing
-/// when both the per-trade and global subscriptions receive the same event.
-static PROCESSED_GW: OnceLock<std::sync::Mutex<std::collections::VecDeque<String>>> = OnceLock::new();
+/// Sized for the global feed's history replay on reused keys: a mass replay
+/// longer than this window would evict ids that a slower relay may still
+/// redeliver within the same session.
+const DEDUP_MAX_ENTRIES: usize = 512;
+
+/// Recently processed daemon-message event IDs, so an event delivered by both
+/// the per-trade and the global subscription is only handled once.
+///
+/// `seen` answers the membership question; `order` exists only to know which
+/// id to drop when the window is full. Both hold the same `Arc<str>`, so a new
+/// id is allocated once, and `record` is the only thing that writes them —
+/// split those two writes across call sites and `seen` grows without bound.
+///
+/// `frb(ignore)` because this module is part of `crate::api`, which
+/// flutter_rust_bridge scans: without it the codegen emits bindings for this
+/// private, non-bridgeable type and the wasm build stops compiling.
+#[derive(Default)]
+#[flutter_rust_bridge::frb(ignore)]
+struct DedupWindow {
+    seen: std::collections::HashSet<Arc<str>>,
+    order: std::collections::VecDeque<Arc<str>>,
+}
+
+impl DedupWindow {
+    /// Returns `true` if `event_id` is already in the window. Otherwise records
+    /// it — evicting the oldest id when the window is full — and returns
+    /// `false`.
+    fn record(&mut self, event_id: &str) -> bool {
+        if self.seen.contains(event_id) {
+            return true;
+        }
+        let id: Arc<str> = Arc::from(event_id);
+        self.seen.insert(Arc::clone(&id));
+        self.order.push_back(id);
+        if self.order.len() > DEDUP_MAX_ENTRIES {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        false
+    }
+}
+
+static PROCESSED_GW: OnceLock<std::sync::Mutex<DedupWindow>> = OnceLock::new();
 
 /// Returns `true` if this event ID was already processed (duplicate).
 /// Otherwise records it and returns `false`.
 fn is_duplicate_daemon_message(event_id: &str) -> bool {
-    // Sized for the global feed's history replay on reused keys: a mass
-    // replay longer than this window would evict ids that a slower relay
-    // may still redeliver within the same session.
-    const MAX_ENTRIES: usize = 512;
-    let deque = PROCESSED_GW.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
-    let mut guard = match deque.lock() {
-        Ok(g) => g,
-        Err(_) => return false,
-    };
-    if guard.iter().any(|id| id == event_id) {
-        return true;
+    let window = PROCESSED_GW.get_or_init(|| std::sync::Mutex::new(DedupWindow::default()));
+    match window.lock() {
+        Ok(mut guard) => guard.record(event_id),
+        Err(_) => false,
     }
-    guard.push_back(event_id.to_string());
-    if guard.len() > MAX_ENTRIES {
-        guard.pop_front();
-    }
-    false
 }
 
 static ORDER_BOOK: OnceCell<OrderBook> = OnceCell::const_new();
@@ -471,7 +669,7 @@ pub async fn create_order(params: NewOrderParams) -> Result<OrderInfo> {
     // DO NOT add to order book or DB yet — wait for daemon confirmation first.
     // This avoids a phantom "pending" order when the daemon rejects (CantDo).
 
-    let mostro_pubkey = nostr_sdk::PublicKey::from_hex(&active_mostro_pubkey())?;
+    let mostro_pubkey = nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey())?;
     let identity_keys =
         crate::api::identity::get_transport_identity_keys(&sender_keys).await?;
 
@@ -684,7 +882,7 @@ pub async fn take_order(
     // published yet, so pretending the take went through (the old behavior)
     // would show the user a trade that never existed.
     let sender_keys = crate::api::identity::get_active_trade_keys(trade_index).await?;
-    let mostro_pubkey = nostr_sdk::PublicKey::from_hex(&active_mostro_pubkey())?;
+    let mostro_pubkey = nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey())?;
     let identity_keys =
         crate::api::identity::get_transport_identity_keys(&sender_keys).await?;
 
@@ -827,11 +1025,15 @@ pub async fn take_order(
         order_info.amount_sats = amount_sats;
     }
 
-    let trade = TradeInfo {
+    let mut trade = TradeInfo {
         id: uuid::Uuid::new_v4().to_string(),
         order: order_info,
         role,
-        counterparty_pubkey: order.creator_pubkey.clone(),
+        // Not the peer's trade pubkey: `creator_pubkey` on a book order is the
+        // Mostro node itself (the 38383 event author) — seeding it here poisons
+        // the durable peer record (#334). The real counterparty arrives via
+        // `maybe_capture_peer_reveal` and is persisted below when already known.
+        counterparty_pubkey: String::new(),
         current_step: initial_step,
         hold_invoice,
         buyer_invoice: None,
@@ -892,7 +1094,10 @@ pub async fn take_order(
     // success / canceled at the end); the fine-grained states only ever arrive
     // as daemon messages.
     subscribe_single_order(&order_id).await;
-    // Create a session so the chat API can look up keys immediately.
+    // Create a session so the chat API can look up keys immediately. May
+    // already exist: when the take's first reply carried both trade pubkeys,
+    // `maybe_capture_peer_reveal` created it (with peer + shared key set)
+    // before this task was woken — the duplicate-create error is expected.
     let _ = crate::mostro::session::session_manager()
         .create_session(
             order_id.clone(),
@@ -901,6 +1106,25 @@ pub async fn take_order(
             trade.order.clone(),
         )
         .await;
+    // In that same case the reveal ran before the trade row existed, so its
+    // durable write was a no-op — replay it from the session now that the
+    // row is persisted (#334). Mirror it on the returned struct too:
+    // `TradeInfo.counterparty_pubkey` is what `tradeInfoToChatRoom` gates
+    // the chat room on, so the value handed across the bridge must agree
+    // with the row just written.
+    if let Some(session) = crate::mostro::session::session_manager()
+        .get_session(&order_id)
+        .await
+    {
+        if let Some(peer) = session.peer_pubkey.filter(|p| !p.is_empty()) {
+            if let Some(db) = crate::db::app_db::db() {
+                if let Err(e) = db.update_trade_counterparty(&order_id, &peer).await {
+                    log::warn!("[orders] take_order: failed to persist counterparty: {e}");
+                }
+            }
+            trade.counterparty_pubkey = peer;
+        }
+    }
 
     Ok(trade)
 }
@@ -933,7 +1157,7 @@ pub async fn send_invoice(
     let sender_keys = crate::api::identity::get_active_trade_keys(trade_index).await?;
     let identity_keys =
         crate::api::identity::get_transport_identity_keys(&sender_keys).await?;
-    let mostro_pubkey = nostr_sdk::PublicKey::from_hex(&active_mostro_pubkey())?;
+    let mostro_pubkey = nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey())?;
 
     // Correlation nonce for this submission. The daemon echoes it in its
     // reply (progression message or CantDo, e.g. InvalidInvoice); only a
@@ -1033,7 +1257,7 @@ pub async fn send_fiat_sent(order_id: String) -> Result<()> {
     let sender_keys = crate::api::identity::get_active_trade_keys(trade_index).await?;
     let identity_keys =
         crate::api::identity::get_transport_identity_keys(&sender_keys).await?;
-    let mostro_pubkey = nostr_sdk::PublicKey::from_hex(&active_mostro_pubkey())?;
+    let mostro_pubkey = nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey())?;
     let event_json = actions::fiat_sent(
         &identity_keys,
         &sender_keys,
@@ -1064,7 +1288,7 @@ pub async fn release_order(order_id: String) -> Result<()> {
     let sender_keys = crate::api::identity::get_active_trade_keys(trade_index).await?;
     let identity_keys =
         crate::api::identity::get_transport_identity_keys(&sender_keys).await?;
-    let mostro_pubkey = nostr_sdk::PublicKey::from_hex(&active_mostro_pubkey())?;
+    let mostro_pubkey = nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey())?;
     let event_json = actions::release(
         &identity_keys,
         &sender_keys,
@@ -1096,7 +1320,7 @@ pub async fn cancel_order(order_id: String) -> Result<()> {
     let sender_keys = crate::api::identity::get_active_trade_keys(trade_index).await?;
     let identity_keys =
         crate::api::identity::get_transport_identity_keys(&sender_keys).await?;
-    let mostro_pubkey = nostr_sdk::PublicKey::from_hex(&active_mostro_pubkey())?;
+    let mostro_pubkey = nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey())?;
     let event_json = actions::cancel(
         &identity_keys,
         &sender_keys,
@@ -1121,7 +1345,13 @@ pub async fn cancel_order(order_id: String) -> Result<()> {
             )
             .await
         {
-            log::warn!("[orders] failed to optimistically update cancel status for {order_id}: {e}");
+            crate::api::logging::blog_warn(
+                "orders",
+                format!(
+                    "cancel status not persisted for order={}: {e}",
+                    crate::api::logging::short_id(&order_id),
+                ),
+            );
         }
     }
 
@@ -1149,7 +1379,7 @@ pub async fn cancel_order(order_id: String) -> Result<()> {
 /// The relay subscription is established synchronously (awaited) before returning,
 /// then the event loop is spawned as a background task. This guarantees the
 /// subscription is active before the caller publishes the order event.
-pub(crate) async fn subscribe_daemon_messages(trade_pubkey: nostr_sdk::PublicKey, trade_index: u32) {
+pub(crate) async fn subscribe_daemon_messages(trade_pubkey: nostr_sdk::prelude::PublicKey, trade_index: u32) {
     // ── Synchronous setup: awaited by the caller ──
     let recipient_keys = match crate::api::identity::get_active_trade_keys(trade_index).await {
         Ok(k) => k,
@@ -1166,7 +1396,7 @@ pub(crate) async fn subscribe_daemon_messages(trade_pubkey: nostr_sdk::PublicKey
     let client = pool.client();
 
     let mostro_pubkey =
-        match nostr_sdk::PublicKey::from_hex(&crate::config::active_mostro_pubkey()) {
+        match nostr_sdk::prelude::PublicKey::from_hex(&crate::config::active_mostro_pubkey()) {
             Ok(pk) => pk,
             Err(e) => {
                 log::error!("[orders] subscribe_daemon_messages: invalid mostro pubkey: {e}");
@@ -1195,12 +1425,12 @@ pub(crate) async fn subscribe_daemon_messages(trade_pubkey: nostr_sdk::PublicKey
     // never touches live events, so it cannot drop the genuine reply when
     // the client clock runs ahead of the daemon's. Offline catch-up is the
     // global feed's job (see subscribe_node_filters), which replays history.
-    let filter = nostr_sdk::Filter::new()
-        .kind(nostr_sdk::Kind::PrivateDirectMessage)
+    let filter = nostr_sdk::prelude::Filter::new()
+        .kind(nostr_sdk::prelude::Kind::PrivateDirectMessage)
         .author(mostro_pubkey)
         .pubkey(trade_pubkey)
         .limit(0);
-    if let Err(e) = client.subscribe(filter, None).await {
+    if let Err(e) = client.subscribe(filter).await {
         log::warn!("[orders] subscribe_daemon_messages subscribe failed: {e}");
         return;
     }
@@ -1213,7 +1443,7 @@ pub(crate) async fn subscribe_daemon_messages(trade_pubkey: nostr_sdk::PublicKey
 
     // ── Event loop: spawned as a background task ──
     crate::rt::spawn(async move {
-        use nostr_sdk::RelayPoolNotification;
+        use nostr_sdk::prelude::{ClientNotification, StreamExt};
         use crate::rt::time::{timeout, Duration};
 
         const IDLE_TIMEOUT_SECS: u64 = 30 * 60;
@@ -1226,9 +1456,9 @@ pub(crate) async fn subscribe_daemon_messages(trade_pubkey: nostr_sdk::PublicKey
                 break;
             }
 
-            match timeout(remaining, rx.recv()).await {
-                Ok(Ok(RelayPoolNotification::Event { event, .. })) => {
-                    if event.kind != nostr_sdk::Kind::PrivateDirectMessage {
+            match timeout(remaining, rx.next()).await {
+                Ok(Some(ClientNotification::Event { event, .. })) => {
+                    if event.kind != nostr_sdk::prelude::Kind::PrivateDirectMessage {
                         continue;
                     }
                     // Disambiguate Mostro replies from NIP-17 peer chat (also
@@ -1281,14 +1511,9 @@ pub(crate) async fn subscribe_daemon_messages(trade_pubkey: nostr_sdk::PublicKey
                         )),
                     }
                 }
-                Ok(Ok(RelayPoolNotification::Shutdown)) => break,
-                Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
-                    log::warn!("[orders] daemon-msg lagged by {n} messages");
-                    continue;
-                }
-                Ok(Err(broadcast::error::RecvError::Closed)) => break,
+                Ok(Some(ClientNotification::Shutdown)) | Ok(None) => break,
                 Err(_) => break, // idle timeout
-                Ok(Ok(_)) => continue,
+                Ok(Some(_)) => continue,
             }
         }
 
@@ -1328,19 +1553,25 @@ async fn dispatch_mostro_message(
     //
     // A forger cannot sign a kind-14 event as the node, so `sender == mostro`
     // is the authoritative check.
+    //
+    // `created_at` is the kind-14 event's own timestamp, not an inner field
+    // (`unwrap_message_nip44` sets it from `event.created_at`) — the very key
+    // relays order their stored events by. It is the only thing that separates
+    // a live daemon reply from one being replayed out of a startup backlog,
+    // and until now it was dropped here.
     let mostro_core::nip59::UnwrappedMessage {
         message: msg,
         sender,
         identity: _,
         signature: _,
-        created_at: _,
+        created_at: event_created_at,
     } = unwrapped;
 
     // Daemon authentication: the kind-14 event author (`sender`) must be the
     // active Mostro pubkey. The event signature is verified inside
     // `unwrap_incoming`, so `sender` is the cryptographically authoritative
     // origin.
-    match nostr_sdk::PublicKey::from_hex(&crate::config::active_mostro_pubkey()) {
+    match nostr_sdk::prelude::PublicKey::from_hex(&crate::config::active_mostro_pubkey()) {
         Ok(expected) if expected == sender => {}
         Ok(expected) => {
             crate::api::logging::blog_warn("daemon-msg", format!(
@@ -1403,9 +1634,22 @@ async fn dispatch_mostro_message(
         Some(other) => format!("{other:?}"),
         None => "None".to_string(),
     };
+    // `age` is the event's timestamp against the local clock. A live reply reads
+    // ~0; the global kind-14 feed carries no `since`, so on every start it
+    // replays the node's full history and those read hours or days. Relays hand
+    // that backlog back newest-first while the arms below apply each message as
+    // if it had just arrived, so a large age marks writes that are about to
+    // overwrite fresher state. Negative means the node's clock runs ahead.
+    let event_ts = event_created_at.as_secs() as i64;
+    let event_age_secs = crate::rt::unix_now().saturating_sub(event_ts);
     crate::api::logging::blog_info("daemon-msg", format!(
-        "action={:?} order_id={:?} trade_index={:?} trade_pubkey={} payload={}",
-        kind.action, kind.id, kind.trade_index, &trade_pubkey_hex[..8], payload_desc
+        "action={:?} order_id={:?} trade_index={:?} trade_pubkey={} age={}s payload={}",
+        kind.action,
+        kind.id,
+        kind.trade_index,
+        &trade_pubkey_hex[..8],
+        event_age_secs,
+        payload_desc
     ));
 
     // Everything below is serialized against other handlers of this order id:
@@ -1499,6 +1743,24 @@ async fn dispatch_mostro_message(
         }
     }
 
+    // Durable peer capture (#334), BEFORE the take-waiter interception so a
+    // take's first reply — consumed below and never seen by the per-action
+    // arms — still reveals the counterparty. Any payload naming both trade
+    // pubkeys qualifies, whichever action carries it. BondSlashed is exempt
+    // for the same reason it skips the generation gate above: it may be
+    // addressed to a superseded generation and must not write order state.
+    if kind.action != Action::BondSlashed {
+        if let Some(order_id) = &kind.id {
+            maybe_capture_peer_reveal(
+                &order_id.to_string(),
+                &kind.action,
+                kind.payload.as_ref(),
+                trade_index,
+            )
+            .await;
+        }
+    }
+
     // Resolve a waiting take_order call before the per-action arms. Unlike a
     // create (whose only success reply is NewOrder), a take's first reply
     // varies by role and daemon config (add-invoice, pay-invoice,
@@ -1562,6 +1824,50 @@ async fn dispatch_mostro_message(
                     kind.action,
                     &trade_pubkey_hex[..8]
                 ));
+            }
+        }
+
+        // A dispute's only success reply is DisputeInitiatedByYou, so the arm
+        // gates on that action as well as on the nonce — anything else leaves
+        // the record for the genuine reply rather than unblocking the caller
+        // on a message that is not an acceptance. Falls through like an
+        // add-invoice: the reply is also the status update that moves the
+        // order to Dispute.
+        //
+        // DisputeInitiatedByPeer echoes the same nonce but the daemon
+        // addresses it to the counterparty's trade key, which has no pending
+        // record of ours (mostro src/app/dispute.rs, notify_dispute_to_users).
+        if kind.action == Action::DisputeInitiatedByYou {
+            match take_matching_dispute(trade_pubkey_hex, kind.request_id) {
+                Some(DisputeMatch::Waiting(tx)) => {
+                    crate::api::logging::blog_info("daemon-msg", format!(
+                        "DisputeInitiatedByYou: accepted waiting open_dispute for trade={}",
+                        &trade_pubkey_hex[..8]
+                    ));
+                    let _ = tx.send(Wake::from(DaemonReply::DisputeAccepted {
+                        dispute_id: dispute_id_from_payload(kind.payload.as_ref()),
+                    }));
+                }
+                // Genuine acceptance after the 10s timeout — of this attempt or
+                // of an earlier one a retry superseded. The caller already
+                // returned NoDaemonResponse and persisted no dispute. Record it
+                // now: the status arm below moves the trade to Dispute
+                // regardless, and a disputed trade with no dispute record has no
+                // solver to reach (PR #275 review).
+                Some(DisputeMatch::Late) => {
+                    crate::api::logging::blog_warn("daemon-msg", format!(
+                        "DisputeInitiatedByYou: late acceptance for timed-out open_dispute on trade={}",
+                        &trade_pubkey_hex[..8]
+                    ));
+                    if let Some(order_id) = kind.id.map(|id| id.to_string()) {
+                        crate::api::disputes::record_late_acceptance(
+                            &order_id,
+                            dispute_id_from_payload(kind.payload.as_ref()),
+                        )
+                        .await;
+                    }
+                }
+                None => {}
             }
         }
     }
@@ -1673,9 +1979,10 @@ async fn dispatch_mostro_message(
                 // and completed — must not overwrite the terminal outcome.
                 // The wipe path below is unaffected: it starts from
                 // pending/waiting, which are not terminal.
-                if status_sync_blocked_by_terminal(&oid, &kind.action).await {
+                if status_write_blocked(&oid, &kind.action, event_ts).await {
                     return;
                 }
+                record_status_event(&oid, event_ts).await;
                 // Deliberately NOT removed from the order book. The book is
                 // fed only by the daemon's Kind 38383 events, and on a
                 // taker-responsible timeout mostrod republishes the order as
@@ -1735,7 +2042,13 @@ async fn dispatch_mostro_message(
                             )
                             .await
                         {
-                            log::warn!("[orders] failed to sync Canceled status for {oid}: {e}");
+                            crate::api::logging::blog_warn(
+                                "orders",
+                                format!(
+                                    "Canceled status not persisted for order={}: {e}",
+                                    crate::api::logging::short_id(&oid),
+                                ),
+                            );
                         }
                     }
                 }
@@ -1756,16 +2069,18 @@ async fn dispatch_mostro_message(
                     return;
                 }
             };
-            // Before ANY side effect — a stale replay over a finished trade
-            // must not re-derive the peer key, recreate session state, or
-            // respawn the chat subscription either (the legit re-take of a
+            // Terminal guard for the status sync below: a stale replay over a
+            // finished trade must not resurrect its status. (Peer capture
+            // already ran in `maybe_capture_peer_reveal`, which carries its
+            // own copy of this guard.) The legit re-take of a
             // timeout-canceled order is unaffected: its wiped row leaves the
-            // book's `pending` as the local status, which passes).
-            if status_sync_blocked_by_terminal(&order_id, &kind.action).await {
+            // book's `pending` as the local status, which passes.
+            if status_write_blocked(&order_id, &kind.action, event_ts).await {
                 return;
             }
+            record_status_event(&order_id, event_ts).await;
             let small_order = match &kind.payload {
-                Some(mostro_core::message::Payload::Order(o)) => o.clone(),
+                Some(mostro_core::message::Payload::Order(o)) => o,
                 _ => {
                     log::warn!(
                         "[orders] daemon-msg {:?} payload is not an Order",
@@ -1774,36 +2089,8 @@ async fn dispatch_mostro_message(
                     return;
                 }
             };
-            // Determine which pubkey is the peer based on action:
-            // - BuyerTookOrder  → we are the seller, peer is the buyer
-            // - HoldInvoicePaymentAccepted → we are the buyer, peer is the seller
-            // Determine the peer pubkey from the order payload.
-            //   BuyerTookOrder          → we are the seller, peer is the buyer.
-            //   HoldInvoicePaymentAccepted → we are the buyer, peer is the seller.
-            // Both are the only arms that reach this branch (see outer match guard).
-            let peer_pubkey_hex = match kind.action {
-                Action::BuyerTookOrder => small_order.buyer_trade_pubkey.clone(),
-                Action::HoldInvoicePaymentAccepted => small_order.seller_trade_pubkey.clone(),
-                // Safety: unreachable — outer match only routes these two variants here.
-                _ => unreachable!("unexpected action in peer-pubkey resolution"),
-            };
-            let peer_pubkey_hex = match peer_pubkey_hex {
-                Some(pk) if !pk.is_empty() => pk,
-                _ => {
-                    log::warn!(
-                        "[orders] daemon-msg {:?}: missing peer pubkey in payload",
-                        kind.action
-                    );
-                    return;
-                }
-            };
-            log::info!(
-                "[orders] daemon-msg {:?}: order={order_id} peer={peer_pubkey_hex}",
-                kind.action
-            );
-            // Derive the ECDH shared key and store in session so the chat API
-            // can encrypt/decrypt P2P messages and subscribe to the right p-tag.
-            on_peer_pubkey_received(&order_id, &peer_pubkey_hex).await;
+            // Peer capture happens in `maybe_capture_peer_reveal` before the
+            // dispatch arms (#334) — this arm only owns the status sync.
 
             // Sync the order status from the payload so the trade doesn't stay
             // stuck at Pending in the DB and in-memory order book. Both actions
@@ -1828,8 +2115,12 @@ async fn dispatch_mostro_message(
                         .update_trade_fields(&order_id, Some(new_status.clone()), None, None)
                         .await
                     {
-                        log::warn!(
-                            "[orders] failed to sync status for order={order_id}: {e}"
+                        crate::api::logging::blog_warn(
+                            "orders",
+                            format!(
+                                "status not persisted for order={}: {e}",
+                                crate::api::logging::short_id(&order_id),
+                            ),
                         );
                     }
                 }
@@ -1863,9 +2154,10 @@ async fn dispatch_mostro_message(
                 }
                 return;
             };
-            if status_sync_blocked_by_terminal(&order_id, &kind.action).await {
+            if status_write_blocked(&order_id, &kind.action, event_ts).await {
                 return;
             }
+            record_status_event(&order_id, event_ts).await;
             crate::api::logging::blog_info(
                 "orders",
                 format!(
@@ -1948,9 +2240,10 @@ async fn dispatch_mostro_message(
                 bolt11.len(),
                 amount
             );
-            if status_sync_blocked_by_terminal(&order_id, &kind.action).await {
+            if status_write_blocked(&order_id, &kind.action, event_ts).await {
                 return;
             }
+            record_status_event(&order_id, event_ts).await;
             // Save the hold invoice and update status to WaitingPayment.
             crate::api::logging::blog_info(
                 "orders",
@@ -1970,8 +2263,12 @@ async fn dispatch_mostro_message(
                     )
                     .await
                 {
-                    log::warn!(
-                        "[orders] failed to save hold invoice for order={order_id}: {e}"
+                    crate::api::logging::blog_warn(
+                        "orders",
+                        format!(
+                            "hold invoice and status not persisted for order={}: {e}",
+                            crate::api::logging::short_id(&order_id),
+                        ),
                     );
                 }
             }
@@ -2011,9 +2308,10 @@ async fn dispatch_mostro_message(
             // reply classification).
             let new_status = status_for_action(&kind.action);
             if let Some(status) = new_status {
-                if status_sync_blocked_by_terminal(&order_id, &kind.action).await {
+                if status_write_blocked(&order_id, &kind.action, event_ts).await {
                     return;
                 }
+                record_status_event(&order_id, event_ts).await;
                 crate::api::logging::blog_info(
                     "orders",
                     format!(
@@ -2028,8 +2326,12 @@ async fn dispatch_mostro_message(
                         .update_trade_fields(&order_id, Some(status.clone()), None, None)
                         .await
                     {
-                        log::warn!(
-                            "[orders] failed to sync trade status for order={order_id}: {e}"
+                        crate::api::logging::blog_warn(
+                            "orders",
+                            format!(
+                                "status not persisted for order={}: {e}",
+                                crate::api::logging::short_id(&order_id),
+                            ),
                         );
                     }
                 }
@@ -2079,6 +2381,11 @@ async fn dispatch_mostro_message(
                 "IsNotYourOrder" => "Order rejected: this order does not belong to you.".to_string(),
                 "NotAllowedByStatus" => "Action rejected: not allowed in the current order status.".to_string(),
                 "OrderAlreadyCanceled" => "Order is already canceled.".to_string(),
+                // mostro-core 0.14.6: the node is draining (e.g. before a
+                // Lightning node migration) and refuses new orders and takes;
+                // actions on existing orders keep working. Marker only, no
+                // prose: Dart maps `MaintenanceMode` to a localized message.
+                "MaintenanceMode" => "MaintenanceMode".to_string(),
                 other => format!("Order rejected by Mostro: {other}"),
             };
 
@@ -2207,6 +2514,132 @@ async fn status_sync_blocked_by_terminal(
     false
 }
 
+/// Newest daemon-message timestamp already applied to `order_id`'s status.
+///
+/// `None` when nothing was ever recorded, or when there is no durable store
+/// (web, until #233) — both mean "no high-water mark", which fails open.
+async fn load_status_cursor(order_id: &str) -> Option<i64> {
+    let db = crate::db::app_db::db()?;
+    db.get_setting(&crate::db::settings_keys::status_cursor(order_id))
+        .await
+        .ok()
+        .flatten()?
+        .parse()
+        .ok()
+}
+
+/// Record that a daemon message dated `event_created_at` was allowed to write
+/// `order_id`'s status.
+///
+/// The mark is stored **raw**, in the node's own time domain, because that is
+/// the domain [`status_write_blocked`] compares against. Clamping it to the
+/// local clock — as the chat cursor does — is wrong here: there the cursor is a
+/// subscription `since`, where a low value only asks for more than needed, but
+/// here it is an ordering comparator. With a local clock behind the node's, a
+/// newest event at 3000 would store 1000 and a *later, older* event at 2000
+/// would then pass `2000 < 1000` and overwrite it — the very replay regression
+/// this guard exists to stop (PR #396 review).
+///
+/// The freedom that costs is bounded by a skew check instead: an event dated
+/// implausibly far ahead of the local clock does not move the mark, so one
+/// malformed timestamp cannot silence an order's status for good. Same
+/// tolerance the chat envelope already applies to node-adjacent events. A node
+/// whose clock is genuinely further ahead makes the guard inert for that order
+/// rather than wrong — logged, because that is a silent degradation otherwise.
+/// Ordering between the node's own events survives any uniform skew: they all
+/// carry the same clock.
+///
+/// The read-modify-write is safe because every caller runs under this order's
+/// dispatch lock.
+///
+/// Best-effort, like every other write here: losing it costs the durability of
+/// the guard, not its correctness within the session.
+async fn record_status_event(order_id: &str, event_created_at: i64) {
+    let horizon = crate::rt::unix_now()
+        .saturating_add(crate::nostr::transport::MAX_CLOCK_SKEW_SECS as i64);
+    if event_created_at > horizon {
+        crate::api::logging::blog_warn(
+            "orders",
+            format!(
+                "status cursor not advanced for order={}: event is {}s ahead of the local clock",
+                crate::api::logging::short_id(order_id),
+                event_created_at.saturating_sub(horizon),
+            ),
+        );
+        return;
+    }
+    if load_status_cursor(order_id)
+        .await
+        .is_some_and(|c| c >= event_created_at)
+    {
+        return;
+    }
+    if let Some(db) = crate::db::app_db::db() {
+        let key = crate::db::settings_keys::status_cursor(order_id);
+        if let Err(e) = db.set_setting(&key, &event_created_at.to_string()).await {
+            crate::api::logging::blog_warn(
+                "orders",
+                format!(
+                    "status cursor persist failed order={}: {e}",
+                    crate::api::logging::short_id(order_id),
+                ),
+            );
+        }
+    }
+}
+
+/// Whether a daemon message may write `order_id`'s status.
+///
+/// Two independent reasons to refuse, both about the same thing — the startup
+/// backlog:
+///
+/// * the trade already sits in a hard-terminal status
+///   ([`status_sync_blocked_by_terminal`]), and
+/// * the message is **older** than one whose write was already applied.
+///
+/// The second is the general rule and the first is defence in depth, kept
+/// because it is the only one that still works without a durable store (web),
+/// where it reads the in-memory book.
+///
+/// Strictly older is what is refused: the daemon emits several messages for one
+/// order within the same second (the `PayInvoice` reputation follow-up, for
+/// one), and those are genuine, in-order traffic.
+///
+/// That strictness is also why the callers record the mark *before* the writes
+/// they gate, rather than after a successful one (PR #396 review). The mark
+/// answers "which message have I decided to accept", not "which write
+/// succeeded" — every write here is best-effort, `record_status_event`
+/// included, and there is no transaction spanning the settings key and the
+/// trade row. Recording afterwards would leave the mark unmoved when a write
+/// fails, and then a *strictly older* message from the same backlog would be
+/// applied over the row that just failed to update — trading a fault that
+/// heals for one that corrupts. It heals because the failed message is not
+/// blocked on its next delivery: its timestamp equals the mark, and equal
+/// passes. The global feed carries no `since`, so the next start replays it.
+async fn status_write_blocked(
+    order_id: &str,
+    action: &mostro_core::message::Action,
+    event_created_at: i64,
+) -> bool {
+    if status_sync_blocked_by_terminal(order_id, action).await {
+        return true;
+    }
+    if let Some(cursor) = load_status_cursor(order_id).await {
+        if event_created_at < cursor {
+            crate::api::logging::blog_info(
+                "orders",
+                format!(
+                    "skip replayed {action:?} order={}: event is {}s older than the last applied",
+                    crate::api::logging::short_id(order_id),
+                    cursor.saturating_sub(event_created_at),
+                ),
+            );
+            return true;
+        }
+    }
+    false
+}
+
 // ── Public vs private order status ────────────────────────────────────────────
 
 /// Whether a status parsed from a public Kind 38383 event may replace the one
@@ -2254,85 +2687,251 @@ pub(crate) async fn local_trade_status(order_id: &str) -> Option<OrderStatus> {
 
 // ── Peer-pubkey resolution ────────────────────────────────────────────────────
 
-/// Called when the daemon sends `BuyerTookOrder` or `HoldInvoicePaymentAccepted`.
+/// Durable peer capture (#334), mirroring mostrix's symmetric resolution:
+/// any daemon message whose payload carries a `SmallOrder` naming BOTH trade
+/// pubkeys reveals the counterparty. Match our own trade key against the two
+/// and take the other — no per-action role table to maintain, and every
+/// replayed reveal is another chance to self-heal a trade row that missed
+/// it. Persists the peer to the trade row (the durable record — the session
+/// is only a cache) and routes through [`apply_peer_reveal`] for the
+/// session and the incoming-chat subscription.
 ///
-/// Derives the ECDH shared key from `(our_trade_key, peer_trade_pubkey)`,
-/// stores it in the session, and spawns an incoming-chat subscription on the
-/// shared-key pubkey so we receive peer messages from the moment the trade
-/// goes active.
-async fn on_peer_pubkey_received(order_id: &str, peer_pubkey_hex: &str) {
-    // Resolve trade key index from order_id.
-    let trade_index = match get_trade_key_index(order_id).await {
-        Some(idx) => idx,
-        None => {
-            log::warn!("[orders] on_peer_pubkey_received: no trade key for order={order_id}");
+/// `trade_index` is the index of the key that decrypted the message — ours by
+/// construction, and generation-gated by the caller, so it is more reliable
+/// than a book lookup (a take's first reply arrives before the binding).
+async fn maybe_capture_peer_reveal(
+    order_id: &str,
+    action: &mostro_core::message::Action,
+    payload: Option<&mostro_core::message::Payload>,
+    trade_index: u32,
+) {
+    let Some((buyer_hex, seller_hex)) = peer_reveal_pubkeys(payload) else {
+        return;
+    };
+    // Capture already complete → free. This path runs for essentially every
+    // daemon message of a trade — and for the whole replayed history on each
+    // restart (the global DM filter carries no `since` on purpose) — so
+    // without this the key derivation, DB write, ECDH and spawn below repeat
+    // per message. The self-heal property survives: after a restart there is
+    // no session, so the first replayed reveal still does the full pass
+    // (including the durable write) and only the repeats short-circuit.
+    // Session pubkeys are normalized lowercase hex; a payload in another case
+    // merely misses the shortcut and takes the (idempotent) full path.
+    if let Some(session) = crate::mostro::session::session_manager()
+        .get_session(order_id)
+        .await
+    {
+        if session.shared_key.is_some()
+            && session
+                .peer_pubkey
+                .as_deref()
+                .is_some_and(|p| p == buyer_hex || p == seller_hex)
+        {
             return;
         }
+    }
+    let (Ok(buyer_pk), Ok(seller_pk)) = (
+        nostr_sdk::prelude::PublicKey::from_hex(buyer_hex),
+        nostr_sdk::prelude::PublicKey::from_hex(seller_hex),
+    ) else {
+        log::warn!(
+            "[orders] peer-reveal {action:?} order={order_id}: unparseable trade pubkeys in payload"
+        );
+        return;
     };
+    // A stale replay over a finished trade must not respawn chat state.
+    if status_sync_blocked_by_terminal(order_id, action).await {
+        return;
+    }
     let trade_keys = match crate::api::identity::get_active_trade_keys(trade_index).await {
         Ok(k) => k,
         Err(e) => {
-            log::error!("[orders] on_peer_pubkey_received: key load failed: {e}");
+            log::error!("[orders] peer-reveal: key load failed: {e}");
             return;
         }
     };
-    let peer_pubkey = match nostr_sdk::PublicKey::from_hex(peer_pubkey_hex) {
+    let Some((peer_pk, role)) =
+        resolve_peer_side(&trade_keys.public_key(), &buyer_pk, &seller_pk)
+    else {
+        // Decrypted with our key but names two other parties — not ours to
+        // record (e.g. a payload echoing someone else's trade by daemon bug).
+        log::debug!(
+            "[orders] peer-reveal {action:?} order={order_id}: neither party is our trade key"
+        );
+        return;
+    };
+    let peer_hex = peer_pk.to_hex();
+    log::info!(
+        "[orders] peer-reveal {action:?}: order={order_id} role={role:?} peer={peer_hex}"
+    );
+    if let Some(db) = crate::db::app_db::db() {
+        if let Err(e) = db.update_trade_counterparty(order_id, &peer_hex).await {
+            log::warn!("[orders] peer-reveal: failed to persist counterparty: {e}");
+        }
+    }
+    apply_peer_reveal(order_id, &peer_hex, &trade_keys, trade_index, role).await;
+}
+
+/// Pure payload side of the reveal: the two trade pubkeys a daemon payload
+/// names, or `None` when it names fewer than both. Both sides required: with
+/// only one pubkey there is no telling which side is ours, and single-sided
+/// payloads (e.g. the maker's own NewOrder confirmation) reveal nothing
+/// anyway. `Some("")` counts as absent, matching mostrix — this runs for
+/// every daemon message and every replayed one, so letting an empty string
+/// through to `PublicKey::from_hex` would warn-log the whole history on each
+/// restart of a daemon that emits `Some("")` for "no pubkey".
+fn peer_reveal_pubkeys(
+    payload: Option<&mostro_core::message::Payload>,
+) -> Option<(&str, &str)> {
+    let small_order = match payload {
+        Some(mostro_core::message::Payload::Order(o)) => o,
+        Some(mostro_core::message::Payload::PaymentRequest(Some(o), _, _)) => o,
+        _ => return None,
+    };
+    match (
+        small_order.buyer_trade_pubkey.as_deref(),
+        small_order.seller_trade_pubkey.as_deref(),
+    ) {
+        (Some(buyer_hex), Some(seller_hex))
+            if !buyer_hex.is_empty() && !seller_hex.is_empty() =>
+        {
+            Some((buyer_hex, seller_hex))
+        }
+        _ => None,
+    }
+}
+
+/// Pure side of the symmetric reveal: which of the two named trade pubkeys is
+/// the counterparty, given our own. `None` when we are neither party.
+fn resolve_peer_side(
+    my_pk: &nostr_sdk::prelude::PublicKey,
+    buyer_pk: &nostr_sdk::prelude::PublicKey,
+    seller_pk: &nostr_sdk::prelude::PublicKey,
+) -> Option<(nostr_sdk::prelude::PublicKey, TradeRole)> {
+    if my_pk == buyer_pk {
+        Some((*seller_pk, TradeRole::Buyer))
+    } else if my_pk == seller_pk {
+        Some((*buyer_pk, TradeRole::Seller))
+    } else {
+        None
+    }
+}
+
+/// Called when a daemon message reveals the counterparty's trade pubkey
+/// (via [`maybe_capture_peer_reveal`], which already holds the trade keys —
+/// no second identity load or BIP-32 derivation here).
+///
+/// Derives the ECDH shared key from `(our_trade_key, peer_trade_pubkey)`,
+/// stores it in the session — creating the session if none exists, which is
+/// the maker's normal case, `take_order` being the only other creator (#334)
+/// — and spawns an incoming-chat subscription on the shared-key pubkey so we
+/// receive peer messages from the moment the trade goes active. Split from
+/// the capture so tests can exercise the session logic with generated keys
+/// instead of mutating the process-global identity (shared with every other
+/// test in the binary).
+async fn apply_peer_reveal(
+    order_id: &str,
+    peer_pubkey_hex: &str,
+    trade_keys: &nostr_sdk::prelude::Keys,
+    trade_index: u32,
+    role: TradeRole,
+) {
+    let peer_pubkey = match nostr_sdk::prelude::PublicKey::from_hex(peer_pubkey_hex) {
         Ok(pk) => pk,
         Err(e) => {
-            log::error!("[orders] on_peer_pubkey_received: invalid peer pubkey: {e}");
+            log::error!("[orders] peer-reveal: invalid peer pubkey: {e}");
             return;
         }
     };
     // Derive the 32-byte ECDH shared secret.
     let shared_key_bytes =
-        match crate::crypto::ecdh::derive_nip04_shared_key(&trade_keys, &peer_pubkey) {
+        match crate::crypto::ecdh::derive_nip04_shared_key(trade_keys, &peer_pubkey) {
             Ok(k) => k,
             Err(e) => {
-                log::error!("[orders] on_peer_pubkey_received: ECDH failed: {e}");
+                log::error!("[orders] peer-reveal: ECDH failed: {e}");
                 return;
             }
         };
     // Derive the shared-key *pubkey* (the p-tag subscribed by chat listeners).
     // The shared secret is used as a private scalar to derive the corresponding
     // public key — this is the convention used by v1 and the chat protocol spec.
-    let shared_pubkey = match nostr_sdk::SecretKey::from_slice(&shared_key_bytes) {
-        Ok(sk) => nostr_sdk::Keys::new(sk).public_key(),
+    let shared_pubkey = match nostr_sdk::prelude::SecretKey::from_slice(&shared_key_bytes) {
+        Ok(sk) => nostr_sdk::prelude::Keys::new(sk).public_key(),
         Err(e) => {
-            log::error!("[orders] on_peer_pubkey_received: shared key→pubkey failed: {e}");
+            log::error!("[orders] peer-reveal: shared key→pubkey failed: {e}");
             return;
         }
     };
     log::info!(
-        "[orders] on_peer_pubkey_received: order={order_id}          peer={peer_pubkey_hex} shared_pubkey={}",
+        "[orders] peer-reveal: order={order_id} peer={peer_pubkey_hex} shared_pubkey={}",
         shared_pubkey.to_hex()
     );
-    // Update or create the session with peer + shared key.
+    // Update or create the session with peer + shared key. No session is the
+    // maker's NORMAL case, not a race: `take_order` is the only other
+    // creator, so a maker reaches this reveal without one and could never
+    // send (#334). On web this session is also the only chat-identity store
+    // — the trades row is stubbed there (#233).
     let mgr = crate::mostro::session::session_manager();
-    if let Some(mut session) = mgr.get_session(order_id).await {
+    let session = match mgr.get_session(order_id).await {
+        Some(s) => Some(s),
+        None => {
+            // Order info: the persisted trade row wins; the public book
+            // covers platforms without one (web) and the pre-persistence
+            // window of a take's first reply.
+            let from_row = match crate::db::app_db::db() {
+                Some(db) => db
+                    .get_trade_by_order_id(order_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|t| t.order),
+                None => None,
+            };
+            let order_info = match from_row {
+                Some(o) => Some(o),
+                None => order_book().get_order(order_id).await,
+            };
+            match order_info {
+                None => {
+                    log::warn!(
+                        "[orders] peer-reveal: no order info for order={order_id} — cannot create session"
+                    );
+                    None
+                }
+                Some(order_info) => mgr
+                    .create_session(order_id.to_string(), role, trade_index, order_info)
+                    .await
+                    .map_err(|e| {
+                        log::warn!("[orders] peer-reveal: session create failed: {e}")
+                    })
+                    .ok(),
+            }
+        }
+    };
+    if let Some(mut session) = session {
         session.peer_pubkey = Some(peer_pubkey_hex.to_string());
         session.shared_key = Some(shared_key_bytes);
         if let Err(e) = mgr.update_session(order_id, session).await {
-            log::warn!("[orders] on_peer_pubkey_received: session update failed: {e}");
+            log::warn!("[orders] peer-reveal: session update failed: {e}");
         }
     } else {
-        // Session may not exist if we received the event after a restart but
-        // before create_session ran (rare race). Create it now best-effort.
         log::warn!(
-            "[orders] on_peer_pubkey_received: session not found for order={order_id}, skipping session update — incoming subscription still spawned"
+            "[orders] peer-reveal: no session and none creatable for order={order_id} — incoming subscription still spawned"
         );
     }
     // Derive the chat conversation keys (K_conv / K_sign — HKDF split of the
     // trade-key ECDH secret, protocol chat spec) and spawn the incoming-chat
     // subscription pinned to their author key.
-    let (conv, sign) = match crate::crypto::chat_keys::derive_chat_keys(&trade_keys, &peer_pubkey)
+    let (conv, sign) = match crate::crypto::chat_keys::derive_chat_keys(trade_keys, &peer_pubkey)
     {
         Ok(pair) => pair,
         Err(e) => {
-            log::error!("[orders] on_peer_pubkey_received: chat key derivation failed: {e}");
+            log::error!("[orders] peer-reveal: chat key derivation failed: {e}");
             return;
         }
     };
     let order_id_owned = order_id.to_string();
+    let trade_keys = trade_keys.clone();
     crate::rt::spawn(async move {
         crate::api::messages::subscribe_incoming_chat(
             crate::api::messages::ChatChannel::Peer,
@@ -2363,7 +2962,7 @@ async fn subscribe_single_order(order_id: &str) {
         };
         let client = pool.client();
         let mostro_pubkey =
-            match nostr_sdk::PublicKey::from_hex(&crate::config::active_mostro_pubkey()) {
+            match nostr_sdk::prelude::PublicKey::from_hex(&crate::config::active_mostro_pubkey()) {
                 Ok(pk) => pk,
                 Err(e) => {
                     log::error!("[orders] subscribe_single_order: invalid pubkey: {e}");
@@ -2373,13 +2972,13 @@ async fn subscribe_single_order(order_id: &str) {
 
         let mut rx = client.notifications();
         let filter = crate::nostr::order_events::trade_order_filter(&mostro_pubkey, &order_id);
-        if let Err(e) = client.subscribe(filter, None).await {
+        if let Err(e) = client.subscribe(filter).await {
             log::warn!("[orders] subscribe_single_order subscribe failed: {e}");
             return;
         }
         log::info!("[orders] subscribed to d-tag updates for order={order_id}");
 
-        use nostr_sdk::RelayPoolNotification;
+        use nostr_sdk::prelude::{ClientNotification, StreamExt};
         use crate::rt::time::{timeout, Duration};
 
         // Exit after 30 minutes of inactivity (no order updates received).
@@ -2395,8 +2994,8 @@ async fn subscribe_single_order(order_id: &str) {
                 break;
             }
 
-            match timeout(remaining, rx.recv()).await {
-                Ok(Ok(RelayPoolNotification::Event { event, .. })) => {
+            match timeout(remaining, rx.next()).await {
+                Ok(Some(ClientNotification::Event { event, .. })) => {
                     if let Some(mut order) =
                         crate::nostr::order_events::parse_order_event(&event, None)
                     {
@@ -2428,9 +3027,12 @@ async fn subscribe_single_order(order_id: &str) {
                                     )
                                     .await
                                 {
-                                    log::warn!(
-                                        "[orders] failed to sync d-tag trade status for order={}: {e}",
-                                        order.id
+                                    crate::api::logging::blog_warn(
+                                        "orders",
+                                        format!(
+                                            "d-tag status not persisted for order={}: {e}",
+                                            crate::api::logging::short_id(&order.id),
+                                        ),
                                     );
                                 }
                             }
@@ -2443,10 +3045,9 @@ async fn subscribe_single_order(order_id: &str) {
                         }
                     }
                 }
-                Ok(Ok(RelayPoolNotification::Shutdown)) => break,
-                Ok(Err(_)) => break,
+                Ok(Some(ClientNotification::Shutdown)) | Ok(None) => break,
                 Err(_) => break, // idle timeout
-                Ok(Ok(_)) => continue,
+                Ok(Some(_)) => continue,
             }
         }
     });
@@ -2461,7 +3062,7 @@ async fn subscribe_single_order(order_id: &str) {
 async fn publish_event_json(event_json: &str) -> Result<()> {
     let pool =
         crate::api::nostr::get_pool().map_err(|_| anyhow::anyhow!("RelayPoolNotInitialized"))?;
-    let event: nostr_sdk::Event =
+    let event: nostr_sdk::prelude::Event =
         serde_json::from_str(event_json).map_err(|e| anyhow::anyhow!("invalid event JSON: {e}"))?;
     let kind = event.kind.as_u16();
     let eid = event.id.to_hex();
@@ -2472,7 +3073,7 @@ async fn publish_event_json(event_json: &str) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("publish failed: {e}"))?;
     // Per-relay outcome: with one relay habitually down, knowing WHERE each
     // event actually landed is what makes delivery issues diagnosable.
-    for relay in &output.success {
+    for relay in output.success.keys() {
         crate::api::logging::blog_info(
             "publish",
             format!(
@@ -2493,8 +3094,11 @@ async fn publish_event_json(event_json: &str) -> Result<()> {
             ),
         );
     }
-    // The SDK returns Ok even when every relay rejected the event (verified
-    // in nostr-relay-pool 0.44: `send_event_to` has no empty-success guard).
+    // The SDK returns Ok even when every relay rejected the event (re-verified
+    // on the 0.45 bump: the pool collects per-relay outcomes and ends in a
+    // bare `Ok(output)`, with no empty-success guard. `success` still means
+    // accepted — an `OK false` becomes a relay error and lands in `failed`.
+    // nostr-relay-pool was folded into nostr-sdk itself in 0.45.)
     // Without this, fire-and-forget actions (fiat-sent, release, cancel)
     // would report success having reached zero relays, and correlated ones
     // would wait 10s for a reply that can never arrive. Partial success
@@ -2517,8 +3121,8 @@ static SUBSCRIPTION_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// loop exits (pool shutdown or channel closed).
 ///
 /// Internally spawns a background Tokio task that:
-/// 1. Subscribes to `all_orders_filter()` via the relay pool client.
-/// 2. Loops over `RelayPoolNotification::Event` messages.
+/// 1. Subscribes to the `order_book_filters()` pair via the relay pool client.
+/// 2. Loops over `ClientNotification::Event` messages.
 /// 3. Parses each Kind 38383 event via `parse_order_event` and upserts it
 ///    into the order book, which broadcasts the update to all `OrdersStream`
 ///    subscribers.
@@ -2624,6 +3228,39 @@ fn spawn_stale_sweep() {
     });
 }
 
+/// Look a single order's public status up directly on the relays, bypassing
+/// the in-memory book.
+///
+/// The book is fed by [`order_book_filters`], whose any-status half is
+/// windowed to `RECENT_ORDERS_WINDOW_SECS` (48 h). A trade whose cancellation
+/// the app missed while offline for longer than that window therefore has no
+/// cached status at all, and the sweep would keep it waiting forever — which
+/// is exactly the case the sweep exists for. An unwindowed `d`-tag query
+/// returns a single addressable event, so it is cheap and no relay replay cap
+/// can hide it.
+async fn fetch_public_order_status(order_id: &str) -> Option<crate::api::types::OrderStatus> {
+    let pool = crate::api::nostr::get_pool().ok()?;
+    let mostro_pubkey = nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey()).ok()?;
+    let filter = crate::nostr::order_events::trade_order_filter(&mostro_pubkey, order_id);
+    let events = match pool
+        .client()
+        .fetch_events(filter)
+        .timeout(std::time::Duration::from_secs(10))
+        .await
+    {
+        Ok(events) => events,
+        Err(e) => {
+            log::warn!("[orders] sweep: d-tag fetch for {order_id} failed: {e}");
+            return None;
+        }
+    };
+    events
+        .into_iter()
+        .max_by_key(|e| e.created_at)
+        .and_then(|e| crate::nostr::order_events::parse_order_event(&e, None))
+        .map(|o| o.status)
+}
+
 /// Reconcile trades stuck in waiting states with the daemon's public book.
 ///
 /// Covers cancellations whose daemon message the app never received (closed or
@@ -2660,7 +3297,12 @@ async fn run_stale_sweep_once() {
         }
         examined += 1;
         let oid = trade.order.id.clone();
-        let book_status = order_book().get_order(&oid).await.map(|o| o.status);
+        // The book first (free); on a miss, ask the relays for this one order.
+        // A miss is the long-offline case the windowed filter cannot cover.
+        let book_status = match order_book().get_order(&oid).await.map(|o| o.status) {
+            Some(status) => Some(status),
+            None => fetch_public_order_status(&oid).await,
+        };
         match sweep_action(trade.order.is_mine, book_status.as_ref()) {
             SweepAction::Wipe => match db.delete_trade_by_order_id(&oid).await {
                 Ok(()) => {
@@ -2734,40 +3376,85 @@ async fn refetch_active_node_orders() {
         log::warn!("[orders] refetch: relay pool not initialized");
         return;
     };
-    let mostro_pubkey = match nostr_sdk::PublicKey::from_hex(&active_mostro_pubkey()) {
+    let mostro_pubkey = match nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey()) {
         Ok(pk) => pk,
         Err(e) => {
             log::error!("[orders] refetch: invalid mostro pubkey: {e}");
             return;
         }
     };
-    let order_filter = crate::nostr::order_events::all_orders_filter(&mostro_pubkey);
-    match pool
-        .client()
-        .fetch_events(order_filter, std::time::Duration::from_secs(10))
-        .await
-    {
-        Ok(events) => {
-            crate::api::logging::blog_info(
-                "orders",
-                format!("refetched {} current orders for active node", events.len()),
-            );
-            for event in events.into_iter() {
-                ingest_order_event(&event).await;
-            }
-        }
-        Err(e) => log::warn!("[orders] refetch: fetch current orders failed: {e}"),
+    // Same two filters as the live subscription (see `order_book_filters`).
+    let (pending_filter, recent_filter) = order_book_filters(&mostro_pubkey);
+    let client = pool.client();
+    let timeout = std::time::Duration::from_secs(10);
+    // Fetched independently on purpose: the two scopes fail independently, and
+    // losing the recent-changes pass must not throw away a pending book that
+    // arrived fine (that would leave the UI empty on a transient relay error).
+    let pending = client.fetch_events(pending_filter).timeout(timeout).await;
+    let recent = client.fetch_events(recent_filter).timeout(timeout).await;
+    if let Err(e) = &pending {
+        log::warn!("[orders] refetch: pending-book fetch failed: {e}");
     }
+    if let Err(e) = &recent {
+        log::warn!("[orders] refetch: recent-changes fetch failed: {e}");
+    }
+    if pending.is_err() && recent.is_err() {
+        // Both scopes failed: nothing to ingest, and the warnings above say why.
+        return;
+    }
+    let mut events: Vec<nostr_sdk::prelude::Event> = Vec::new();
+    for batch in [pending, recent].into_iter().flatten() {
+        events.extend(batch);
+    }
+    crate::api::logging::blog_info(
+        "orders",
+        format!("refetched {} current orders for active node", events.len()),
+    );
+    for event in events.into_iter() {
+        ingest_order_event_with(&event, Publish::WhenBatchEnds).await;
+    }
+    // One emission for the batch. Publishing per event made a refetch
+    // O(N²): each upsert cloned the whole book and sent it across the
+    // bridge, so N orders cost N clones of an N-element vector. This
+    // path runs on cold start, on every node switch, and on every
+    // pull-to-refresh.
+    order_book().publish().await;
 }
 
-/// Stable subscription ID for the Kind 38383 order-book feed.
-fn orders_subscription_id() -> nostr_sdk::SubscriptionId {
-    nostr_sdk::SubscriptionId::new("mostro-orders")
+/// Stable subscription ID for the Kind 38383 pending order-book feed.
+fn orders_subscription_id() -> nostr_sdk::prelude::SubscriptionId {
+    nostr_sdk::prelude::SubscriptionId::new("mostro-orders")
+}
+
+/// Stable subscription ID for the windowed any-status Kind 38383 feed that
+/// carries the transitions taking an order *out* of the book.
+fn recent_orders_subscription_id() -> nostr_sdk::prelude::SubscriptionId {
+    nostr_sdk::prelude::SubscriptionId::new("mostro-orders-recent")
+}
+
+/// The pair of Kind 38383 filters that together give a complete, bounded
+/// view of a node's book: every pending order plus every status change of
+/// the last [`RECENT_ORDERS_WINDOW_SECS`] hours. Shared by the live
+/// subscription and the refetch so neither can drift back to the
+/// unbounded query.
+///
+/// [`RECENT_ORDERS_WINDOW_SECS`]: crate::nostr::order_events::RECENT_ORDERS_WINDOW_SECS
+fn order_book_filters(
+    mostro_pubkey: &nostr_sdk::prelude::PublicKey,
+) -> (nostr_sdk::prelude::Filter, nostr_sdk::prelude::Filter) {
+    use crate::nostr::order_events::{pending_orders_filter, recent_orders_filter, RECENT_ORDERS_WINDOW_SECS};
+    let since = nostr_sdk::prelude::Timestamp::now() - RECENT_ORDERS_WINDOW_SECS;
+    (pending_orders_filter(mostro_pubkey), recent_orders_filter(mostro_pubkey, since))
 }
 
 /// Stable subscription ID for the Kind 14 Mostro-reply feed.
-fn mostro_dm_subscription_id() -> nostr_sdk::SubscriptionId {
-    nostr_sdk::SubscriptionId::new("mostro-dm")
+fn mostro_dm_subscription_id() -> nostr_sdk::prelude::SubscriptionId {
+    nostr_sdk::prelude::SubscriptionId::new("mostro-dm")
+}
+
+/// Stable subscription ID for the node's kind 10002 relay list.
+fn relay_list_subscription_id() -> nostr_sdk::prelude::SubscriptionId {
+    nostr_sdk::prelude::SubscriptionId::new("mostro-relay-list")
 }
 
 /// (Re)subscribe the order-book (Kind 38383) and Mostro-reply (Kind 14)
@@ -2778,22 +3465,46 @@ fn mostro_dm_subscription_id() -> nostr_sdk::SubscriptionId {
 /// overwrites the subscription for a known ID) instead of leaking a second
 /// subscription that keeps the old node's events flowing.
 async fn subscribe_node_filters(
-    client: &nostr_sdk::Client,
-    mostro_pubkey: nostr_sdk::PublicKey,
-    trade_pubkeys: Vec<nostr_sdk::PublicKey>,
+    client: &nostr_sdk::prelude::Client,
+    mostro_pubkey: nostr_sdk::prelude::PublicKey,
+    trade_pubkeys: Vec<nostr_sdk::prelude::PublicKey>,
 ) -> Result<()> {
-    let order_filter = crate::nostr::order_events::all_orders_filter(&mostro_pubkey);
+    // Two filters, not one unbounded one: relays cap how many stored events
+    // they replay per REQ (relay.mostro.network: 300, oldest-first when no
+    // limit is given), so a bare `kind+author` filter comes back with the
+    // node's dead history and none of the live book. See `pending_orders_filter`.
+    let (pending_filter, recent_filter) = order_book_filters(&mostro_pubkey);
     client
-        .subscribe_with_id(orders_subscription_id(), order_filter, None)
+        .subscribe(pending_filter)
+        .with_id(orders_subscription_id())
         .await
         .map_err(|e| anyhow::anyhow!("order subscribe failed: {e}"))?;
+    client
+        .subscribe(recent_filter)
+        .with_id(recent_orders_subscription_id())
+        .await
+        .map_err(|e| anyhow::anyhow!("recent-orders subscribe failed: {e}"))?;
     crate::api::logging::blog_info(
         "relay",
         format!(
-            "sub created id={} kinds=[38383] author={}",
+            "subs created id={} (kinds=[38383] s=pending) + id={} (kinds=[38383] since=-{}h) author={}",
             orders_subscription_id(),
+            recent_orders_subscription_id(),
+            crate::nostr::order_events::RECENT_ORDERS_WINDOW_SECS / 3600,
             crate::api::logging::short_id(&mostro_pubkey.to_hex()),
         ),
+    );
+
+    // The node's NIP-65 relay list, kept live so an operator adding a relay
+    // reaches running clients; applied additively by apply_relay_list_event.
+    client
+        .subscribe(crate::nostr::relay_list::relay_list_filter(&mostro_pubkey))
+        .with_id(relay_list_subscription_id())
+        .await
+        .map_err(|e| anyhow::anyhow!("relay-list subscribe failed: {e}"))?;
+    crate::api::logging::blog_info(
+        "relay",
+        format!("sub created id={} kinds=[10002]", relay_list_subscription_id()),
     );
 
     // Kind-14 NIP-44 replies authored by Mostro for all known trade pubkeys.
@@ -2805,12 +3516,13 @@ async fn subscribe_node_filters(
     // per-trade subscription (subscribe_daemon_messages) carries a cutoff.
     if !trade_pubkeys.is_empty() {
         let p_count = trade_pubkeys.len();
-        let dm_filter = nostr_sdk::Filter::new()
-            .kind(nostr_sdk::Kind::PrivateDirectMessage)
+        let dm_filter = nostr_sdk::prelude::Filter::new()
+            .kind(nostr_sdk::prelude::Kind::PrivateDirectMessage)
             .author(mostro_pubkey)
             .pubkeys(trade_pubkeys);
         client
-            .subscribe_with_id(mostro_dm_subscription_id(), dm_filter, None)
+            .subscribe(dm_filter)
+            .with_id(mostro_dm_subscription_id())
             .await
             .map_err(|e| anyhow::anyhow!("dm subscribe failed: {e}"))?;
         crate::api::logging::blog_info(
@@ -2852,7 +3564,7 @@ pub(crate) async fn refresh_subscriptions_for_active_node() {
     };
     let client = pool.client();
 
-    let mostro_pubkey = match nostr_sdk::PublicKey::from_hex(&active_mostro_pubkey()) {
+    let mostro_pubkey = match nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey()) {
         Ok(pk) => pk,
         Err(e) => {
             log::error!("[orders] node switch: invalid mostro pubkey: {e}");
@@ -2897,10 +3609,10 @@ pub(crate) async fn refresh_subscriptions_for_active_node() {
 /// alone, so an unseeded or shrunk map makes previous sessions' trades
 /// undecryptable and silently unsubscribes them.
 static GLOBAL_DM_KEYS: std::sync::OnceLock<
-    tokio::sync::RwLock<HashMap<String, (nostr_sdk::Keys, u32)>>,
+    tokio::sync::RwLock<HashMap<String, (nostr_sdk::prelude::Keys, u32)>>,
 > = std::sync::OnceLock::new();
 
-fn global_dm_keys() -> &'static tokio::sync::RwLock<HashMap<String, (nostr_sdk::Keys, u32)>> {
+fn global_dm_keys() -> &'static tokio::sync::RwLock<HashMap<String, (nostr_sdk::prelude::Keys, u32)>> {
     GLOBAL_DM_KEYS.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
 }
 
@@ -2909,7 +3621,7 @@ fn global_dm_keys() -> &'static tokio::sync::RwLock<HashMap<String, (nostr_sdk::
 /// key (including an admin-took-dispute long after creation) are received
 /// for the whole life of the process, not just while the temporary per-trade
 /// receiver runs. Idempotent: a key already covered causes no relay churn.
-pub(crate) async fn ensure_global_dm_coverage(keys: &nostr_sdk::Keys, trade_index: u32) {
+pub(crate) async fn ensure_global_dm_coverage(keys: &nostr_sdk::prelude::Keys, trade_index: u32) {
     let hex = keys.public_key().to_hex();
     {
         let mut map = global_dm_keys().write().await;
@@ -2928,26 +3640,27 @@ async fn resubscribe_global_dm_filter() {
     let Ok(pool) = crate::api::nostr::get_pool() else {
         return;
     };
-    let Ok(mostro_pubkey) = nostr_sdk::PublicKey::from_hex(&active_mostro_pubkey()) else {
+    let Ok(mostro_pubkey) = nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey()) else {
         return;
     };
-    let trade_pubkeys: Vec<nostr_sdk::PublicKey> = global_dm_keys()
+    let trade_pubkeys: Vec<nostr_sdk::prelude::PublicKey> = global_dm_keys()
         .read()
         .await
         .keys()
-        .filter_map(|hex| nostr_sdk::PublicKey::from_hex(hex).ok())
+        .filter_map(|hex| nostr_sdk::prelude::PublicKey::from_hex(hex).ok())
         .collect();
     if trade_pubkeys.is_empty() {
         return;
     }
     let p_count = trade_pubkeys.len();
-    let dm_filter = nostr_sdk::Filter::new()
-        .kind(nostr_sdk::Kind::PrivateDirectMessage)
+    let dm_filter = nostr_sdk::prelude::Filter::new()
+        .kind(nostr_sdk::prelude::Kind::PrivateDirectMessage)
         .author(mostro_pubkey)
         .pubkeys(trade_pubkeys);
     if let Err(e) = pool
         .client()
-        .subscribe_with_id(mostro_dm_subscription_id(), dm_filter, None)
+        .subscribe(dm_filter)
+        .with_id(mostro_dm_subscription_id())
         .await
     {
         log::warn!("[orders] bulk DM filter refresh failed: {e}");
@@ -2967,18 +3680,18 @@ async fn resubscribe_global_dm_filter() {
 ///
 /// Union, not replace: a session key inserted concurrently (create/take in
 /// flight while subscriptions restart) must never be evicted.
-async fn seed_global_dm_coverage() -> Vec<nostr_sdk::PublicKey> {
+async fn seed_global_dm_coverage() -> Vec<nostr_sdk::prelude::PublicKey> {
     let derived = build_trade_key_map().await;
     let mut map = global_dm_keys().write().await;
     for (hex, entry) in derived {
         map.entry(hex).or_insert(entry);
     }
     map.keys()
-        .filter_map(|hex| nostr_sdk::PublicKey::from_hex(hex).ok())
+        .filter_map(|hex| nostr_sdk::prelude::PublicKey::from_hex(hex).ok())
         .collect()
 }
 
-async fn build_trade_key_map() -> HashMap<String, (nostr_sdk::Keys, u32)> {
+async fn build_trade_key_map() -> HashMap<String, (nostr_sdk::prelude::Keys, u32)> {
     let mut map = HashMap::new();
     let max_index = match crate::api::identity::get_identity().await {
         Ok(Some(info)) => info.trade_key_index,
@@ -2996,48 +3709,50 @@ async fn build_trade_key_map() -> HashMap<String, (nostr_sdk::Keys, u32)> {
     map
 }
 
-/// Handle a kind-14 Mostro reply received on the global subscription.
+/// Find which of our trade keys this kind-14 is addressed to, reading the key
+/// map only for the lookup itself.
 ///
-/// The caller has already pinned the author to the active Mostro pubkey.
-/// Finds which trade key the event is addressed to (via `p` tag), decrypts
-/// via `mostro_core::transport::unwrap_incoming`, and dispatches the recovered
-/// `Message` through `dispatch_mostro_message`.
-async fn handle_global_daemon_message(
-    event: &nostr_sdk::Event,
-    trade_key_map: &HashMap<String, (nostr_sdk::Keys, u32)>,
-) {
-    // Find the p-tag that matches one of our trade keys.
-    let (recipient_hex, recipient_keys, trade_idx) = {
-        let mut found = None;
-        for tag in event.tags.iter() {
-            let s = tag.as_slice();
-            if s.first().map(|v| v.as_str()) == Some("p") {
-                if let Some(pk_hex) = s.get(1).map(|v| v.as_str()) {
-                    if let Some((keys, idx)) = trade_key_map.get(pk_hex) {
-                        found = Some((pk_hex.to_string(), keys.clone(), *idx));
-                        break;
-                    }
+/// The read guard must not be held past this point: handling a message can end
+/// up in `ensure_global_dm_coverage`, which takes the same lock for writing.
+async fn resolve_dm_recipient(
+    event: &nostr_sdk::prelude::Event,
+) -> Option<(String, nostr_sdk::prelude::Keys, u32)> {
+    let map = global_dm_keys().read().await;
+    for tag in event.tags.iter() {
+        let s = tag.as_slice();
+        if s.first().map(|v| v.as_str()) == Some("p") {
+            if let Some(pk_hex) = s.get(1).map(|v| v.as_str()) {
+                if let Some((keys, idx)) = map.get(pk_hex) {
+                    return Some((pk_hex.to_string(), keys.clone(), *idx));
                 }
             }
         }
-        match found {
-            Some(f) => f,
-            None => {
-                // The bulk filter pins author + our own p-tags, so a kind-14
-                // that reaches here without a matching key is an anomaly
-                // (stale filter after regenerate? key map gap?) — worth a warn.
-                crate::api::logging::blog_warn(
-                    "daemon-msg",
-                    format!(
-                        "drop ev={} reason=no-matching-p-tag map={}",
-                        crate::api::logging::short_id(&event.id.to_hex()),
-                        trade_key_map.len(),
-                    ),
-                );
-                return;
-            }
-        }
-    };
+    }
+    // The bulk filter pins author + our own p-tags, so a kind-14 that reaches
+    // here without a matching key is an anomaly (stale filter after
+    // regenerate? key map gap?) — worth a warn.
+    crate::api::logging::blog_warn(
+        "daemon-msg",
+        format!(
+            "drop ev={} reason=no-matching-p-tag map={}",
+            crate::api::logging::short_id(&event.id.to_hex()),
+            map.len(),
+        ),
+    );
+    None
+}
+
+/// Handle a kind-14 Mostro reply received on the global subscription.
+///
+/// The caller has already pinned the author to the active Mostro pubkey and
+/// resolved the addressed trade key via [`resolve_dm_recipient`]. Decrypts
+/// via `mostro_core::transport::unwrap_incoming` and dispatches the recovered
+/// `Message` through `dispatch_mostro_message`.
+async fn handle_global_daemon_message(
+    event: &nostr_sdk::prelude::Event,
+    recipient: (String, nostr_sdk::prelude::Keys, u32),
+) {
+    let (recipient_hex, recipient_keys, trade_idx) = recipient;
 
     let eid = event.id.to_hex();
     if is_duplicate_daemon_message(&eid) {
@@ -3097,8 +3812,21 @@ fn admin_pubkey_from_payload(
 /// rejects it (`InvalidPeer`, #326). This mirrors the v1 client, which keys the
 /// trade index by daemon UUID and never by order content.
 async fn bridge_fingerprint_trade_index(order_id: &str, trade_idx: u32) {
-    if get_trade_key_index(order_id).await.is_none() {
+    // "No binding yet" is the case this function exists to handle, so the
+    // warning variant would fire on the normal path.
+    if lookup_trade_key_index(order_id).await.is_none() {
         store_trade_key_index(order_id, trade_idx).await;
+    }
+}
+
+/// The daemon's dispute UUID out of a `Dispute` payload.
+fn dispute_id_from_payload(
+    payload: Option<&mostro_core::message::Payload>,
+) -> Option<String> {
+    use mostro_core::message::Payload;
+    match payload {
+        Some(Payload::Dispute(id, _)) => Some(id.to_string()),
+        _ => None,
     }
 }
 
@@ -3108,7 +3836,21 @@ async fn bridge_fingerprint_trade_index(order_id: &str, trade_idx: u32) {
 ///
 /// Shared by the live subscription loop and the node-switch refetch so both
 /// paths populate the book identically.
-async fn ingest_order_event(event: &nostr_sdk::Event) {
+/// When an ingested event reaches subscribers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Publish {
+    /// At most one emission per coalescing window — the relay firehose, where
+    /// events arrive faster than the UI can consume whole-book snapshots.
+    Coalesced,
+    /// Bulk ingest: the caller publishes once for the whole batch.
+    WhenBatchEnds,
+}
+
+async fn ingest_order_event(event: &nostr_sdk::prelude::Event) {
+    ingest_order_event_with(event, Publish::Coalesced).await;
+}
+
+async fn ingest_order_event_with(event: &nostr_sdk::prelude::Event, publish: Publish) {
     log::debug!(
         "[orders] event kind={} author={}",
         event.kind,
@@ -3116,7 +3858,7 @@ async fn ingest_order_event(event: &nostr_sdk::Event) {
     );
     match parse_order_event(event, None) {
         Some(mut info) => {
-            log::info!(
+            log::debug!(
                 "[orders] parsed order id={} kind={:?} status={:?}",
                 info.id,
                 info.kind,
@@ -3134,7 +3876,10 @@ async fn ingest_order_event(event: &nostr_sdk::Event) {
                     &info.payment_method,
                 );
                 log::debug!("[orders] fingerprint check order={} ck={ck}", info.id);
-                if let Some(trade_idx) = get_trade_key_index(&ck).await {
+                // A miss is the expected case here: every order from another
+                // user fails this lookup, so the warning variant would fire
+                // once per ingested event.
+                if let Some(trade_idx) = lookup_trade_key_index(&ck).await {
                     info.is_mine = true;
                     // Bridge content fingerprint → daemon UUID so subsequent
                     // actions (cancel) can look up the trade key by real order ID.
@@ -3200,9 +3945,12 @@ async fn ingest_order_event(event: &nostr_sdk::Event) {
                             )
                             .await
                         {
-                            log::warn!(
-                                "[orders] failed to sync trade status for order={}: {e}",
-                                info.id
+                            crate::api::logging::blog_warn(
+                                "orders",
+                                format!(
+                                    "status not persisted for order={}: {e}",
+                                    crate::api::logging::short_id(&info.id),
+                                ),
                             );
                         }
                     }
@@ -3213,7 +3961,24 @@ async fn ingest_order_event(event: &nostr_sdk::Event) {
                     }
                 }
             }
-            order_book().upsert_order(info).await;
+            // Whether this order is *ours*, which is not what `is_mine`
+            // answers: that flag means "I am the maker". `parse_order_event`
+            // hardcodes it to false, and the fingerprint restoration above only
+            // recovers maker orders, so an order we *took* arrives with
+            // `is_mine == false` and is indistinguishable from a stranger's at
+            // this layer. What both roles do have is a trade-key binding for
+            // the order id, so that is the question asked.
+            //
+            // Asked only when the answer can change what happens — a
+            // hard-terminal order — so the firehose of pending updates never
+            // pays for the lookup. It is answered from the in-memory map or the
+            // negative cache in the common case, which also keeps it correct on
+            // web, where the trade store is a stub (#233) and a DB-only test
+            // would call every trade of ours a stranger's.
+            let ours = info.is_mine
+                || (is_hard_terminal(&info.status)
+                    && lookup_trade_key_index(&info.id).await.is_some());
+            order_book().apply_ingested_order(info, ours, publish).await;
         }
         None => {
             log::warn!(
@@ -3239,7 +4004,7 @@ async fn _run_order_subscription() {
 
     // The Mostro daemon is the author of all Kind 38383 events.
     // Use the compiled-in default pubkey (mirrors config.rs / settings screen).
-    let mostro_pubkey = match nostr_sdk::PublicKey::from_hex(&crate::config::active_mostro_pubkey())
+    let mostro_pubkey = match nostr_sdk::prelude::PublicKey::from_hex(&crate::config::active_mostro_pubkey())
     {
         Ok(pk) => pk,
         Err(e) => {
@@ -3272,47 +4037,56 @@ async fn _run_order_subscription() {
 
     crate::api::logging::blog_info("orders", "subscriptions active — waiting for events".to_string());
 
-    use nostr_sdk::RelayPoolNotification;
+    use nostr_sdk::prelude::{ClientNotification, StreamExt};
 
     loop {
-        match rx.recv().await {
-            Ok(RelayPoolNotification::Event { event, .. }) => {
+        match rx.next().await {
+            Some(ClientNotification::Event { event, .. }) => {
                 // Resolve the *current* active node for each event so a node
                 // switch is respected without restarting this loop.
                 let Ok(active_mostro) =
-                    nostr_sdk::PublicKey::from_hex(&active_mostro_pubkey())
+                    nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey())
                 else {
                     continue;
                 };
 
                 // ── Kind 14 NIP-44 Mostro reply: decrypt and dispatch ──
-                if event.kind == nostr_sdk::Kind::PrivateDirectMessage {
+                if event.kind == nostr_sdk::prelude::Kind::PrivateDirectMessage {
                     // Disambiguate from NIP-17 peer chat (also kind 14): only
                     // the active node may author a Mostro reply.
                     if event.pubkey != active_mostro {
                         continue;
                     }
-                    let keys = global_dm_keys().read().await.clone();
-                    handle_global_daemon_message(&event, &keys).await;
+                    if let Some(recipient) = resolve_dm_recipient(&event).await {
+                        handle_global_daemon_message(&event, recipient).await;
+                    }
+                    continue;
+                }
+
+                // Everything below is authored by the active node only.
+                // Ignore stale events from a previously-active node (e.g.
+                // buffered across a node switch): the book only ever holds
+                // the active node's orders, and only its relay list is applied.
+                if event.pubkey != active_mostro {
+                    continue;
+                }
+
+                // ── Kind 10002 relay list: auto-add announced relays ──
+                if event.kind.as_u16() == crate::nostr::relay_list::KIND_RELAY_LIST {
+                    crate::api::nostr::apply_relay_list_event(&event).await;
                     continue;
                 }
 
                 // ── Kind 38383 order book event ──
-                // Ignore stale orders from a previously-active node (e.g. events
-                // buffered across a node switch); the book only ever holds the
-                // active node's orders.
-                if event.pubkey != active_mostro {
-                    continue;
-                }
                 ingest_order_event(&event).await;
             }
             // Raw relay control messages. Observation only — every arm just
             // logs. CLOSED and NOTICE are anomalies (a relay refusing or
             // complaining about a subscription) that were previously
             // swallowed by the catch-all and undiagnosable in the field.
-            Ok(RelayPoolNotification::Message { relay_url, message }) => {
-                use nostr_sdk::RelayMessage;
-                match message {
+            Some(ClientNotification::Message { relay_url, message }) => {
+                use nostr_sdk::prelude::RelayMessage;
+                match *message {
                     // Ground truth for delivery questions: this fires for
                     // every frame the relay pushes, BEFORE the SDK's
                     // first-time-seen dedup that gates the Event
@@ -3377,17 +4151,13 @@ async fn _run_order_subscription() {
                     _ => {}
                 }
             }
-            Ok(RelayPoolNotification::Shutdown) => {
+            Some(ClientNotification::Shutdown) => {
                 log::info!("[orders] relay pool shutdown — subscription loop exiting");
                 break;
             }
-            Err(broadcast::error::RecvError::Closed) => {
-                log::warn!("[orders] notification channel closed");
+            None => {
+                log::warn!("[orders] notification stream closed");
                 break;
-            }
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                log::warn!("[orders] lagged by {n} messages");
-                continue;
             }
         }
     }
@@ -3503,7 +4273,15 @@ impl OrdersStream {
         loop {
             match self.rx.recv().await {
                 Ok(orders) => return Some(orders),
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                // Each message is a full snapshot, so dropping some is
+                // survivable: the next one carries the whole book. Log it
+                // anyway — this is the only backpressure signal there is, and
+                // it stops being harmless the moment this channel carries
+                // deltas instead of snapshots.
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    log::warn!("[orders] order-book stream lagged, dropped {n} snapshots");
+                    continue;
+                }
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
         }
@@ -3516,8 +4294,8 @@ impl OrdersStream {
 // `upsert_order`. Kept as a reusable helper for future event-processing paths.
 #[allow(dead_code)]
 pub(crate) async fn process_order_event(
-    event: &nostr_sdk::Event,
-    my_pubkey: Option<&nostr_sdk::PublicKey>,
+    event: &nostr_sdk::prelude::Event,
+    my_pubkey: Option<&nostr_sdk::prelude::PublicKey>,
 ) {
     if let Some(order) = parse_order_event(event, my_pubkey) {
         order_book().upsert_order(order).await;
@@ -3559,23 +4337,33 @@ pub async fn get_trade_role(order_id: String) -> Result<Option<crate::api::types
     }
 }
 
+/// Coerce a wire trade index (`i64`) into a usable counter value, or `None`.
+///
+/// Trade indexes cross the wire as `i64` (restore payloads, the
+/// `LastTradeIndex` reply). A value that is negative or `>= u32::MAX` is not a
+/// real trade index: negatives are nonsense, and `u32::MAX` is the reserved
+/// terminal index — storing it as the counter would make the next
+/// `derive_trade_key` compute `u32::MAX + 1` and overflow (panic in debug, wrap
+/// to 0 in release, reissuing index 0 — the exact key-reuse the resync
+/// prevents). Such a value is dropped rather than truncated into the counter.
+fn sanitize_trade_index(i: i64) -> Option<u32> {
+    u32::try_from(i).ok().filter(|&v| v < u32::MAX)
+}
+
 /// Highest trade-key index across all recovered orders and disputes (#217).
 ///
 /// The counter must be raised to this so the next `derive_trade_key()` cannot
 /// hand out an index a recovered trade already owns. Returns `None` when the
-/// restore carried no trades (nothing to resync to). Indexes are `i64` on the
-/// wire; a value that is negative or beyond `u32::MAX` is not a real trade
-/// index, so it is dropped rather than truncated into the counter.
+/// restore carried no trades (nothing to resync to).
+///
+/// NOTE (#328): this is only a *lower bound* of the daemon's real counter —
+/// the restore payload lists only non-finalized orders, so a finalized trade
+/// holding a higher index is invisible here. `restore_session` sources its
+/// resync floor from `last_trade_index()` (authoritative) and falls back to
+/// this only when the daemon does not answer.
 fn recovered_max_trade_index(
     info: &mostro_core::message::RestoreSessionInfo,
 ) -> Option<u32> {
-    // A single adapter drops both negatives and any value >= u32::MAX — neither
-    // is a real trade index, and truncating one into a small u32 could corrupt
-    // the counter this exists to protect. u32::MAX itself is dropped: it is the
-    // reserved terminal index, and storing it as the counter would make the next
-    // derive_trade_key compute u32::MAX + 1 and overflow (panic in debug, wrap to
-    // 0 in release — reissuing index 0, the exact key-reuse this resync prevents).
-    // Collapsed into one filter_map so the two conditions can't drift apart.
     let all: Vec<i64> = info
         .restore_orders
         .iter()
@@ -3583,10 +4371,7 @@ fn recovered_max_trade_index(
         .chain(info.restore_disputes.iter().map(|d| d.trade_index))
         .collect();
     let total = all.len();
-    let valid: Vec<u32> = all
-        .into_iter()
-        .filter_map(|i| u32::try_from(i).ok().filter(|&v| v < u32::MAX))
-        .collect();
+    let valid: Vec<u32> = all.iter().copied().filter_map(sanitize_trade_index).collect();
     // A dropped index is not just an odd value: it means the daemon sent
     // something this client's model does not cover, and a silently-lowered
     // floor produces a later CantDo(InvalidTradeIndex) with no breadcrumb. Warn
@@ -3604,6 +4389,270 @@ fn recovered_max_trade_index(
         );
     }
     valid.into_iter().max()
+}
+
+/// Pick the resync floor as the highest of the daemon counter and the
+/// restore-payload maximum (#328).
+///
+/// The daemon's `LastTradeIndex` answer (`daemon_counter`) is authoritative and
+/// is the real high-water mark, including finalized trades. The payload maximum
+/// is a proven lower bound — every recovered order carries its own index.
+///
+/// Against a consistent daemon the counter is always `>=` the payload maximum:
+/// the daemon raises `last_trade_index` to every index it accepts
+/// (`update_user_trade_index`) and rejects any index it has already seen, so an
+/// order it still returns in the restore payload was necessarily seen at or
+/// below the counter. Taking the max is therefore a no-op in practice — kept as
+/// cheap defense-in-depth so the floor stays correct independent of that
+/// invariant: a stale/partial reply or a daemon bug can never make us resync
+/// below a recovered trade's own index and reuse its key. Returns `None` only
+/// when neither source has a usable index.
+fn resync_floor(
+    daemon_counter: Option<u32>,
+    info: &mostro_core::message::RestoreSessionInfo,
+) -> Option<u32> {
+    let payload_max = recovered_max_trade_index(info);
+    match (daemon_counter, payload_max) {
+        (Some(daemon), Some(payload)) => {
+            if payload > daemon {
+                // The invariant argued above says this cannot happen against a
+                // consistent daemon — so seeing it means a stale/partial reply
+                // or a daemon bug, the same "the daemon sent something this
+                // client's model does not cover" class
+                // recovered_max_trade_index already warns about. The behaviour
+                // (take the payload bound) is right; the silence would not be.
+                crate::api::logging::blog_warn(
+                    "restore",
+                    format!(
+                        "LastTradeIndex counter {daemon} is below the restore \
+                         payload max {payload} — inconsistent daemon reply; \
+                         resyncing to the payload bound"
+                    ),
+                );
+            }
+            Some(daemon.max(payload))
+        }
+        (daemon, payload) => daemon.or(payload),
+    }
+}
+
+/// True only for the reply to THIS `LastTradeIndex` request: the action
+/// matches and the daemon echoed our correlation nonce
+/// (`mostro/src/app/last_trade_index.rs` copies `request_id` into the reply).
+///
+/// A replayed reply from an earlier request carries a different nonce — or
+/// none: mostro-cli sends this action with `request_id: None`
+/// (`src/cli/last_trade_index.rs`), so nonce-less replies for the same account
+/// exist in the wild wherever the user also runs the CLI. Accepting `None`
+/// would readmit exactly those replays. This is deliberately stricter than
+/// the spec — <https://mostro.network/protocol/last_trade_index.html>
+/// documents no `request_id` on either side — so a conforming daemon that
+/// never echoes one falls back to the restore-payload maximum, the same
+/// designed path as a silent daemon.
+fn is_matching_last_trade_index_reply(
+    kind: &mostro_core::message::MessageKind,
+    request_id: u64,
+) -> bool {
+    kind.action == mostro_core::message::Action::LastTradeIndex
+        && kind.request_id == Some(request_id)
+}
+
+/// True for the daemon's refusal of THIS request: `CantDo` echoing our nonce.
+///
+/// The daemon currently answers `LastTradeIndex` with `CantDo(NotFound)` when
+/// the account is unknown — an identity with no trade history on this node,
+/// and every privacy-mode request, since without an identity proof there is no
+/// account to look up — and `CantDo(InvalidTradeIndex)` when the stored
+/// counter is 0 (where the spec instead says the counter comes back as 1;
+/// either way the caller ends at the payload fallback). Both echo
+/// `request_id` (`mostro/src/app.rs` routes `MostroCantDo` through
+/// `enqueue_cant_do_msg` with the request's id).
+/// Treating them as terminal turns a full REPLY_TIMEOUT stall on those paths
+/// into an immediate, logged fallback.
+fn is_matching_cant_do_refusal(
+    kind: &mostro_core::message::MessageKind,
+    request_id: u64,
+) -> bool {
+    kind.action == mostro_core::message::Action::CantDo
+        && kind.request_id == Some(request_id)
+}
+
+/// Ask the daemon for its authoritative last-known trade index (#328).
+///
+/// The rumor is authored by `sender_keys` — the fresh trade key the caller
+/// (`restore_session`) already derived — like every other daemon-bound event:
+/// the outer kind-14 must never be authored by the master identity pubkey,
+/// which would publish a permanent identity→Mostro link on every relay. The
+/// daemon resolves the account from the encrypted identity proof
+/// (`event.identity`) and replies to the rumor author (`event.sender`), so the
+/// reply is a kind-14 addressed to the trade key, carrying the counter in
+/// `MessageKind::trade_index`. The identity keys come from
+/// `get_transport_identity_keys` — the privacy-toggle gate: in full-privacy
+/// mode no proof is attached, the daemon finds no account and refuses with
+/// `CantDo(NotFound)`, and the caller takes the payload fallback (privacy mode
+/// has no stable account to ask about).
+///
+/// Returns `Ok(Some(idx))` with the sanitized counter, or `Ok(None)` when the
+/// daemon refuses (`CantDo`), does not answer within the timeout, or the reply
+/// carries no usable index — the caller then falls back to
+/// `recovered_max_trade_index`.
+///
+/// This is a self-contained request/reply (own subscription + inline wait, like
+/// mostro-cli's `wait_for_dm`) rather than a `pending_requests` record: the
+/// reply also reaches the global dispatch path (the trade key is in the bulk
+/// coverage), which ignores it — the restore's pending record was already
+/// consumed — while this loop correlates by its own nonce.
+async fn last_trade_index(sender_keys: &nostr_sdk::prelude::Keys) -> Result<Option<u32>> {
+    use nostr_sdk::prelude::{ClientNotification, StreamExt};
+    use crate::rt::time::{timeout, Duration};
+
+    let trade_pk = sender_keys.public_key();
+    let trade_pk_hex = trade_pk.to_hex();
+    let mostro_pubkey = nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey())?;
+    let identity_keys =
+        crate::api::identity::get_transport_identity_keys(sender_keys).await?;
+
+    // Correlation nonce, echoed by the daemon in its reply. Without it any
+    // authenticated LastTradeIndex reply resolves this request, so a malicious
+    // relay could replay an old one. Monotonicity caps the damage (the max in
+    // resync_floor means a stale counter degrades to the payload fallback, the
+    // same as a silent daemon) — but the daemon echoes request_id, so binding
+    // the reply to this request costs nothing.
+    let request_id: u64 = {
+        use rand::RngCore;
+        rand::rngs::OsRng.next_u64().max(1) // 0 is indistinguishable from "unset"
+    };
+
+    // Build the event BEFORE subscribing: wrap_message_first_contact awaits the
+    // PoW capability snapshot and mines the PoW synchronously, so building
+    // after subscribe would start the relay-side auto-close early and shrink
+    // the usable reply window by the PoW + publish cost — at a high
+    // pow_first_contact on a slow device the relay could CLOSE before the
+    // request is even published.
+    let event_json =
+        actions::last_trade_index(&identity_keys, sender_keys, &mostro_pubkey, request_id)
+            .await?;
+
+    let pool = crate::api::nostr::get_pool()?;
+    let client = pool.client();
+
+    // Grab the notifications receiver BEFORE subscribing so the reply can't
+    // arrive in the gap between subscribe and the first recv.
+    let mut rx = client.notifications();
+
+    // This query, unlike the restore itself, has a fallback (the payload
+    // maximum), so a shorter wait halves the worst-case restore latency
+    // against a silent daemon. Shared by the relay-side auto-close and the
+    // outer wait loop — both started at subscribe below, so the two budgets
+    // actually run together.
+    const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+    // limit(0): live-only, same rationale as subscribe_daemon_messages — the
+    // reply is published after we subscribe, and we never want a replayed
+    // historical LastTradeIndex to resolve this request.
+    let filter = nostr_sdk::prelude::Filter::new()
+        .kind(nostr_sdk::prelude::Kind::PrivateDirectMessage)
+        .author(mostro_pubkey)
+        .pubkey(trade_pk)
+        .limit(0);
+    // Auto-close the relay-side subscription — this is a one-shot request/reply
+    // (mostro-cli's wait_for_dm shape), not a long-lived watcher. Leaving the
+    // CLOSE to manual bookkeeping is the leak class #182/#255 address.
+    // WaitDurationAfterEOSE, not WaitForEventsAfterEOSE(1): the recipient is
+    // the restore's trade key, so a late-propagating duplicate of the restore
+    // reply matches this filter too and would consume a one-event budget before
+    // the LastTradeIndex reply arrives. Holding the subscription open for the
+    // full reply window closes it deterministically on every path without that
+    // race. Auto-close subs are deliberately excluded from reconnect
+    // re-subscription (correct here: if the socket drops mid-request we fall
+    // back to the payload maximum by design).
+    let close_opts = nostr_sdk::prelude::SubscribeAutoCloseOptions::default()
+        .exit_policy(nostr_sdk::prelude::ReqExitPolicy::WaitDurationAfterEOSE(
+            REPLY_TIMEOUT,
+        ))
+        .timeout(Some(REPLY_TIMEOUT));
+    if let Err(e) = client.subscribe(filter).close_on(close_opts).await {
+        log::warn!("[orders] last_trade_index subscribe failed: {e}");
+        return Ok(None);
+    }
+    // Client-side deadline, started at subscribe time — the same instant the
+    // relay-side auto-close starts — so both give up together.
+    let start = crate::rt::time::Instant::now();
+
+    publish_event_json(&event_json).await?;
+    crate::api::logging::blog_info(
+        "restore",
+        "LastTradeIndex published — waiting for daemon".to_string(),
+    );
+
+    loop {
+        let remaining = REPLY_TIMEOUT.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        match timeout(remaining, rx.next()).await {
+            Ok(Some(ClientNotification::Event { event, .. })) => {
+                if event.kind != nostr_sdk::prelude::Kind::PrivateDirectMessage
+                    || event.pubkey != mostro_pubkey
+                {
+                    continue;
+                }
+                let is_for_us = event.tags.iter().any(|t| {
+                    let s = t.as_slice();
+                    s.first().map(|v| v.as_str()) == Some("p")
+                        && s.get(1).map(|v| v.as_str()) == Some(trade_pk_hex.as_str())
+                });
+                if !is_for_us {
+                    continue;
+                }
+                match crate::nostr::transport::unwrap_mostro_message(sender_keys, &event).await {
+                    Ok(Some(unwrapped)) => {
+                        // Authenticate: the kind-14 author must be the node.
+                        if unwrapped.sender != mostro_pubkey {
+                            continue;
+                        }
+                        let kind = unwrapped.message.get_inner_message_kind();
+                        if is_matching_last_trade_index_reply(kind, request_id) {
+                            let idx = kind.trade_index.and_then(sanitize_trade_index);
+                            crate::api::logging::blog_info("restore", format!(
+                                "LastTradeIndex reply: trade_index={:?} -> floor={idx:?}",
+                                kind.trade_index
+                            ));
+                            return Ok(idx);
+                        }
+                        if is_matching_cant_do_refusal(kind, request_id) {
+                            let reason = match &kind.payload {
+                                Some(mostro_core::message::Payload::CantDo(Some(r))) => {
+                                    format!("{r:?}")
+                                }
+                                _ => "unspecified".to_string(),
+                            };
+                            crate::api::logging::blog_warn("restore", format!(
+                                "LastTradeIndex refused: CantDo({reason}) — \
+                                 falling back to restore payload max"
+                            ));
+                            return Ok(None);
+                        }
+                        continue;
+                    }
+                    Ok(None) => continue,
+                    Err(e) => {
+                        log::warn!("[orders] last_trade_index decrypt failed: {e}");
+                        continue;
+                    }
+                }
+            }
+            Ok(Some(ClientNotification::Shutdown)) | Ok(None) => break,
+            Err(_) => break, // timeout
+            Ok(Some(_)) => continue,
+        }
+    }
+    crate::api::logging::blog_warn(
+        "restore",
+        "LastTradeIndex: no usable daemon reply — falling back to restore payload max"
+            .to_string(),
+    );
+    Ok(None)
 }
 
 /// Send a `RestoreSession` to the active daemon and return the user's active
@@ -3626,7 +4675,7 @@ pub async fn restore_session() -> Result<mostro_core::message::RestoreSessionInf
     ensure_global_dm_coverage(&sender_keys, trade_index).await;
     let trade_pk_hex = sender_keys.public_key().to_hex();
 
-    let mostro_pubkey = nostr_sdk::PublicKey::from_hex(&active_mostro_pubkey())?;
+    let mostro_pubkey = nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey())?;
     // Identity/transport keys sign the Seal -> event.identity (master key).
     let identity_keys =
         crate::api::identity::get_transport_identity_keys(&sender_keys).await?;
@@ -3679,13 +4728,29 @@ pub async fn restore_session() -> Result<mostro_core::message::RestoreSessionInf
 
     match confirmation {
         Ok(Ok(Wake { reply: DaemonReply::Restored(info), .. })) => {
-            // #217: raise trade_key_index past every recovered trade before
-            // returning, so the next derive_trade_key() can't reuse a key a
-            // recovered trade already owns. Monotonic and idempotent. A persist
-            // failure fails the restore: an un-resynced counter reopens the
-            // key-reuse bug this closes, so silent success would be worse than
-            // a surfaced error the caller can retry.
-            if let Some(floor) = recovered_max_trade_index(&info) {
+            // #217: raise trade_key_index before returning, so the next
+            // derive_trade_key() can't reuse a key a recovered trade already
+            // owns. Monotonic and idempotent. A persist failure fails the
+            // restore: an un-resynced counter reopens the key-reuse bug this
+            // closes, so silent success would be worse than a surfaced error
+            // the caller can retry.
+            //
+            // #328: the authoritative floor is the daemon's LastTradeIndex
+            // counter. The restore payload lists only non-finalized orders, so
+            // recovered_max_trade_index is a lower bound (a finalized trade
+            // holding a higher index is invisible) — kept only as a fallback
+            // for when the daemon does not answer.
+            let daemon_counter = match last_trade_index(&sender_keys).await {
+                Ok(idx) => idx,
+                Err(e) => {
+                    crate::api::logging::blog_warn("restore", format!(
+                        "LastTradeIndex request errored ({e}); \
+                         falling back to restore payload max"
+                    ));
+                    None
+                }
+            };
+            if let Some(floor) = resync_floor(daemon_counter, &info) {
                 crate::api::identity::ensure_trade_key_index_at_least(floor).await?;
             }
             Ok(info)
@@ -3705,7 +4770,361 @@ pub async fn restore_session() -> Result<mostro_core::message::RestoreSessionInf
 mod tests {
     use super::*;
     use crate::api::types::TradeRole;
+    use crate::mostro::pending::register_dispute_request;
     use crate::mostro::session::session_manager;
+
+    /// Nothing ever displays a stranger's finished order — the book filters to
+    /// Pending for display — but every one of them was kept for the life of
+    /// the process, inflating every snapshot clone and every bridge payload.
+    #[tokio::test]
+    async fn a_strangers_finished_order_leaves_the_book() {
+        let book = OrderBook::new();
+        let mut done = dummy_order_info("stranger-done");
+        done.is_mine = false;
+        done.status = crate::api::types::OrderStatus::Pending;
+        book.upsert_order(done.clone()).await;
+        assert!(book.get_order("stranger-done").await.is_some());
+
+        done.status = crate::api::types::OrderStatus::Success;
+        book.apply_ingested_order(done, false, Publish::Coalesced).await;
+
+        assert!(
+            book.get_order("stranger-done").await.is_none(),
+            "a finished order nobody can act on should not be retained"
+        );
+    }
+
+    /// Orders of ours stay: the trade detail screen looks them up in the book
+    /// by id after the trade finishes.
+    #[tokio::test]
+    async fn our_own_finished_order_stays_in_the_book() {
+        let book = OrderBook::new();
+        let mut mine = dummy_order_info("mine-done");
+        mine.status = crate::api::types::OrderStatus::Success;
+
+        book.apply_ingested_order(mine, true, Publish::Coalesced).await;
+
+        assert!(
+            book.get_order("mine-done").await.is_some(),
+            "our own history must remain addressable by id"
+        );
+    }
+
+    /// Build a signed Kind 38383 event for `order_id` at `status`, the shape
+    /// the relay feed delivers.
+    fn book_event(order_id: &str, status: &str) -> nostr_sdk::prelude::Event {
+        use nostr::event::FinalizeEvent;
+        use nostr_sdk::prelude::{EventBuilder, Keys, Kind, Tag};
+        EventBuilder::new(Kind::from(38383u16), "")
+            .tags([
+                Tag::parse(["d", order_id]).unwrap(),
+                Tag::parse(["k", "sell"]).unwrap(),
+                Tag::parse(["s", status]).unwrap(),
+                Tag::parse(["f", "USD"]).unwrap(),
+                Tag::parse(["pm", "cashapp"]).unwrap(),
+                Tag::parse(["premium", "1"]).unwrap(),
+                Tag::parse(["amt", "0"]).unwrap(),
+                Tag::parse(["fa", "20"]).unwrap(),
+                Tag::parse(["z", "order"]).unwrap(),
+            ])
+            .finalize(&Keys::generate())
+            .unwrap()
+    }
+
+    /// The regression this PR was one predicate away from shipping: an order we
+    /// **took** arrives with `is_mine == false` — `parse_order_event` hardcodes
+    /// it and the fingerprint restoration only recovers *maker* orders — so a
+    /// prune keyed on `is_mine` alone drops it the moment the trade succeeds,
+    /// and the trade-detail screen the app navigates to right afterwards loses
+    /// the amount, the currency and the created-at line it reads from the book.
+    ///
+    /// The trade-key binding is what both roles have, so that is what decides.
+    #[tokio::test]
+    async fn a_finished_order_we_took_survives_ingest() {
+        // Arrange — in the book as pending, with a trade key of ours bound to
+        // it, which is what taking an order leaves behind.
+        let order_id = uuid::Uuid::new_v4().to_string();
+        order_book().upsert_order(dummy_order_info(&order_id)).await;
+        store_trade_key_index(&order_id, 7).await;
+
+        // Act — the daemon publishes the finished order.
+        ingest_order_event_with(&book_event(&order_id, "success"), Publish::WhenBatchEnds).await;
+
+        // Assert
+        assert!(
+            order_book().get_order(&order_id).await.is_some(),
+            "an order we took must stay addressable once it finishes"
+        );
+        order_book().remove_order(&order_id).await;
+    }
+
+    /// The other half: with no binding and no `is_mine`, the same event is a
+    /// stranger's finished order and leaves.
+    #[tokio::test]
+    async fn a_finished_order_of_a_strangers_is_dropped_by_ingest() {
+        // Arrange
+        let order_id = uuid::Uuid::new_v4().to_string();
+        order_book().upsert_order(dummy_order_info(&order_id)).await;
+
+        // Act
+        ingest_order_event_with(&book_event(&order_id, "success"), Publish::WhenBatchEnds).await;
+
+        // Assert
+        assert!(
+            order_book().get_order(&order_id).await.is_none(),
+            "nothing can ever act on a stranger's finished order"
+        );
+    }
+
+    /// A removal that removed nothing must not publish: a stranger's order
+    /// finishing unseen is the common case on a busy node, and every emission
+    /// carries the whole book across the bridge.
+    #[tokio::test]
+    async fn dropping_an_order_that_was_never_in_the_book_publishes_nothing() {
+        let book = OrderBook::new();
+        let mut stream = book.subscribe();
+        let mut unseen = dummy_order_info("never-seen");
+        unseen.status = crate::api::types::OrderStatus::Canceled;
+
+        book.apply_ingested_order(unseen, false, Publish::Coalesced).await;
+
+        assert!(
+            stream.try_recv().is_err(),
+            "a no-op removal must not send a whole-book snapshot"
+        );
+    }
+
+    /// A cached miss that outlived the key being created would make the order
+    /// look like somebody else's, and every later action on it would be signed
+    /// with the wrong key. Storing a key must clear its recorded miss.
+    #[tokio::test]
+    async fn storing_a_trade_key_clears_its_recorded_miss() {
+        let order_id = format!("neg-cache-{}", uuid::Uuid::new_v4());
+        note_trade_key_miss(&order_id);
+        assert!(trade_key_misses().read().unwrap().contains(&order_id));
+
+        store_trade_key_index(&order_id, 7).await;
+
+        assert!(
+            !trade_key_misses().read().unwrap().contains(&order_id),
+            "the miss must not survive the key it denies"
+        );
+    }
+
+    /// The miss set is a cache, not a record: it must not grow without bound
+    /// as strangers' orders stream past.
+    #[test]
+    fn the_miss_cache_stays_bounded() {
+        let mut misses = std::collections::HashSet::new();
+
+        for n in 0..(TRADE_KEY_MISS_CAPACITY * 2) {
+            record_miss(&mut misses, &format!("bound-{n}"));
+        }
+
+        assert!(
+            misses.len() <= TRADE_KEY_MISS_CAPACITY,
+            "miss cache grew to {}",
+            misses.len()
+        );
+    }
+
+    /// A refetch replays the node's whole book through ingest. Publishing per
+    /// event made that O(N²) in clones and in bridge payload, so the batch
+    /// must produce exactly one emission.
+    #[tokio::test]
+    async fn a_bulk_ingest_publishes_once_for_the_whole_batch() {
+        const BATCH: usize = 50;
+        let book = OrderBook::new();
+        let mut rx = book.subscribe();
+
+        for n in 0..BATCH {
+            book.upsert_order_deferred(dummy_order_info(&format!("bulk-{n}")))
+                .await;
+        }
+
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "a deferred upsert must not publish"
+        );
+
+        book.publish().await;
+
+        let snapshot = rx.try_recv().expect("the batch publishes one snapshot");
+        assert_eq!(snapshot.len(), BATCH, "the snapshot carries the whole book");
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "the batch must publish exactly once"
+        );
+    }
+
+    /// Daemon-message handlers and user actions still emit immediately:
+    /// both deferring and coalescing are opt-in.
+    #[tokio::test]
+    async fn a_direct_upsert_still_publishes_immediately() {
+        let book = OrderBook::new();
+        let mut rx = book.subscribe();
+
+        book.upsert_order(dummy_order_info("live-1")).await;
+
+        let snapshot = rx.try_recv().expect("a direct upsert publishes");
+        assert_eq!(snapshot.len(), 1);
+    }
+
+    /// A relay firehose delivers many 38383 events back to back. Each one
+    /// publishing a whole-book snapshot is what makes a busy book expensive,
+    /// so a burst inside one window must collapse to a single emission.
+    #[tokio::test]
+    async fn live_relay_updates_coalesce_into_one_emission() {
+        const BURST: usize = 20;
+        let book = OrderBook::new();
+        let mut rx = book.subscribe();
+
+        for n in 0..BURST {
+            book.upsert_order_coalesced(dummy_order_info(&format!("burst-{n}")))
+                .await;
+        }
+
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "nothing should be published before the window closes"
+        );
+
+        crate::rt::time::sleep(std::time::Duration::from_millis(
+            PUBLISH_COALESCE_MS * 4,
+        ))
+        .await;
+
+        let snapshot = rx.try_recv().expect("the window publishes once");
+        assert_eq!(snapshot.len(), BURST, "the snapshot carries the whole burst");
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "one emission per window, not one per event"
+        );
+    }
+
+    /// The window must re-arm, or the book would publish once and then go
+    /// silent for the rest of the session.
+    #[tokio::test]
+    async fn a_later_update_opens_a_new_window() {
+        let book = OrderBook::new();
+        let mut rx = book.subscribe();
+        let settle = || {
+            crate::rt::time::sleep(std::time::Duration::from_millis(
+                PUBLISH_COALESCE_MS * 4,
+            ))
+        };
+
+        book.upsert_order_coalesced(dummy_order_info("first")).await;
+        settle().await;
+        assert_eq!(rx.try_recv().expect("first window").len(), 1);
+
+        book.upsert_order_coalesced(dummy_order_info("second")).await;
+        settle().await;
+        assert_eq!(rx.try_recv().expect("second window").len(), 2);
+    }
+
+    /// `global_dm_keys()` is a process-global shared by every test in this
+    /// binary, and tests run in parallel: the entry is removed before the
+    /// assertions so a failure here cannot leave the map grown for whoever
+    /// runs next (`a_late_derived_key_joins_the_global_dm_coverage` asserts
+    /// on its size).
+    #[tokio::test]
+    async fn dm_recipient_is_resolved_from_the_p_tag() {
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Kind, Tag};
+
+        let mine = nostr_sdk::prelude::Keys::generate();
+        let mine_hex = mine.public_key().to_hex();
+        let stranger = nostr_sdk::prelude::Keys::generate();
+
+        let addressed_to_us = EventBuilder::new(Kind::PrivateDirectMessage, "")
+            .tags([Tag::parse(["p", &mine_hex]).unwrap()])
+            .finalize(&nostr_sdk::prelude::Keys::generate())
+            .unwrap();
+        // A stranger's key is never inserted, so this one resolves to None
+        // whatever else the shared map happens to hold.
+        let addressed_elsewhere = EventBuilder::new(Kind::PrivateDirectMessage, "")
+            .tags([Tag::parse(["p", &stranger.public_key().to_hex()]).unwrap()])
+            .finalize(&nostr_sdk::prelude::Keys::generate())
+            .unwrap();
+
+        global_dm_keys()
+            .write()
+            .await
+            .insert(mine_hex.clone(), (mine.clone(), 7));
+        let resolved = resolve_dm_recipient(&addressed_to_us).await;
+        let unresolved = resolve_dm_recipient(&addressed_elsewhere).await;
+        global_dm_keys().write().await.remove(&mine_hex);
+
+        assert!(
+            matches!(resolved, Some((ref hex, _, 7)) if *hex == mine_hex),
+            "p-tag matching one of our trade keys must resolve to it"
+        );
+        assert!(unresolved.is_none());
+    }
+
+    /// The window must recognize a repeat, and must forget an id once
+    /// `DEDUP_MAX_ENTRIES` newer ones have arrived — otherwise it would grow
+    /// without bound.
+    ///
+    /// Driven against a local window rather than `is_duplicate_daemon_message`:
+    /// that one shares a process-global static with every other test in this
+    /// binary, so asserting on it would both depend on and destroy state the
+    /// rest of the suite may touch.
+    #[test]
+    fn daemon_message_dedup_recognizes_repeats_and_evicts_oldest() {
+        let mut window = DedupWindow::default();
+        let id = |n: usize| format!("{n:064x}");
+
+        assert!(!window.record(&id(0)));
+        assert!(window.record(&id(0)));
+
+        // One more than capacity, so id(0) is pushed out of the window.
+        for n in 1..=DEDUP_MAX_ENTRIES {
+            window.record(&id(n));
+        }
+
+        assert!(
+            !window.record(&id(0)),
+            "the oldest id should have been evicted once the window filled"
+        );
+        assert_eq!(
+            window.seen.len(),
+            window.order.len(),
+            "the set and the eviction queue drifted apart"
+        );
+        assert!(
+            window.order.len() <= DEDUP_MAX_ENTRIES,
+            "window grew past its bound: {}",
+            window.order.len()
+        );
+    }
+
+    /// A subscriber that falls behind must resume from the retained window
+    /// rather than closing, and that window is `ORDER_STREAM_CAPACITY` deep.
+    #[tokio::test]
+    async fn a_lagged_orders_stream_resumes_from_the_retained_window() {
+        const SENT: usize = 100;
+        const _: () = assert!(SENT > ORDER_STREAM_CAPACITY, "the test must overflow the channel");
+
+        let book = OrderBook::new();
+        let mut stream = OrdersStream { rx: book.subscribe() };
+
+        // Publish without ever reading, so the receiver is forced to lag.
+        for n in 0..SENT {
+            book.set_orders(vec![dummy_order_info(&format!("order-{n}"))])
+                .await;
+        }
+
+        let recovered = stream
+            .next()
+            .await
+            .expect("a lagged stream must resume, not close");
+        assert_eq!(
+            recovered[0].id,
+            format!("order-{}", SENT - ORDER_STREAM_CAPACITY),
+            "should resume at the oldest snapshot still retained"
+        );
+    }
 
     #[test]
     fn the_solver_pubkey_is_read_from_a_peer_payload() {
@@ -3813,6 +5232,100 @@ mod tests {
             recovered_max_trade_index(&restore_info(vec![-1], vec![huge])),
             None
         );
+    }
+
+    // ── #328 sanitize_trade_index / resync_floor ─────────────────────────────
+    #[test]
+    fn sanitize_trade_index_drops_negative_and_out_of_range() {
+        assert_eq!(sanitize_trade_index(0), Some(0));
+        assert_eq!(sanitize_trade_index(42), Some(42));
+        assert_eq!(sanitize_trade_index(-1), None);
+        // u32::MAX is the reserved terminal index (dropped to avoid +1 overflow).
+        assert_eq!(sanitize_trade_index(i64::from(u32::MAX)), None);
+        assert_eq!(sanitize_trade_index(i64::from(u32::MAX) - 1), Some(u32::MAX - 1));
+        assert_eq!(sanitize_trade_index(i64::from(u32::MAX) + 1), None);
+    }
+
+    #[test]
+    fn resync_floor_takes_the_higher_of_daemon_counter_and_payload_max() {
+        // The #328 scenario: order X open at index 1 (the only non-finalized
+        // trade the restore returns), order Y canceled at index 2. The payload
+        // max is 1, but the daemon's LastTradeIndex counter is 2 — the real
+        // high-water mark — and must win, or the first new order collides.
+        assert_eq!(resync_floor(Some(2), &restore_info(vec![1], vec![])), Some(2));
+        // Defense-in-depth: never resync below a recovered trade's own index.
+        // A consistent daemon cannot answer below an index it still tracks (it
+        // raised last_trade_index when it accepted that order), so this only
+        // guards a stale/partial reply — the payload lower bound then wins.
+        assert_eq!(resync_floor(Some(1), &restore_info(vec![5], vec![])), Some(5));
+        // Daemon present, payload empty -> the daemon value.
+        assert_eq!(resync_floor(Some(7), &restore_info(vec![], vec![])), Some(7));
+    }
+
+    #[test]
+    fn a_replayed_last_trade_index_reply_is_rejected() {
+        use mostro_core::message::{Action, MessageKind};
+
+        let reply = |request_id: Option<u64>| {
+            MessageKind::new(None, request_id, Some(7), Action::LastTradeIndex, None)
+        };
+        // The genuine reply echoes our nonce.
+        assert!(is_matching_last_trade_index_reply(&reply(Some(42)), 42));
+        // A replay of an earlier request's reply carries a different nonce...
+        assert!(!is_matching_last_trade_index_reply(&reply(Some(41)), 42));
+        // ...or none at all — mostro-cli sends this action with no request_id,
+        // so nonce-less replies for the same account exist in the wild and are
+        // exactly the replay material to reject.
+        assert!(!is_matching_last_trade_index_reply(&reply(None), 42));
+        // A different action never matches, even with the right nonce.
+        let other =
+            MessageKind::new(None, Some(42), Some(7), Action::RestoreSession, None);
+        assert!(!is_matching_last_trade_index_reply(&other, 42));
+    }
+
+    #[test]
+    fn a_cant_do_refusal_matches_only_our_nonce() {
+        use mostro_core::message::{Action, MessageKind};
+
+        let refusal = |request_id: Option<u64>| {
+            MessageKind::new(None, request_id, None, Action::CantDo, None)
+        };
+        // The daemon's refusal of THIS request echoes our nonce and is
+        // terminal — the caller falls back immediately instead of stalling.
+        assert!(is_matching_cant_do_refusal(&refusal(Some(42)), 42));
+        // A replayed or foreign CantDo does not resolve this request.
+        assert!(!is_matching_cant_do_refusal(&refusal(Some(41)), 42));
+        assert!(!is_matching_cant_do_refusal(&refusal(None), 42));
+        // The genuine counter reply is not a refusal.
+        let counter =
+            MessageKind::new(None, Some(42), Some(7), Action::LastTradeIndex, None);
+        assert!(!is_matching_cant_do_refusal(&counter, 42));
+    }
+
+    #[test]
+    fn resync_floor_falls_back_to_payload_max_when_daemon_is_silent() {
+        // No LastTradeIndex answer (timeout / error): the restore-payload
+        // maximum is the best available lower bound.
+        assert_eq!(resync_floor(None, &restore_info(vec![3, 9], vec![4])), Some(9));
+        // Nothing anywhere -> no resync (None).
+        assert_eq!(resync_floor(None, &restore_info(vec![], vec![])), None);
+    }
+
+    #[test]
+    fn the_daemon_dispute_id_is_read_from_a_dispute_payload() {
+        use mostro_core::message::Payload;
+
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(
+            dispute_id_from_payload(Some(&Payload::Dispute(id, None))).as_deref(),
+            Some(id.to_string().as_str())
+        );
+
+        // An acceptance carrying no dispute payload leaves the id unknown
+        // rather than inventing one — the acceptance is malformed and
+        // open_dispute fails closed on it.
+        assert_eq!(dispute_id_from_payload(None), None);
+        assert_eq!(dispute_id_from_payload(Some(&Payload::Amount(42))), None);
     }
 
     fn insert_pending_create(key: &str, request_id: u64) -> tokio::sync::oneshot::Receiver<Wake> {
@@ -4012,6 +5525,160 @@ mod tests {
         assert!(!pending_requests().lock().unwrap().contains_key(ai_key));
 
         pending_requests().lock().unwrap().remove(take_key);
+    }
+
+    /// `take_matching_dispute` mirrors the take rules for its own kind: only
+    /// Dispute records, only with the exact nonce.
+    #[tokio::test]
+    async fn take_matching_dispute_only_consumes_dispute_records() {
+        let take_key = "test-dispute-take-pubkey";
+        let dispute_key = "test-dispute-dispute-pubkey";
+        let _rx_t = insert_pending_take(take_key, 71);
+        let _rx_d = register_dispute_request(dispute_key.to_string(), 72, 5);
+
+        // A Take record is never consumed here, even with its exact nonce.
+        assert!(take_matching_dispute(take_key, Some(71)).is_none());
+        assert!(pending_requests().lock().unwrap().contains_key(take_key));
+
+        assert!(take_matching_dispute(dispute_key, None).is_none());
+        assert!(take_matching_dispute(dispute_key, Some(99)).is_none());
+        assert!(matches!(
+            take_matching_dispute(dispute_key, Some(72)),
+            Some(DisputeMatch::Waiting(_))
+        ));
+        assert!(!pending_requests().lock().unwrap().contains_key(dispute_key));
+
+        pending_requests().lock().unwrap().remove(take_key);
+    }
+
+    /// Builds the `UnwrappedMessage` for a daemon reply to an open-dispute,
+    /// signed-by-sender semantics included, for driving the real dispatcher.
+    /// `Action::CantDo` is a `Message::CantDo` on the wire, every other reply
+    /// a `Message::Dispute` — the arms are reached through the dispatcher, not
+    /// re-implemented in the test.
+    fn dispute_reply_message(
+        order_uuid: uuid::Uuid,
+        request_id: u64,
+        trade_index: u32,
+        action: mostro_core::message::Action,
+        payload: Option<mostro_core::message::Payload>,
+    ) -> mostro_core::nip59::UnwrappedMessage {
+        use mostro_core::message::{Action, Message};
+
+        let message = match action {
+            Action::CantDo => Message::cant_do(Some(order_uuid), Some(request_id), payload),
+            other => Message::new_dispute(
+                Some(order_uuid),
+                Some(request_id),
+                Some(trade_index as i64),
+                other,
+                payload,
+            ),
+        };
+        let sender =
+            nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey()).expect("valid mostro pubkey");
+        mostro_core::nip59::UnwrappedMessage {
+            message,
+            signature: None,
+            sender,
+            identity: sender,
+            created_at: nostr_sdk::prelude::Timestamp::from(0u64),
+        }
+    }
+
+    /// The acceptance, through the real dispatcher: its `DisputeInitiatedByYou`
+    /// arm must wake the caller with the daemon's dispute id AND still fall
+    /// through to the status arm that moves the trade to Dispute. The matcher's
+    /// own test sees neither half — only this one pins the fall-through the
+    /// arm's comment claims.
+    #[tokio::test]
+    async fn a_dispute_acceptance_wakes_the_caller_and_moves_the_trade() {
+        use crate::api::types::OrderStatus;
+        use mostro_core::message::{Action, Payload};
+
+        let order_uuid = uuid::Uuid::new_v4();
+        let order_id = order_uuid.to_string();
+        let key = "test-dispute-accepted-pubkey";
+        let dispute_uuid = uuid::Uuid::new_v4();
+
+        // A disputable trade, bound to the generation the reply arrives on.
+        let mut info = dummy_order_info(&order_id);
+        info.status = OrderStatus::Active;
+        order_book().upsert_order(info).await;
+        store_trade_key_index(&order_id, 8).await;
+
+        let mut rx = register_dispute_request(key.to_string(), 74, 8);
+
+        dispatch_mostro_message(
+            dispute_reply_message(
+                order_uuid,
+                74,
+                8,
+                Action::DisputeInitiatedByYou,
+                Some(Payload::Dispute(dispute_uuid, None)),
+            ),
+            "test-dispute-accepted",
+            key,
+            8,
+        )
+        .await;
+
+        // The waiting open_dispute gets the daemon's id — the one the solver
+        // and the Kind 38386 event refer to — not a locally minted one.
+        match rx.try_recv() {
+            Ok(Wake { reply: DaemonReply::DisputeAccepted { dispute_id }, .. }) => {
+                assert_eq!(dispute_id, Some(dispute_uuid.to_string()));
+            }
+            _ => panic!("the acceptance must reach the waiting open_dispute"),
+        }
+        assert!(!pending_requests().lock().unwrap().contains_key(key));
+
+        assert_eq!(
+            order_book()
+                .get_order(&order_id)
+                .await
+                .expect("order still cached")
+                .status,
+            OrderStatus::Dispute,
+            "the acceptance is also the status update"
+        );
+    }
+
+    /// #202 itself, driven through the arm that was dropping it: the CantDo arm
+    /// resolves whatever request the nonce identifies, so a registered dispute
+    /// is rejected through the same path as any other request. Before the
+    /// dispute registered one, its rejection matched no pending request and was
+    /// dropped — leaving a local dispute Open forever.
+    #[tokio::test]
+    async fn a_cantdo_rejection_reaches_the_waiting_open_dispute() {
+        use mostro_core::error::CantDoReason;
+        use mostro_core::message::{Action, Payload};
+
+        let order_uuid = uuid::Uuid::new_v4();
+        let key = "test-dispute-cantdo-pubkey";
+        let mut rx = register_dispute_request(key.to_string(), 73, 6);
+
+        dispatch_mostro_message(
+            dispute_reply_message(
+                order_uuid,
+                73,
+                6,
+                Action::CantDo,
+                Some(Payload::CantDo(Some(CantDoReason::NotAllowedByStatus))),
+            ),
+            "test-dispute-cantdo",
+            key,
+            6,
+        )
+        .await;
+
+        match rx.try_recv() {
+            Ok(Wake { reply: DaemonReply::Rejected { reason, .. }, .. }) => {
+                assert_eq!(reason, "NotAllowedByStatus");
+            }
+            _ => panic!("the rejection must reach the waiting open_dispute"),
+        }
+        assert!(!pending_requests().lock().unwrap().contains_key(key));
     }
 
     /// Same-key overlap (send_invoice reuses the take's trade key): a newer
@@ -4326,7 +5993,7 @@ mod tests {
     /// refresh itself is a no-op here: no pool in unit tests.)
     #[tokio::test]
     async fn a_late_derived_key_joins_the_global_dm_coverage() {
-        let keys = nostr_sdk::Keys::generate();
+        let keys = nostr_sdk::prelude::Keys::generate();
         let hex = keys.public_key().to_hex();
 
         ensure_global_dm_coverage(&keys, 91).await;
@@ -4388,7 +6055,7 @@ mod tests {
 
         let mut rx = trade_updates_tx().subscribe();
 
-        let sender = nostr_sdk::PublicKey::from_hex(&active_mostro_pubkey())
+        let sender = nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey())
             .expect("valid mostro pubkey");
         let unwrapped = mostro_core::nip59::UnwrappedMessage {
             message: Message::new_order(
@@ -4401,7 +6068,7 @@ mod tests {
             signature: None,
             sender,
             identity: sender,
-            created_at: nostr_sdk::Timestamp::from(0u64),
+            created_at: nostr_sdk::prelude::Timestamp::from(0u64),
         };
         dispatch_mostro_message(unwrapped, "test-cancel-replay", "ff00ff00", 1).await;
 
@@ -4424,6 +6091,235 @@ mod tests {
             }
         }
         assert!(!leaked, "stale Canceled must not emit a TradeUpdate");
+    }
+
+    /// The startup backlog must not walk a trade's status backwards.
+    ///
+    /// The global kind-14 subscription carries no `since`, so every start
+    /// replays the node's whole history for the order, and relays serve stored
+    /// events newest-first. Applied blindly, the *oldest* message lands last
+    /// and wins: a disputed trade came back as `waiting-buyer-invoice` on every
+    /// restart, with the intermediate states emitted to the UI on the way down.
+    ///
+    /// Replays in that exact order — newest first, none of them terminal, so
+    /// only the ordering rule can refuse them.
+    #[tokio::test]
+    async fn a_replayed_backlog_cannot_walk_the_status_backwards() {
+        use mostro_core::message::{Action, Message};
+
+        let path = std::env::temp_dir()
+            .join(format!("mostro_status_replay_{}.db", std::process::id()));
+        let _ = crate::db::app_db::init_db(path.to_str().unwrap()).await;
+        let db = crate::db::app_db::db().expect("store initialised");
+
+        let order_uuid = uuid::Uuid::new_v4();
+        let order_id = order_uuid.to_string();
+        let order_info = dummy_order_info(&order_id);
+        order_book().upsert_order(order_info.clone()).await;
+        db.save_trade(&crate::api::types::TradeInfo {
+            id: order_id.clone(),
+            order: order_info,
+            role: TradeRole::Seller,
+            counterparty_pubkey: String::new(),
+            current_step: crate::api::types::TradeStep::Seller(
+                crate::api::types::SellerStep::OrderPublished,
+            ),
+            hold_invoice: None,
+            buyer_invoice: None,
+            trade_key_index: 1,
+            cooperative_cancel_state: None,
+            timeout_at: None,
+            started_at: 1,
+            completed_at: None,
+            outcome: None,
+            peer_rating: None,
+            peer_reviews: None,
+            peer_days: None,
+            rated_at: None,
+        })
+        .await
+        .expect("save the trade row");
+
+        let mut rx = trade_updates_tx().subscribe();
+        let sender = nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey())
+            .expect("valid mostro pubkey");
+
+        // Newest first, exactly how the relay hands the backlog back.
+        for (action, created_at) in [
+            (Action::DisputeInitiatedByYou, 3_000u64),
+            (Action::FiatSentOk, 2_000),
+            (Action::WaitingBuyerInvoice, 1_000),
+        ] {
+            dispatch_mostro_message(
+                mostro_core::nip59::UnwrappedMessage {
+                    message: Message::new_order(Some(order_uuid), None, None, action, None),
+                    signature: None,
+                    sender,
+                    identity: sender,
+                    created_at: nostr_sdk::prelude::Timestamp::from(created_at),
+                },
+                &format!("test-backlog-{created_at}"),
+                "ff00ff10",
+                1,
+            )
+            .await;
+        }
+
+        // The newest message is the one that stuck, in both the book...
+        assert_eq!(
+            order_book()
+                .get_order(&order_id)
+                .await
+                .expect("order still cached")
+                .status,
+            crate::api::types::OrderStatus::Dispute,
+            "the newest replayed message must own the status",
+        );
+        // ...and the row My Trades reads.
+        assert_eq!(
+            db.get_trade_by_order_id(&order_id)
+                .await
+                .expect("trade lookup")
+                .expect("trade row")
+                .order
+                .status,
+            crate::api::types::OrderStatus::Dispute,
+            "the persisted status must not walk backwards across a restart",
+        );
+        // The cursor is the high-water mark that survives the restart.
+        assert_eq!(
+            db.get_setting(&crate::db::settings_keys::status_cursor(&order_id))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("3000"),
+            "the applied event's timestamp must be recorded",
+        );
+        // Nothing older reached the UI on the way down: one update, not three.
+        let mut emitted = Vec::new();
+        while let Ok(update) = rx.try_recv() {
+            if update.order_id == order_id {
+                emitted.push(update.status);
+            }
+        }
+        assert_eq!(
+            emitted,
+            vec![crate::api::types::OrderStatus::Dispute],
+            "a refused replay must not emit a TradeUpdate",
+        );
+    }
+
+    /// The ordering mark must live in the node's time domain, not the local
+    /// one. Clamping it to the local clock (as the chat cursor does, where it
+    /// is a subscription `since` and not a comparator) breaks the guard
+    /// whenever the local clock runs behind the node's: the newest event
+    /// stores a clamped, smaller value, and the next *older* event then
+    /// compares above it and wins — the replay regression, restored.
+    ///
+    /// Both events here are dated ahead of the local clock, replayed
+    /// newest-first, and inside the skew tolerance so the mark may move.
+    #[tokio::test]
+    async fn a_cursor_behind_the_local_clock_still_orders_future_dated_events() {
+        use mostro_core::message::{Action, Message};
+
+        let path = std::env::temp_dir()
+            .join(format!("mostro_status_skew_{}.db", std::process::id()));
+        let _ = crate::db::app_db::init_db(path.to_str().unwrap()).await;
+        let db = crate::db::app_db::db().expect("store initialised");
+
+        let order_uuid = uuid::Uuid::new_v4();
+        let order_id = order_uuid.to_string();
+        let order_info = dummy_order_info(&order_id);
+        order_book().upsert_order(order_info.clone()).await;
+        db.save_trade(&crate::api::types::TradeInfo {
+            id: order_id.clone(),
+            order: order_info,
+            role: TradeRole::Seller,
+            counterparty_pubkey: String::new(),
+            current_step: crate::api::types::TradeStep::Seller(
+                crate::api::types::SellerStep::OrderPublished,
+            ),
+            hold_invoice: None,
+            buyer_invoice: None,
+            trade_key_index: 1,
+            cooperative_cancel_state: None,
+            timeout_at: None,
+            started_at: 1,
+            completed_at: None,
+            outcome: None,
+            peer_rating: None,
+            peer_reviews: None,
+            peer_days: None,
+            rated_at: None,
+        })
+        .await
+        .expect("save the trade row");
+
+        let sender = nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey())
+            .expect("valid mostro pubkey");
+        let now = crate::rt::unix_now() as u64;
+        let newest = now + 6;
+        let oldest = now + 3;
+
+        for (action, created_at) in [
+            (Action::DisputeInitiatedByYou, newest),
+            (Action::WaitingBuyerInvoice, oldest),
+        ] {
+            dispatch_mostro_message(
+                mostro_core::nip59::UnwrappedMessage {
+                    message: Message::new_order(Some(order_uuid), None, None, action, None),
+                    signature: None,
+                    sender,
+                    identity: sender,
+                    created_at: nostr_sdk::prelude::Timestamp::from(created_at),
+                },
+                &format!("test-skew-{created_at}"),
+                "ff00ff11",
+                1,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            db.get_trade_by_order_id(&order_id)
+                .await
+                .expect("trade lookup")
+                .expect("trade row")
+                .order
+                .status,
+            crate::api::types::OrderStatus::Dispute,
+            "a future-dated newest event must still outrank an older one",
+        );
+        assert_eq!(
+            db.get_setting(&crate::db::settings_keys::status_cursor(&order_id))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(newest.to_string().as_str()),
+            "the mark must be stored raw, in the node's time domain",
+        );
+    }
+
+    /// One malformed timestamp must not be able to silence an order for good:
+    /// an event far beyond the skew tolerance is still applied, but it does not
+    /// move the mark, so the messages that follow it are not all refused.
+    #[tokio::test]
+    async fn an_absurdly_future_event_does_not_move_the_cursor() {
+        let path = std::env::temp_dir()
+            .join(format!("mostro_status_skew_{}.db", std::process::id()));
+        let _ = crate::db::app_db::init_db(path.to_str().unwrap()).await;
+        let db = crate::db::app_db::db().expect("store initialised");
+
+        let order_id = format!("skew-{}", uuid::Uuid::new_v4());
+        record_status_event(&order_id, crate::rt::unix_now() + 365 * 24 * 3600).await;
+
+        assert_eq!(
+            db.get_setting(&crate::db::settings_keys::status_cursor(&order_id))
+                .await
+                .unwrap(),
+            None,
+            "an event a year ahead must not become the high-water mark",
+        );
     }
 
     /// #326: the fingerprint-restore path must NOT overwrite the authoritative
@@ -4501,7 +6397,7 @@ mod tests {
             None,
             None,
         );
-        let sender = nostr_sdk::PublicKey::from_hex(&active_mostro_pubkey())
+        let sender = nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey())
             .expect("valid mostro pubkey");
         let unwrapped = mostro_core::nip59::UnwrappedMessage {
             message: Message::new_order(
@@ -4514,7 +6410,7 @@ mod tests {
             signature: None,
             sender,
             identity: sender,
-            created_at: nostr_sdk::Timestamp::from(0u64),
+            created_at: nostr_sdk::prelude::Timestamp::from(0u64),
         };
         dispatch_mostro_message(unwrapped, "test-take-replay", "ff00ff01", 93).await;
 
@@ -4548,7 +6444,7 @@ mod tests {
     /// unsubscribes them.
     #[tokio::test]
     async fn seeding_coverage_never_evicts_existing_keys() {
-        let session = nostr_sdk::Keys::generate();
+        let session = nostr_sdk::prelude::Keys::generate();
         ensure_global_dm_coverage(&session, 92).await;
 
         // No identity in unit tests → the derived set is empty; the seed
@@ -4707,18 +6603,310 @@ mod tests {
         assert!(session.shared_key.is_none());
     }
 
+    /// `create_session_with_peer` is the atomic counterpart (#381 review):
+    /// the session is complete from the first moment any reader can see it —
+    /// what the MANAGER returns for the order already carries peer and
+    /// shared key, so no concurrent send can observe a keyless intermediate
+    /// and degrade to local-only. Duplicate semantics match `create_session`.
+    #[tokio::test]
+    async fn session_created_with_peer_is_never_observable_keyless() {
+        let order_id = uuid::Uuid::new_v4().to_string();
+        let order = dummy_order_info(&order_id);
+        let peer_hex = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let shared = [7u8; 32];
+
+        let mgr = session_manager();
+        let returned = mgr
+            .create_session_with_peer(
+                order_id.clone(),
+                TradeRole::Buyer,
+                4,
+                order.clone(),
+                peer_hex.clone(),
+                shared,
+            )
+            .await
+            .unwrap();
+        assert_eq!(returned.peer_pubkey.as_deref(), Some(peer_hex.as_str()));
+        assert_eq!(returned.shared_key, Some(shared));
+
+        // The stored copy — what any concurrent reader gets — is the same
+        // complete session, not a keyless one later patched up.
+        let observed = mgr.get_session(&order_id).await.expect("session stored");
+        assert_eq!(observed.peer_pubkey.as_deref(), Some(peer_hex.as_str()));
+        assert_eq!(observed.shared_key, Some(shared));
+
+        // Same duplicate guard as create_session: second insert fails and
+        // leaves the original untouched.
+        let dup = mgr
+            .create_session_with_peer(
+                order_id.clone(),
+                TradeRole::Buyer,
+                4,
+                order,
+                "other-peer".into(),
+                [9u8; 32],
+            )
+            .await;
+        assert!(dup.is_err());
+        let kept = mgr.get_session(&order_id).await.expect("still stored");
+        assert_eq!(kept.peer_pubkey.as_deref(), Some(peer_hex.as_str()));
+    }
+
     // ── Peer-pubkey resolution ────────────────────────────────────────────────
 
-    /// on_peer_pubkey_received with no session for the order is a graceful no-op.
+    /// Symmetric reveal resolution (#334): whichever side our trade key
+    /// matches, the counterparty is the other one — and a payload naming two
+    /// strangers resolves to nothing.
+    #[test]
+    fn resolve_peer_side_is_symmetric() {
+        let buyer = nostr_sdk::prelude::Keys::generate().public_key();
+        let seller = nostr_sdk::prelude::Keys::generate().public_key();
+        let stranger = nostr_sdk::prelude::Keys::generate().public_key();
+
+        let (peer, role) = resolve_peer_side(&buyer, &buyer, &seller).expect("we are the buyer");
+        assert_eq!(peer, seller);
+        assert!(matches!(role, TradeRole::Buyer));
+
+        let (peer, role) = resolve_peer_side(&seller, &buyer, &seller).expect("we are the seller");
+        assert_eq!(peer, buyer);
+        assert!(matches!(role, TradeRole::Seller));
+
+        assert!(resolve_peer_side(&stranger, &buyer, &seller).is_none());
+    }
+
+    /// The payload side of the capture (#334): only a `SmallOrder` naming
+    /// BOTH trade pubkeys qualifies as a reveal, whether it arrives as an
+    /// `Order` payload or inside a `PaymentRequest`.
+    #[test]
+    fn peer_reveal_pubkeys_requires_both_sides() {
+        use mostro_core::message::Payload;
+        let order = |buyer: Option<&str>, seller: Option<&str>| {
+            let mut o = small_order_with(mostro_core::order::Status::Active, 100);
+            o.buyer_trade_pubkey = buyer.map(String::from);
+            o.seller_trade_pubkey = seller.map(String::from);
+            o
+        };
+
+        // Both pubkeys present → reveals, from either carrying payload.
+        let both = Payload::Order(order(Some("b"), Some("s")));
+        assert_eq!(peer_reveal_pubkeys(Some(&both)), Some(("b", "s")));
+        let pay_req =
+            Payload::PaymentRequest(Some(order(Some("b"), Some("s"))), "lnbc1".into(), None);
+        assert_eq!(peer_reveal_pubkeys(Some(&pay_req)), Some(("b", "s")));
+
+        // Single-sided payloads (e.g. the maker's own NewOrder confirmation)
+        // reveal nothing — there is no telling which side is ours.
+        let buyer_only = Payload::Order(order(Some("b"), None));
+        assert_eq!(peer_reveal_pubkeys(Some(&buyer_only)), None);
+        let seller_only = Payload::Order(order(None, Some("s")));
+        assert_eq!(peer_reveal_pubkeys(Some(&seller_only)), None);
+
+        // `Some("")` is absent, not present (mostrix parity): it must be
+        // filtered here, not warn-logged downstream for every replayed
+        // message of a daemon that encodes "no pubkey" as an empty string.
+        let empty_buyer = Payload::Order(order(Some(""), Some("s")));
+        assert_eq!(peer_reveal_pubkeys(Some(&empty_buyer)), None);
+        let empty_seller = Payload::Order(order(Some("b"), Some("")));
+        assert_eq!(peer_reveal_pubkeys(Some(&empty_seller)), None);
+
+        // No SmallOrder at all: bare PaymentRequest, non-order payload, none.
+        let bare_pay_req = Payload::PaymentRequest(None, "lnbc1".into(), None);
+        assert_eq!(peer_reveal_pubkeys(Some(&bare_pay_req)), None);
+        let text = Payload::TextMessage("hi".into());
+        assert_eq!(peer_reveal_pubkeys(Some(&text)), None);
+        assert_eq!(peer_reveal_pubkeys(None), None);
+    }
+
+    /// A reveal for an order with no session AND no order info anywhere
+    /// (row or book) cannot create one — it must degrade to a warning, not
+    /// a panic. Exercised through `apply_peer_reveal` with generated keys,
+    /// same as the maker-session test below.
     #[tokio::test]
     async fn peer_pubkey_with_no_session_does_not_panic() {
-        // Use a random order_id that has no session — should log a warning only.
-        on_peer_pubkey_received(
+        let trade_keys = nostr_sdk::prelude::Keys::generate();
+        let peer_hex = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        // Random order_id: no session, no trade row, not in the order book.
+        apply_peer_reveal(
             &uuid::Uuid::new_v4().to_string(),
-            "aabbccdd", // peer_pubkey_hex (irrelevant, no trade key stored)
+            &peer_hex,
+            &trade_keys,
+            0,
+            TradeRole::Buyer,
         )
         .await;
         // If we reach here without panicking the test passes.
+    }
+
+    /// The maker path of #334: a reveal with no existing session creates one
+    /// carrying the peer pubkey and the ECDH shared key, sourcing order info
+    /// from the public book (the maker's trade row may not exist yet, and on
+    /// web never does). Exercised through `apply_peer_reveal` with generated
+    /// keys — loading a real identity would mutate process-global state
+    /// shared with every other test in the binary.
+    #[tokio::test]
+    async fn peer_reveal_creates_missing_maker_session() {
+        let order_id = uuid::Uuid::new_v4().to_string();
+        let trade_keys = nostr_sdk::prelude::Keys::generate();
+        let peer_keys = nostr_sdk::prelude::Keys::generate();
+        let peer_hex = peer_keys.public_key().to_hex();
+
+        order_book().upsert_order(dummy_order_info(&order_id)).await;
+
+        apply_peer_reveal(&order_id, &peer_hex, &trade_keys, 7, TradeRole::Seller).await;
+
+        let session = session_manager()
+            .get_session(&order_id)
+            .await
+            .expect("reveal must create the maker's missing session");
+        assert!(matches!(session.role, TradeRole::Seller));
+        assert_eq!(session.trade_key_index, 7);
+        assert_eq!(session.peer_pubkey.as_deref(), Some(peer_hex.as_str()));
+        let expected =
+            crate::crypto::ecdh::derive_nip04_shared_key(&trade_keys, &peer_keys.public_key())
+                .expect("ECDH derivation");
+        assert_eq!(session.shared_key, Some(expected));
+    }
+
+    /// The seam test for #334: `dispatch_mostro_message` is the ONLY caller
+    /// of `maybe_capture_peer_reveal` — deleting that call leaves every other
+    /// test green, because they exercise the pieces directly. This drives one
+    /// daemon message naming both trade pubkeys through the real dispatcher,
+    /// starting from a row exactly as `take_order` leaves it (empty
+    /// counterparty), and asserts the durable write and the session both
+    /// happened.
+    ///
+    /// `#[ignore]`d because it claims two process-global singletons for the
+    /// whole test binary — the `app_db` OnceCell and the in-memory identity —
+    /// which cannot be shared with the rest of the suite (same pattern as
+    /// `restore_e2e_tests`). Run with:
+    ///   cargo test --lib peer_reveal_capture_is_wired_into_dispatch -- --ignored
+    #[tokio::test]
+    #[ignore = "claims the process-global app_db and identity — run with --ignored"]
+    async fn peer_reveal_capture_is_wired_into_dispatch() {
+        use mostro_core::message::{Action, Message, Payload};
+
+        let db_path = std::env::temp_dir().join(format!(
+            "mostro-wiring-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        crate::db::app_db::init_db(db_path.to_str().unwrap())
+            .await
+            .expect("init app db");
+        crate::api::identity::import_from_mnemonic(
+            "abandon abandon abandon abandon abandon abandon abandon abandon \
+             abandon abandon abandon about"
+                .split_whitespace()
+                .map(String::from)
+                .collect(),
+            false,
+        )
+        .await
+        .expect("import identity");
+
+        let trade_index = 3u32;
+        let trade_keys = crate::api::identity::get_active_trade_keys(trade_index)
+            .await
+            .expect("derive trade key");
+        let my_hex = trade_keys.public_key().to_hex();
+        let peer_keys = nostr_sdk::prelude::Keys::generate();
+        let peer_hex = peer_keys.public_key().to_hex();
+
+        // The world as a maker-seller take leaves it: book entry, trade-key
+        // binding (the generation gate reads it), and a persisted row with an
+        // EMPTY counterparty.
+        let order_uuid = uuid::Uuid::new_v4();
+        let order_id = order_uuid.to_string();
+        let mut order_info = dummy_order_info(&order_id);
+        order_info.kind = crate::api::types::OrderKind::Sell;
+        order_info.status = crate::api::types::OrderStatus::Active;
+        order_book().upsert_order(order_info.clone()).await;
+        store_trade_key_index(&order_id, trade_index).await;
+        let db = crate::db::app_db::db().expect("db just initialized");
+        db.save_trade(&crate::api::types::TradeInfo {
+            id: order_id.clone(),
+            order: order_info,
+            role: TradeRole::Seller,
+            counterparty_pubkey: String::new(),
+            current_step: crate::api::types::TradeStep::Seller(
+                crate::api::types::SellerStep::TakerFound,
+            ),
+            hold_invoice: None,
+            buyer_invoice: None,
+            trade_key_index: trade_index,
+            cooperative_cancel_state: None,
+            timeout_at: None,
+            started_at: 1,
+            completed_at: None,
+            outcome: None,
+            peer_rating: None,
+            peer_reviews: None,
+            peer_days: None,
+            rated_at: None,
+        })
+        .await
+        .expect("save the pre-reveal row");
+
+        // One daemon message whose payload names BOTH trade pubkeys — the
+        // buyer is the peer, the seller is our derived trade key.
+        let so = mostro_core::order::SmallOrder::new(
+            Some(order_uuid),
+            Some(mostro_core::order::Kind::Sell),
+            Some(mostro_core::order::Status::Active),
+            457,
+            "USD".to_string(),
+            None,
+            None,
+            100,
+            "bank".to_string(),
+            0,
+            Some(peer_hex.clone()),
+            Some(my_hex.clone()),
+            None,
+            None,
+            None,
+        );
+        let sender = nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey())
+            .expect("valid mostro pubkey");
+        let unwrapped = mostro_core::nip59::UnwrappedMessage {
+            message: Message::new_order(
+                Some(order_uuid),
+                None,
+                None,
+                Action::BuyerTookOrder,
+                Some(Payload::Order(so)),
+            ),
+            signature: None,
+            sender,
+            identity: sender,
+            created_at: nostr_sdk::prelude::Timestamp::from(0u64),
+        };
+        dispatch_mostro_message(unwrapped, "test-peer-reveal-wiring", &my_hex, trade_index)
+            .await;
+
+        // The durable write: the row now holds the peer. This is the
+        // assertion that fails when the dispatcher call is deleted.
+        let row = db
+            .get_trade_by_order_id(&order_id)
+            .await
+            .expect("row query")
+            .expect("row survives dispatch");
+        assert_eq!(row.counterparty_pubkey, peer_hex);
+
+        // The session cache: created by the same capture, with peer, role and
+        // the real ECDH shared key.
+        let session = session_manager()
+            .get_session(&order_id)
+            .await
+            .expect("capture must create the maker's session");
+        assert!(matches!(session.role, TradeRole::Seller));
+        assert_eq!(session.peer_pubkey.as_deref(), Some(peer_hex.as_str()));
+        let expected =
+            crate::crypto::ecdh::derive_nip04_shared_key(&trade_keys, &peer_keys.public_key())
+                .expect("ECDH derivation");
+        assert_eq!(session.shared_key, Some(expected));
+
+        let _ = std::fs::remove_file(&db_path);
     }
 
     // ── #259 per-order dispatch serialization ─────────────────────────────────
@@ -4812,13 +7000,13 @@ mod tests {
         let mut rx = trade_updates_tx().subscribe();
 
         let sender =
-            nostr_sdk::PublicKey::from_hex(&active_mostro_pubkey()).expect("valid mostro pubkey");
+            nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey()).expect("valid mostro pubkey");
         let unwrapped = mostro_core::nip59::UnwrappedMessage {
             message: Message::new_order(Some(order_uuid), None, None, Action::Canceled, None),
             signature: None,
             sender,
             identity: sender,
-            created_at: nostr_sdk::Timestamp::from(0u64),
+            created_at: nostr_sdk::prelude::Timestamp::from(0u64),
         };
 
         // The retake enters its persistence block...
@@ -4853,13 +7041,13 @@ mod tests {
     fn canceled_message(order_uuid: uuid::Uuid) -> mostro_core::nip59::UnwrappedMessage {
         use mostro_core::message::{Action, Message};
         let sender =
-            nostr_sdk::PublicKey::from_hex(&active_mostro_pubkey()).expect("valid mostro pubkey");
+            nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey()).expect("valid mostro pubkey");
         mostro_core::nip59::UnwrappedMessage {
             message: Message::new_order(Some(order_uuid), None, None, Action::Canceled, None),
             signature: None,
             sender,
             identity: sender,
-            created_at: nostr_sdk::Timestamp::from(0u64),
+            created_at: nostr_sdk::prelude::Timestamp::from(0u64),
         }
     }
 
@@ -4955,7 +7143,7 @@ mod tests {
         let mut rx = insert_pending_take(trade_pk, 91);
 
         let sender =
-            nostr_sdk::PublicKey::from_hex(&active_mostro_pubkey()).expect("valid mostro pubkey");
+            nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey()).expect("valid mostro pubkey");
         let unwrapped = mostro_core::nip59::UnwrappedMessage {
             message: Message::new_order(
                 Some(order_uuid),
@@ -4967,7 +7155,7 @@ mod tests {
             signature: None,
             sender,
             identity: sender,
-            created_at: nostr_sdk::Timestamp::from(0u64),
+            created_at: nostr_sdk::prelude::Timestamp::from(0u64),
         };
         dispatch_mostro_message(unwrapped, "test-handoff-live", trade_pk, 4).await;
 
@@ -4993,7 +7181,7 @@ mod tests {
         drop(insert_pending_take(trade_pk, 92));
 
         let sender =
-            nostr_sdk::PublicKey::from_hex(&active_mostro_pubkey()).expect("valid mostro pubkey");
+            nostr_sdk::prelude::PublicKey::from_hex(&active_mostro_pubkey()).expect("valid mostro pubkey");
         let unwrapped = mostro_core::nip59::UnwrappedMessage {
             message: Message::new_order(
                 Some(order_uuid),
@@ -5005,7 +7193,7 @@ mod tests {
             signature: None,
             sender,
             identity: sender,
-            created_at: nostr_sdk::Timestamp::from(0u64),
+            created_at: nostr_sdk::prelude::Timestamp::from(0u64),
         };
         dispatch_mostro_message(unwrapped, "test-handoff-dead", trade_pk, 4).await;
 
@@ -5023,20 +7211,39 @@ mod restore_e2e_tests {
     //! Requires a live regtest stack: mostrod + relay on ws://localhost:7000.
     //! Run with:  cargo test --lib restore_session_roundtrip -- --ignored --nocapture
     //! Ignored by default so it never runs in CI without the stack.
+    //! Set MOSTRO_REGTEST_PUBKEY to your daemon's pubkey (from mostrod's
+    //! startup logs); MOSTRO_REGTEST_RELAY overrides the default relay,
+    //! ws://localhost:7000.
     use super::*;
 
-    #[tokio::test]
-    #[ignore = "requires live regtest daemon + relay on ws://localhost:7000"]
-    async fn restore_session_roundtrip() {
-        // Point ONLY at the local regtest relay.
-        crate::api::nostr::initialize(Some(vec!["ws://localhost:7000".to_string()]))
+    /// Shared regtest setup. Every test here ends up in `derive_trade_key`
+    /// (via `create_order`, or as `restore_session`'s reply address), which
+    /// refuses to run without durable storage — so a throwaway SQLite file
+    /// must be initialised before anything else. `init_db` is a process-wide
+    /// no-op after the first call, so tests sharing a process share the first
+    /// file; each creates a fresh identity, so that's fine.
+    async fn init_regtest() {
+        let dbp = std::env::temp_dir().join(format!("e2e-restore-{}.db", uuid::Uuid::new_v4()));
+        crate::db::app_db::init_db(dbp.to_str().expect("utf-8 temp path"))
+            .await
+            .expect("init_db");
+        // Point ONLY at the daemon's relay.
+        let relay = std::env::var("MOSTRO_REGTEST_RELAY")
+            .unwrap_or_else(|_| "ws://localhost:7000".to_string());
+        crate::api::nostr::initialize(Some(vec![relay]))
             .await
             .expect("relay pool init");
+        let mostro_pk = std::env::var("MOSTRO_REGTEST_PUBKEY").expect(
+            "MOSTRO_REGTEST_PUBKEY env var required \
+             (your regtest daemon's pubkey, from mostrod's startup logs)",
+        );
+        crate::config::set_active_mostro_pubkey(Some(mostro_pk));
+    }
 
-        // Regtest daemon pubkey (from mostrod startup logs).
-        crate::config::set_active_mostro_pubkey(Some(
-            "bae71ea2566771ed45b1d267dc0c0753028fe960a7bc4aeee08a44da0cb91520".to_string(),
-        ));
+    #[tokio::test]
+    #[ignore = "requires live regtest stack — set MOSTRO_REGTEST_PUBKEY (relay defaults to ws://localhost:7000)"]
+    async fn restore_session_roundtrip() {
+        init_regtest().await;
 
         // Fresh in-memory identity (no keyring needed — Rust never persists it).
         let id = crate::api::identity::create_identity().await.expect("create identity");
@@ -5063,14 +7270,9 @@ mod restore_e2e_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires live regtest daemon + relay on ws://localhost:7000"]
+    #[ignore = "requires live regtest stack — set MOSTRO_REGTEST_PUBKEY (relay defaults to ws://localhost:7000)"]
     async fn trade_then_restore_recovers_order() {
-        crate::api::nostr::initialize(Some(vec!["ws://localhost:7000".to_string()]))
-            .await
-            .expect("relay pool init");
-        crate::config::set_active_mostro_pubkey(Some(
-            "bae71ea2566771ed45b1d267dc0c0753028fe960a7bc4aeee08a44da0cb91520".to_string(),
-        ));
+        init_regtest().await;
         let id = crate::api::identity::create_identity().await.expect("create identity");
         println!("[test] identity A pubkey={}", id.public_key);
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -5113,5 +7315,135 @@ mod restore_e2e_tests {
                 "trade_key_index ({idx}) must be >= max recovered index ({max_recovered}) after resync",
             );
         }
+    }
+
+    /// #328 e2e: the highest-index trade is already finalized, so the restore
+    /// payload's maximum is a lower bound and only LastTradeIndex carries the
+    /// real counter. Mirrors the probe in the issue: order A open at index 1,
+    /// order B canceled at index 2 — a fresh install that restores must end
+    /// with the counter at the daemon's high-water mark (2) and get its first
+    /// new order accepted (index 3), where the payload-only resync of #239
+    /// left the counter at 1 and the daemon refused the next order with
+    /// CantDo(InvalidTradeIndex).
+    #[tokio::test]
+    #[ignore = "requires live regtest stack — set MOSTRO_REGTEST_PUBKEY (relay defaults to ws://localhost:7000)"]
+    async fn restore_with_finalized_top_index_resyncs_from_last_trade_index() {
+        init_regtest().await;
+
+        let id = crate::api::identity::create_identity().await.expect("create identity");
+        let words = id.mnemonic_words.clone();
+        println!("[test] identity pubkey={}", id.public_key);
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        let params = |fiat: f64| crate::api::types::NewOrderParams {
+            kind: crate::api::types::OrderKind::Sell,
+            fiat_amount: Some(fiat),
+            fiat_amount_min: None,
+            fiat_amount_max: None,
+            fiat_code: "USD".to_string(),
+            payment_method: "cash".to_string(),
+            premium: 0.0,
+            amount_sats: None,
+        };
+        // Distinct fiat amounts so the two orders never share a content
+        // fingerprint slot (see bridge_fingerprint_trade_index).
+        println!("[test] creating order A (index 1)...");
+        let order_a = create_order(params(100.0)).await.expect("create order A");
+        println!("[test] order A id={}", order_a.id);
+        println!("[test] creating order B (index 2)...");
+        let order_b = create_order(params(200.0)).await.expect("create order B");
+        println!("[test] order B id={}", order_b.id);
+
+        // Finalize the top-index trade: cancel B. cancel_order publishes and
+        // returns without waiting for the daemon, so poll B's public Kind
+        // 38383 view until the daemon's cancellation lands — the restore
+        // below must not see B as pending. (The s-tag is NIP-69's public
+        // bucket, never a trade's live status — but the pending→canceled
+        // transition is exactly the "daemon processed the cancel" proof this
+        // needs, and it is the authoritative, relay-visible one.)
+        cancel_order(order_b.id.clone()).await.expect("cancel order B");
+        let mostro_pk = nostr_sdk::prelude::PublicKey::from_hex(
+            &crate::config::active_mostro_pubkey(),
+        )
+        .expect("mostro pubkey");
+        let client = crate::api::nostr::get_pool().expect("pool").client();
+        let b_filter =
+            crate::nostr::order_events::trade_order_filter(&mostro_pk, &order_b.id);
+        let start = crate::rt::time::Instant::now();
+        loop {
+            let canceled = client
+                .fetch_events(b_filter.clone())
+                .timeout(std::time::Duration::from_secs(2))
+                .await
+                .ok()
+                .and_then(|events| {
+                    // Newest first: 38383 is addressable, but don't rely on
+                    // the relay's replacement — read the latest snapshot.
+                    events
+                        .iter()
+                        .max_by_key(|ev| ev.created_at)
+                        .and_then(|ev| parse_order_event(ev, None))
+                })
+                .is_some_and(|o| o.status == OrderStatus::Canceled);
+            if canceled {
+                break;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(15),
+                "daemon did not publish order B as canceled within 15s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+
+        // Fresh install: same mnemonic, counter back to zero.
+        crate::api::identity::delete_identity().await.expect("delete identity");
+        crate::api::identity::import_from_mnemonic(words, false)
+            .await
+            .expect("re-import identity");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        println!("[test] calling restore_session()...");
+        let info = restore_session().await.expect("restore round-trip");
+        for o in &info.restore_orders {
+            println!(
+                "[test]   order_id={} status={} index={}",
+                o.order_id, o.status, o.trade_index
+            );
+        }
+
+        // The canceled order B must be invisible here — that is exactly what
+        // makes the payload maximum (1) a lower bound of the daemon counter (2).
+        let payload_max = recovered_max_trade_index(&info);
+        assert_eq!(
+            payload_max,
+            Some(1),
+            "restore payload should carry only the open order A"
+        );
+
+        // The resync floor must have come from LastTradeIndex: with the
+        // payload fallback alone the counter would sit at 1.
+        let idx = crate::api::identity::get_identity()
+            .await
+            .expect("get_identity")
+            .expect("identity present after restore")
+            .trade_key_index;
+        assert!(
+            idx >= 2,
+            "counter ({idx}) must be >= 2 — the LastTradeIndex floor, not the payload bound"
+        );
+
+        // And the point of #328: the first post-restore order must be ACCEPTED.
+        println!("[test] creating first post-restore order...");
+        let order_c = create_order(params(300.0)).await.expect(
+            "first post-restore order must be accepted \
+             (was CantDo(InvalidTradeIndex) before #328)",
+        );
+        println!("[test] ✓ post-restore order accepted id={}", order_c.id);
+        let idx_after = crate::api::identity::get_identity()
+            .await
+            .expect("get_identity")
+            .expect("identity present")
+            .trade_key_index;
+        assert_eq!(idx_after, 3, "the post-restore order should consume index 3");
     }
 }
