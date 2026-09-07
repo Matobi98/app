@@ -137,10 +137,17 @@ void main() {
     );
 
     final before = tester.widget(find.byType(AppBar));
+    // No order reaches the screen here, so the countdown starts from the
+    // 15-minute default.
+    expect(find.text('15:00'), findsOneWidget);
 
-    // Two ticks of the 1s countdown.
+    // Two ticks of the 1s countdown. The value assertions pin that the
+    // notifier path still repaints the clock; without them, a builder that
+    // never updated would also keep the AppBar identical.
     await tester.pump(const Duration(seconds: 1));
+    expect(find.text('14:59'), findsOneWidget);
     await tester.pump(const Duration(seconds: 1));
+    expect(find.text('14:58'), findsOneWidget);
 
     expect(
       identical(tester.widget(find.byType(AppBar)), before),
