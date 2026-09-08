@@ -10,6 +10,7 @@ import 'package:mostro/core/storage/app_data_dir.dart'
     if (dart.library.html) 'package:mostro/core/storage/app_data_dir_web.dart';
 import 'package:mostro/core/app.dart';
 import 'package:mostro/core/mostro_defaults.dart';
+import 'package:mostro/core/startup_failure.dart';
 import 'package:mostro/core/services/identity_service.dart';
 import 'package:mostro/core/test_environment.dart';
 import 'package:mostro/core/web/bridge_probe.dart';
@@ -44,24 +45,68 @@ import 'package:mostro/features/notifications/providers/notifications_provider.d
 /// defaults gone, an unreachable local relay fails the test instead of
 /// silently succeeding against a public one.
 Future<void> bootstrapAndRun({List<String> seedRelays = const []}) async {
+  try {
+    await _startup(seedRelays: seedRelays);
+  } catch (e, st) {
+    // The failure surface calls runApp too, and that is the whole fix: today an
+    // exception in here means runApp never runs and Flutter paints nothing —
+    // the page is not broken, it is absent, with no message anywhere (#227).
+    debugPrint('[startup] fatal while $_currentStep: $e\n$st');
+    runApp(StartupFailureApp(step: _currentStep));
+  }
+}
+
+/// Names the startup step in progress, so a failure can say where it happened.
+///
+/// A file-level variable rather than a parameter: the only writers are the
+/// steps themselves and the only reader is the guard above.
+String _currentStep = 'starting up';
+
+/// Runs a startup step the app can do without: a failure is recorded and
+/// startup continues, so the app opens degraded rather than not at all.
+///
+/// One helper rather than a try/catch per step, so every degradation prints the
+/// same prefix — grepping `[startup]` lists everything a run gave up on, in
+/// order, which matters when one failure is the cause of the next.
+Future<void> _optional(String name, Future<void> Function() body) async {
+  _currentStep = name;
+  try {
+    await body();
+  } catch (e, st) {
+    debugPrint('[startup] $name failed — continuing without it: $e\n$st');
+  }
+}
+
+Future<void> _startup({List<String> seedRelays = const []}) async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Initialize Firebase (no-op if firebase_options.dart is the placeholder).
+  // Push notifications only — the app trades, chats and settles without them.
+  // Two arms on purpose: the placeholder config is an expected state, not a
+  // failure, and folding both into one message would make every single run log
+  // a "failed" nobody reads by the time it means something.
+  _currentStep = 'setting up notifications';
   try {
     await Firebase.initializeApp(
       options: DefaultFirebaseOptions.currentPlatform,
     );
   } on UnsupportedError catch (e) {
     debugPrint(
-      '[main] Firebase not configured: $e — push notifications disabled.',
+      '[startup] Firebase not configured — push notifications disabled: $e',
+    );
+  } catch (e, st) {
+    // A call into a third-party JS SDK: config, network, or the SDK itself.
+    debugPrint(
+      '[startup] setting up notifications failed — continuing without it: $e\n$st',
     );
   }
 
+  _currentStep = 'loading the engine';
   await RustLib.init();
 
   // Pre-read SharedPreferences so providers start with synchronous initial
   // values — eliminates the AsyncValue.loading() race that caused the router
   // to show the home screen before redirecting to /walkthrough on first launch.
+  _currentStep = 'reading your settings';
   final prefs = await SharedPreferences.getInstance();
   final firstRunComplete = prefs.getBool(kFirstRunCompleteKey) ?? false;
   final backupDismissed = prefs.getBool(kBackupReminderDismissedKey) ?? false;
@@ -71,23 +116,27 @@ Future<void> bootstrapAndRun({List<String> seedRelays = const []}) async {
 
   // Before any startup work below, so a failure in it is captured at the
   // verbosity the user asked for rather than the default.
-  await settings_api.setLoggingEnabled(enabled: savedSettings.loggingEnabled);
+  await _optional('applying your log settings', () async {
+    await settings_api.setLoggingEnabled(enabled: savedSettings.loggingEnabled);
+  });
 
-  // Initialize the persistent store (SQLite file off the web, IndexedDB
-  // database on it). Must come before any trade / order operations that read
-  // or write trade keys and trade records.
-  try {
+  // The persistent store (a SQLite file off the web, an IndexedDB database on
+  // it, #408). Must come before any trade / order operation that reads or
+  // writes trade keys and trade records.
+  //
+  // Optional, and it was already written that way before this guard existed:
+  // without it the session is memory-only — trade keys and roles do not
+  // survive a restart — but orders still browse and relay messages still
+  // arrive, and every Rust caller handles a missing database. Runs on the web
+  // too: since #408 that is where web persistence lives, so skipping it there
+  // would quietly take out every feature built on top of it.
+  await _optional('opening the local database', () async {
     final location = databaseLocation(
       isWeb: kIsWeb,
       dataDir: kIsWeb ? null : await appDataDirPath(),
     );
     await rust_api.initDb(path: location);
-  } catch (e, st) {
-    // DB init failure is non-fatal: trade-key and role persistence won't
-    // work for this session, but the app can still browse orders and relay
-    // messages.  All Rust callers already handle db() == None gracefully.
-    debugPrint('[main] DB init failed — running in memory-only mode: $e\n$st');
-  }
+  });
 
   // Load the persisted active Mostro node into the Rust override before the
   // relay pool starts, so the first subscription targets the user's selected
@@ -154,19 +203,30 @@ Future<void> bootstrapAndRun({List<String> seedRelays = const []}) async {
   // Subscribe to bond-slashed notices BEFORE relay delivery starts, so the
   // Tokio broadcast channel buffers any notice arriving during startup rather
   // than dropping it (a receiver must exist at send time).
-  final bondSlashedStream = await bond_api.onBondSlashed();
+  bond_api.BondSlashedStream? bondSlashedStream;
+  await _optional('subscribing to bond notices', () async {
+    bondSlashedStream = await bond_api.onBondSlashed();
+  });
 
   // Initialize the Nostr relay pool. `null` means the compiled-in defaults
   // (config.rs); a non-empty seed list replaces them entirely.
   // This must happen before any Nostr/order API calls.
-  await nostr_api.initialize(relays: seedRelays.isEmpty ? null : seedRelays);
+  // Optional because the app already knows how to be disconnected: it shows
+  // connection state, and Settings can switch node or edit the relay list. An
+  // app that opens offline can be fixed from inside; one that does not open
+  // cannot be fixed at all.
+  await _optional('connecting to the network', () async {
+    await nostr_api.initialize(relays: seedRelays.isEmpty ? null : seedRelays);
+  });
 
   // Log initial relay state for diagnostics.
-  final relays = await nostr_api.getRelays();
-  final connState = await nostr_api.getConnectionState();
-  debugPrint(
-    '[main] relay pool initialized — state=$connState relays=${relays.map((r) => '${r.url}:${r.status}').join(', ')}',
-  );
+  await _optional('reading relay status', () async {
+    final relays = await nostr_api.getRelays();
+    final connState = await nostr_api.getConnectionState();
+    debugPrint(
+      '[main] relay pool initialized — state=$connState relays=${relays.map((r) => '${r.url}:${r.status}').join(', ')}',
+    );
+  });
 
   // Watch for connection state changes in background (logs appear in flutter output).
   _watchConnectionState();
@@ -193,8 +253,10 @@ Future<void> bootstrapAndRun({List<String> seedRelays = const []}) async {
     _restoreNwcConnection(savedNwcUri, container);
   }
 
-  _consumeBondSlashed(bondSlashedStream, container);
+  final slashed = bondSlashedStream;
+  if (slashed != null) _consumeBondSlashed(slashed, container);
 
+  _currentStep = 'building the interface';
   runApp(
     UncontrolledProviderScope(container: container, child: const MostroApp()),
   );
