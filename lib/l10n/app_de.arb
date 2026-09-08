@@ -727,5 +727,8 @@
   "settingsCashuMintOverrideInvalid": "Das ist keine gültige Mint-URL. Verwende http oder https mit einem Host.",
   "settingsEscrowEffectiveMode": "Effektives Backend: {mode}",
   "settingsEscrowEffectiveMint": "Effektive Mint: {mint}",
-  "settingsEscrowCashuUnavailable": "Cashu funktioniert ohne Mint nicht – unten eine festlegen."
+  "settingsEscrowCashuUnavailable": "Cashu funktioniert ohne Mint nicht – unten eine festlegen.",
+  "tradeStatusPayoutPending": "Auszahlung ausstehend",
+  "tradeHeadlinePayoutPending": "Warten auf die Auszahlung an den Käufer",
+  "tradeInstructionPayoutPending": "Der Verkäufer hat die Treuhandmittel freigegeben. Die Lightning-Zahlung an den Käufer steht noch aus."
 }

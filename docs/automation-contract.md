@@ -51,7 +51,7 @@ fails the build when an identifier is declared and attached to nothing.
 
 | Identifier | Value |
 |---|---|
-| `order.status` | The kebab-case name of `TradeStatus`: `loading`, `pending`, `waiting-invoice`, `waiting-payment`, `in-progress`, `active`, `fiat-sent`, `completed`, `cancelled`, `disputed`, `pending-rating`, `rated`. Never the localized pill copy. |
+| `order.status` | The kebab-case name of `TradeStatus`: `loading`, `pending`, `waiting-invoice`, `waiting-payment`, `in-progress`, `active`, `fiat-sent`, `payout-pending`, `completed`, `cancelled`, `disputed`, `pending-rating`, `rated`. Never the localized pill copy. |
 | `order.id` | The full order id, where the visible text is shortened. |
 | `keys.public_key` | The identity's full public key. |
 | `settings.mostro_node.pubkey` | The active daemon's full public key, where the visible subtitle is truncated. |
@@ -110,3 +110,37 @@ how they start.
 
 Attaching an identifier changes no behaviour. The entry point, the relay seed
 and the banner apply only to a build that carries the define.
+
+## Linux and Web execution
+
+Web exposes `Semantics.identifier` as `flt-semantics-identifier` in the
+rendered semantics DOM. The test entry point enables semantics from startup.
+Build the Rust core with `scripts/build-web.sh --release` before Flutter Web
+and serve cross-origin isolation headers.
+
+The current Flutter Linux engine does not forward `Semantics.identifier` to
+AT-SPI. Only in an armed Mortsom build, `AutomationId` prefixes the accessible
+name with `[mortsom:<identifier>]`. An explicit readout follows the closing
+bracket exactly; ordinary controls retain their merged descendant labels.
+Production builds retain their original accessible labels. Mortsom locates
+this exact prefix and invokes public AT-SPI actions or editable-text methods.
+
+Each Linux actor must have its own DBus session, Secret Service and XDG
+directories. XDG isolation alone does not isolate FlutterSecureStorage.
+
+### Buyer payout completion
+
+`payout-pending` is nonterminal: the seller escrow has settled but the buyer payout has not yet been confirmed. Continue observing until the protocol status is `OrderStatus::Success`; only then may the UI expose `pending-rating` or completion. A released escrow alone never authorizes rating or a completed-trade assertion.
+
+
+### Manual buyer invoice readouts
+
+`invoice.amount` exposes the positive unsigned number of sats requested by the daemon, alongside the
+ordinary amount shown on the manual invoice form. `invoice.order_id` exposes the visible order reference on
+that same form. Automation must verify the requested order and amount before generating an invoice, retain
+its exact hash and amount before submission, and verify field readback before pressing submit. The manual
+submission returns to the matching trade detail (`order.id` and `order.status`).
+
+The release action stays on trade detail while payment finalizes. An early rating notification or direct
+rating route also waits for final success. The historical order-preset selector still categorizes settled
+escrow as a successful preset; auditing that unrelated history surface is a follow-up.

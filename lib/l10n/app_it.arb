@@ -727,5 +727,8 @@
   "settingsCashuMintOverrideInvalid": "Non è un URL di mint valido. Usa http o https con un host.",
   "settingsEscrowEffectiveMode": "Backend effettivo: {mode}",
   "settingsEscrowEffectiveMint": "Mint effettiva: {mint}",
-  "settingsEscrowCashuUnavailable": "Cashu non può funzionare senza una mint: impostane una qui sotto."
+  "settingsEscrowCashuUnavailable": "Cashu non può funzionare senza una mint: impostane una qui sotto.",
+  "tradeStatusPayoutPending": "Pagamento in attesa",
+  "tradeHeadlinePayoutPending": "In attesa del pagamento all’acquirente",
+  "tradeInstructionPayoutPending": "Il venditore ha rilasciato i fondi in deposito. In attesa del completamento del pagamento Lightning all’acquirente."
 }

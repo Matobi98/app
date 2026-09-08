@@ -727,5 +727,8 @@
   "settingsCashuMintOverrideInvalid": "Ce n'est pas une URL de mint valide. Utilisez http ou https avec un hôte.",
   "settingsEscrowEffectiveMode": "Backend effectif : {mode}",
   "settingsEscrowEffectiveMint": "Mint effectif : {mint}",
-  "settingsEscrowCashuUnavailable": "Cashu ne peut pas fonctionner sans mint : configurez-en un ci-dessous."
+  "settingsEscrowCashuUnavailable": "Cashu ne peut pas fonctionner sans mint : configurez-en un ci-dessous.",
+  "tradeStatusPayoutPending": "Paiement en attente",
+  "tradeHeadlinePayoutPending": "En attente du paiement à l’acheteur",
+  "tradeInstructionPayoutPending": "Le vendeur a libéré les fonds en séquestre. En attente de la réussite du paiement Lightning à l’acheteur."
 }
