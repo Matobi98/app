@@ -160,6 +160,7 @@ class AutomationIds {
   static const String invoiceSubmit = 'invoice.submit';
   static const String invoiceCancel = 'invoice.cancel';
   static const String payInvoiceText = 'pay.invoice.text';
+  static const String payOrderId = 'pay.order_id';
   static const String payNwc = 'pay.nwc';
   static const String payCancel = 'pay.cancel';
 }

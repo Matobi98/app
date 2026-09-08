@@ -192,6 +192,13 @@ class _AddLightningInvoiceScreenState
     final l10n = AppLocalizations.of(context);
 
     final isWalletConnected = ref.watch(isWalletConnectedProvider);
+    final appBar = AppBar(
+      title: Text(l10n.addInvoiceTitle),
+      leading:
+          Navigator.of(context).canPop()
+              ? const BackButton().withAutomationId(AutomationIds.appBarBack)
+              : null,
+    );
 
     // Leave the screen when mostrod cancels the order (e.g. the buyer let the
     // waiting-state window expire): the daemon ignores messages for a
@@ -230,7 +237,7 @@ class _AddLightningInvoiceScreenState
     // Show a loading indicator only in that case. Manual entry is always available.
     if (isWalletConnected && sats == null && !_manualMode) {
       return Scaffold(
-        appBar: AppBar(title: Text(l10n.addInvoiceTitle)),
+        appBar: appBar,
         body: Center(
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -262,7 +269,7 @@ class _AddLightningInvoiceScreenState
         sats != null &&
         sats > BigInt.zero) {
       return Scaffold(
-        appBar: AppBar(title: Text(l10n.addInvoiceTitle)),
+        appBar: appBar,
         body: Padding(
           padding: const EdgeInsets.all(AppSpacing.lg),
           child: Column(
@@ -300,7 +307,7 @@ class _AddLightningInvoiceScreenState
     }
 
     return Scaffold(
-      appBar: AppBar(title: Text(l10n.addInvoiceTitle)),
+      appBar: appBar,
       body: Padding(
         // #267: bottom system-bar inset so the Cancel/Submit row clears the
         // gesture / 3-button navigation bar.
