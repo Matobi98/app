@@ -119,11 +119,15 @@ Build the Rust core with `scripts/build-web.sh --release` before Flutter Web
 and serve cross-origin isolation headers.
 
 The current Flutter Linux engine does not forward `Semantics.identifier` to
-AT-SPI. Only in an armed Mortsom build, `AutomationId` prefixes the accessible
-name with `[mortsom:<identifier>]`. An explicit readout follows the closing
-bracket exactly; ordinary controls retain their merged descendant labels.
-Production builds retain their original accessible labels. Mortsom locates
-this exact prefix and invokes public AT-SPI actions or editable-text methods.
+AT-SPI. Only in an armed Mortsom build, `AutomationId` prefixes its accessible
+name with `[mortsom:<identifier>]`. Flutter can merge parent metadata ahead of
+that name: a native tab exposes `Tab 2 of 2\n[mortsom:order.book.tab.sell]\nSell BTC`.
+The marker therefore starts a line, which is not necessarily the first line
+of the final AT-SPI name. Mortsom recognizes exactly one marker at a line
+boundary and invokes the merged node's public AT-SPI action; it never matches
+an identifier embedded in ordinary prose. An explicit readout follows the
+closing bracket exactly; ordinary controls retain their merged descendant
+labels. Production builds retain their original accessible labels.
 
 Each Linux actor must have its own DBus session, Secret Service and XDG
 directories. XDG isolation alone does not isolate FlutterSecureStorage.

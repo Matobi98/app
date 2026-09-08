@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/semantics.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:go_router/go_router.dart';
@@ -106,6 +107,73 @@ void main() {
       );
       await tester.tap(find.byType(ElevatedButton));
       expect(tapped, isTrue);
+    },
+    skip: !TestEnvironment.defineEnabled,
+    variant: TargetPlatformVariant.only(TargetPlatform.linux),
+  );
+
+  testWidgets(
+    'armed Linux tab semantics preserve the identifier and tab action',
+    (tester) async {
+      TestEnvironment.arm();
+      final semantics = tester.ensureSemantics();
+      try {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: DefaultTabController(
+              length: 2,
+              child: Scaffold(
+                appBar: AppBar(
+                  bottom: TabBar(
+                    tabs: [
+                      Tab(
+                        child: const Text(
+                          'Buy BTC',
+                        ).withAutomationId(AutomationIds.orderBookTabBuy),
+                      ),
+                      Tab(
+                        child: const Text(
+                          'Sell BTC',
+                        ).withAutomationId(AutomationIds.orderBookTabSell),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        final tab = tester.getSemantics(
+          semantic(AutomationIds.orderBookTabSell),
+        );
+        expect(
+          tab.getSemanticsData().label,
+          'Tab 2 of 2\n[mortsom:order.book.tab.sell]\nSell BTC',
+        );
+        expect(
+          tester
+              .getSemantics(semantic(AutomationIds.orderBookTabBuy))
+              .getSemanticsData()
+              .label,
+          'Tab 1 of 2\n[mortsom:order.book.tab.buy]\nBuy BTC',
+        );
+        expect(
+          tab,
+          isSemantics(
+            identifier: AutomationIds.orderBookTabSell,
+            hasTapAction: true,
+            isSelected: false,
+          ),
+        );
+        tab.owner!.performAction(tab.id, SemanticsAction.tap);
+        await tester.pumpAndSettle();
+        expect(
+          tester.getSemantics(semantic(AutomationIds.orderBookTabSell)),
+          isSemantics(isSelected: true),
+        );
+      } finally {
+        semantics.dispose();
+      }
     },
     skip: !TestEnvironment.defineEnabled,
     variant: TargetPlatformVariant.only(TargetPlatform.linux),
