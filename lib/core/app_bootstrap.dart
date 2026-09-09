@@ -2,10 +2,10 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 // Resolves the app's own data directory — never the user-visible Documents
 // folder. Web gets the stub; bootstrap only calls it behind `!kIsWeb`.
+import 'package:mostro/core/storage/db_location.dart';
 import 'package:mostro/core/storage/app_data_dir.dart'
     if (dart.library.html) 'package:mostro/core/storage/app_data_dir_web.dart';
 import 'package:mostro/core/app.dart';
@@ -70,18 +70,20 @@ Future<void> bootstrapAndRun({List<String> seedRelays = const []}) async {
   // verbosity the user asked for rather than the default.
   await settings_api.setLoggingEnabled(enabled: savedSettings.loggingEnabled);
 
-  // Initialize persistent SQLite store. Must come before any trade / order
-  // operations that read or write trade keys and trade records.
-  if (!kIsWeb) {
-    try {
-      final dataDir = await appDataDirPath();
-      await rust_api.initDb(path: p.join(dataDir, 'mostro.db'));
-    } catch (e, st) {
-      // DB init failure is non-fatal: trade-key and role persistence won't
-      // work for this session, but the app can still browse orders and relay
-      // messages.  All Rust callers already handle db() == None gracefully.
-      debugPrint('[main] DB init failed — running in memory-only mode: $e\n$st');
-    }
+  // Initialize the persistent store (SQLite file off the web, IndexedDB
+  // database on it). Must come before any trade / order operations that read
+  // or write trade keys and trade records.
+  try {
+    final location = databaseLocation(
+      isWeb: kIsWeb,
+      dataDir: kIsWeb ? null : await appDataDirPath(),
+    );
+    await rust_api.initDb(path: location);
+  } catch (e, st) {
+    // DB init failure is non-fatal: trade-key and role persistence won't
+    // work for this session, but the app can still browse orders and relay
+    // messages.  All Rust callers already handle db() == None gracefully.
+    debugPrint('[main] DB init failed — running in memory-only mode: $e\n$st');
   }
 
   // Load the persisted active Mostro node into the Rust override before the
