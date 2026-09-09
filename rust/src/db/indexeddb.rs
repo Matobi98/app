@@ -57,12 +57,28 @@ fn js_err(context: &str, e: impl std::fmt::Debug) -> anyhow::Error {
 pub struct IndexedDbStorage {
     /// IndexedDB database name, from `init_db`'s path argument.
     db_name: String,
+    /// Serialises every read-modify-write on a stored document.
+    ///
+    /// The daemon's status sync, the peer reveal, the reputation follow-up
+    /// and the rating marker can all patch the same trade within moments of
+    /// each other. Each patch reads the document, changes one field and
+    /// writes the whole document back; two of them interleaving would each
+    /// write a full copy and the later one would silently drop the other's
+    /// field. SQLite avoids that with `json_set` in one statement. Holding
+    /// one IndexedDB transaction across the read and the write is not an
+    /// option here: a transaction is only active while its own request
+    /// callbacks run, and the Rust future that continues after `await` is
+    /// polled from a later task, so the write would hit an inactive
+    /// transaction. The lock gives the same guarantee for this process, the
+    /// only writer of this database.
+    patch_serial: tokio::sync::Mutex<()>,
 }
 
 impl IndexedDbStorage {
     pub async fn open(db_name: &str) -> Result<Self> {
         let storage = Self {
             db_name: db_name.to_string(),
+            patch_serial: tokio::sync::Mutex::new(()),
         };
         // Open once eagerly so schema creation (and any quota/permission
         // failure) surfaces at init time, not on the first message.
@@ -200,30 +216,16 @@ impl IndexedDbStorage {
             .find(|doc| trade_json::order_id_of(doc) == Some(order_id)))
     }
 
-    /// Loads the trade for `order_id`, applies `patch` and writes it back,
-    /// all inside one read-write transaction. No-op when no trade matches,
-    /// like an `UPDATE` touching zero rows.
-    ///
-    /// One transaction is what makes this a patch rather than a snapshot:
-    /// the daemon's status sync, the peer reveal, the reputation follow-up
-    /// and the rating marker can all land on the same trade within moments
-    /// of each other. Two of them reading the document in separate
-    /// transactions would each write back a full copy and the later one
-    /// would silently drop the other's field -- the lost update the SQLite
-    /// backend avoids with `json_set` in a single statement.
+    /// Loads the trade for `order_id`, applies `patch` and writes it back.
+    /// No-op when no trade matches, like an `UPDATE` touching zero rows.
+    /// Serialised through `patch_serial`, see there.
     async fn patch_trade_by_order_id(
         &self,
         order_id: &str,
         patch: impl FnOnce(&mut serde_json::Value) -> Result<()>,
     ) -> Result<()> {
-        let db = self.open_db().await?;
-        let tx = db
-            .transaction_on_one_with_mode(TRADES_STORE, IdbTransactionMode::Readwrite)
-            .map_err(|e| js_err("tx open", e))?;
-        let store = tx
-            .object_store(TRADES_STORE)
-            .map_err(|e| js_err("store open", e))?;
-        let Some(mut doc) = find_document(&store, order_id).await? else {
+        let _serial = self.patch_serial.lock().await;
+        let Some(mut doc) = self.trade_document_by_order_id(order_id).await? else {
             log::warn!(
                 "[db] trade update matched no row for order={}",
                 crate::api::logging::short_id(order_id)
@@ -236,31 +238,8 @@ impl IndexedDbStorage {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| anyhow!("trade document without an id"))?
             .to_owned();
-        store
-            .put_key_val_owned(key, &JsValue::from_str(&doc.to_string()))
-            .map_err(|e| js_err("put", e))?;
-        tx.await.into_result().map_err(|e| js_err("tx commit", e))?;
-        Ok(())
+        self.put_string(TRADES_STORE, &key, &doc.to_string()).await
     }
-}
-
-/// The trade document in `store` whose `order.id` is `order_id`, read within
-/// the caller's transaction so a following write in that transaction cannot
-/// race another patch.
-async fn find_document(
-    store: &IdbObjectStore<'_>,
-    order_id: &str,
-) -> Result<Option<serde_json::Value>> {
-    let array = store
-        .get_all()
-        .map_err(|e| js_err("get_all", e))?
-        .await
-        .map_err(|e| js_err("get_all await", e))?;
-    Ok(array
-        .iter()
-        .filter_map(|v| v.as_string())
-        .filter_map(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
-        .find(|doc| trade_json::order_id_of(doc) == Some(order_id)))
 }
 
 impl Storage for IndexedDbStorage {
@@ -402,32 +381,15 @@ impl Storage for IndexedDbStorage {
         id: &str,
         status: QueuedMessageStatus,
     ) -> Result<()> {
-        // Read and write in one transaction: the flush marks a message
-        // in-flight while a retry may be updating the same row.
-        let db = self.open_db().await?;
-        let tx = db
-            .transaction_on_one_with_mode(OUTBOX_STORE, IdbTransactionMode::Readwrite)
-            .map_err(|e| js_err("tx open", e))?;
-        let store = tx
-            .object_store(OUTBOX_STORE)
-            .map_err(|e| js_err("store open", e))?;
-        let current = store
-            .get_owned(id)
-            .map_err(|e| js_err("get", e))?
-            .await
-            .map_err(|e| js_err("get await", e))?
-            .and_then(|v| v.as_string());
-        let Some(json) = current else {
+        // Read-modify-write, serialised like the trade patches: the flush
+        // marks a message in flight while a retry may touch the same row.
+        let _serial = self.patch_serial.lock().await;
+        let Some(json) = self.get_string(OUTBOX_STORE, id).await? else {
             return Ok(());
         };
         let mut msg: QueuedMessage = serde_json::from_str(&json)?;
         msg.status = status;
-        let json = serde_json::to_string(&msg)?;
-        store
-            .put_key_val_owned(id, &JsValue::from_str(&json))
-            .map_err(|e| js_err("put", e))?;
-        tx.await.into_result().map_err(|e| js_err("tx commit", e))?;
-        Ok(())
+        self.save_queued_message(&msg).await
     }
 
     async fn delete_queued_message(&self, id: &str) -> Result<()> {
@@ -514,22 +476,15 @@ impl Storage for IndexedDbStorage {
 
     async fn delete_trade_by_order_id(&self, order_id: &str) -> Result<()> {
         // `trades.id` is a fresh UUID for takers, so the document is found
-        // through the order id stored inside it, in the same transaction
-        // that deletes it. Messages stay untouched.
-        let db = self.open_db().await?;
-        let tx = db
-            .transaction_on_one_with_mode(TRADES_STORE, IdbTransactionMode::Readwrite)
-            .map_err(|e| js_err("tx open", e))?;
-        let store = tx
-            .object_store(TRADES_STORE)
-            .map_err(|e| js_err("store open", e))?;
-        let Some(doc) = find_document(&store, order_id).await? else {
+        // through the order id stored inside it. Messages stay untouched.
+        // Serialised with the patches so a delete never races one.
+        let _serial = self.patch_serial.lock().await;
+        let Some(doc) = self.trade_document_by_order_id(order_id).await? else {
             return Ok(());
         };
         if let Some(id) = doc.get("id").and_then(serde_json::Value::as_str) {
-            store.delete_owned(id).map_err(|e| js_err("delete", e))?;
+            self.delete_key(TRADES_STORE, id).await?;
         }
-        tx.await.into_result().map_err(|e| js_err("tx commit", e))?;
         Ok(())
     }
 
