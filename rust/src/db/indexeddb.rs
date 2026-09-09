@@ -23,7 +23,7 @@ use web_sys::wasm_bindgen::JsValue;
 use crate::api::types::{
     ChatMessage, IdentityInfo, OrderInfo, QueuedMessageStatus, RelayInfo, TradeInfo,
 };
-use crate::db::{trade_json, Storage};
+use crate::db::{trade_json, web_lock, Storage};
 use crate::queue::outbox::QueuedMessage;
 
 /// Bumped when a store is added; `open_db` creates whatever is missing.
@@ -38,6 +38,10 @@ const IDENTITY_STORE: &str = "identity";
 const OUTBOX_STORE: &str = "queued_messages";
 /// The single identity document's key, mirroring SQLite's `id = 1` row.
 const IDENTITY_KEY: &str = "1";
+/// Origin-wide lock names (see [`web_lock`]): one per store whose documents
+/// are read, changed and written back as a whole.
+const TRADES_LOCK: &str = "mostro:db:trades";
+const OUTBOX_LOCK: &str = "mostro:db:queued_messages";
 const ALL_STORES: [&str; 8] = [
     MESSAGES_STORE,
     SETTINGS_STORE,
@@ -57,7 +61,9 @@ fn js_err(context: &str, e: impl std::fmt::Debug) -> anyhow::Error {
 pub struct IndexedDbStorage {
     /// IndexedDB database name, from `init_db`'s path argument.
     db_name: String,
-    /// Serialises every read-modify-write on a stored document.
+    /// Serialises every read-modify-write on a stored document within this
+    /// context; [`web_lock`] extends the same exclusion across the origin's
+    /// other tabs and workers, which share the database.
     ///
     /// The daemon's status sync, the peer reveal, the reputation follow-up
     /// and the rating marker can all patch the same trade within moments of
@@ -69,8 +75,7 @@ pub struct IndexedDbStorage {
     /// option here: a transaction is only active while its own request
     /// callbacks run, and the Rust future that continues after `await` is
     /// polled from a later task, so the write would hit an inactive
-    /// transaction. The lock gives the same guarantee for this process, the
-    /// only writer of this database.
+    /// transaction.
     patch_serial: tokio::sync::Mutex<()>,
 }
 
@@ -216,15 +221,38 @@ impl IndexedDbStorage {
             .find(|doc| trade_json::order_id_of(doc) == Some(order_id)))
     }
 
+    /// Enters the exclusive section for whole-document writes to a store:
+    /// this context's mutex plus the origin-wide lock `name` when the
+    /// browser provides one. Hold the returned guards for the whole
+    /// read-modify-write.
+    async fn exclusive(
+        &self,
+        name: &str,
+    ) -> (
+        tokio::sync::MutexGuard<'_, ()>,
+        Option<web_lock::OriginLock>,
+    ) {
+        let local = self.patch_serial.lock().await;
+        let origin = web_lock::acquire(name).await;
+        (local, origin)
+    }
+
+    /// Writes one queued message without entering the exclusive section;
+    /// callers already hold it.
+    async fn put_queued_message(&self, msg: &QueuedMessage) -> Result<()> {
+        let json = serde_json::to_string(msg)?;
+        self.put_string(OUTBOX_STORE, &msg.id, &json).await
+    }
+
     /// Loads the trade for `order_id`, applies `patch` and writes it back.
     /// No-op when no trade matches, like an `UPDATE` touching zero rows.
-    /// Serialised through `patch_serial`, see there.
+    /// Serialised through [`Self::exclusive`], see `patch_serial`.
     async fn patch_trade_by_order_id(
         &self,
         order_id: &str,
         patch: impl FnOnce(&mut serde_json::Value) -> Result<()>,
     ) -> Result<()> {
-        let _serial = self.patch_serial.lock().await;
+        let _section = self.exclusive(TRADES_LOCK).await;
         let Some(mut doc) = self.trade_document_by_order_id(order_id).await? else {
             log::warn!(
                 "[db] trade update matched no row for order={}",
@@ -268,6 +296,10 @@ impl Storage for IndexedDbStorage {
         Ok(orders)
     }
     async fn save_trade(&self, trade: &TradeInfo) -> Result<()> {
+        // A whole-document save joins the patches' exclusive section: a
+        // save built from a stale read would otherwise drop a patch landed
+        // in between, in this or another tab.
+        let _section = self.exclusive(TRADES_LOCK).await;
         let json = serde_json::to_string(trade)?;
         self.put_string(TRADES_STORE, &trade.id, &json).await
     }
@@ -361,8 +393,8 @@ impl Storage for IndexedDbStorage {
         self.clear_store(IDENTITY_STORE).await
     }
     async fn save_queued_message(&self, msg: &QueuedMessage) -> Result<()> {
-        let json = serde_json::to_string(msg)?;
-        self.put_string(OUTBOX_STORE, &msg.id, &json).await
+        let _section = self.exclusive(OUTBOX_LOCK).await;
+        self.put_queued_message(msg).await
     }
     async fn list_queued_messages(&self) -> Result<Vec<QueuedMessage>> {
         // Pending only, oldest first, as the SQLite query selects.
@@ -383,16 +415,17 @@ impl Storage for IndexedDbStorage {
     ) -> Result<()> {
         // Read-modify-write, serialised like the trade patches: the flush
         // marks a message in flight while a retry may touch the same row.
-        let _serial = self.patch_serial.lock().await;
+        let _section = self.exclusive(OUTBOX_LOCK).await;
         let Some(json) = self.get_string(OUTBOX_STORE, id).await? else {
             return Ok(());
         };
         let mut msg: QueuedMessage = serde_json::from_str(&json)?;
         msg.status = status;
-        self.save_queued_message(&msg).await
+        self.put_queued_message(&msg).await
     }
 
     async fn delete_queued_message(&self, id: &str) -> Result<()> {
+        let _section = self.exclusive(OUTBOX_LOCK).await;
         self.delete_key(OUTBOX_STORE, id).await
     }
 
@@ -478,7 +511,7 @@ impl Storage for IndexedDbStorage {
         // `trades.id` is a fresh UUID for takers, so the document is found
         // through the order id stored inside it. Messages stay untouched.
         // Serialised with the patches so a delete never races one.
-        let _serial = self.patch_serial.lock().await;
+        let _section = self.exclusive(TRADES_LOCK).await;
         let Some(doc) = self.trade_document_by_order_id(order_id).await? else {
             return Ok(());
         };

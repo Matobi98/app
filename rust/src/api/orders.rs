@@ -3336,7 +3336,18 @@ async fn confirm_payout_completion(order_id: String) {
 
 /// Applies the payout completion the public book reported for a trade this
 /// client still held at `SettledHoldInvoice`.
+///
+/// Re-checked under the per-order lock right before writing: a daemon
+/// message (a dispute, an admin cancel) can move the trade while the book
+/// was being fetched, and that newer status must not be overwritten.
 async fn apply_payout_completed(order_id: &str) {
+    let _order = lock_order(order_id).await;
+    if local_trade_status(order_id).await
+        != Some(crate::api::types::OrderStatus::SettledHoldInvoice)
+    {
+        log::debug!("[orders] payout completion for {order_id} skipped: status moved on");
+        return;
+    }
     let status = crate::api::types::OrderStatus::Success;
     order_book()
         .update_order_status(order_id, status.clone())
@@ -3405,8 +3416,11 @@ async fn fetch_public_order_status(order_id: &str) -> Option<crate::api::types::
             return None;
         }
     };
+    // The filter names the daemon as author; a relay is not trusted to have
+    // honoured it, so the author is checked again here.
     events
         .into_iter()
+        .filter(|e| e.pubkey == mostro_pubkey)
         .max_by_key(|e| e.created_at)
         .and_then(|e| crate::nostr::order_events::parse_order_event(&e, None))
         .map(|o| o.status)

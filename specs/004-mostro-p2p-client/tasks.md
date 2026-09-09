@@ -327,7 +327,7 @@ configuration.
 
 **Goal**: After trade completes both parties are prompted to rate (1–5 stars). Rating optional. Ratings appear on order book cards.
 
-**Independent Test**: Seller releases sats → Rate button appears. Tap → rate screen with 5 stars. Select 4 → Submit enabled → tap Submit → screen closes. Counterparty's reputation score updated on their order cards.
+**Independent Test**: `PurchaseCompleted` moves the trade to `Success` → Rate button appears for both parties. Tap → rate screen with 5 stars. Select 4 → Submit enabled → tap Submit → screen closes. Counterparty's reputation score updated on their order cards.
 
 - [x] T094 Implement reputation API in `rust/src/api/reputation.rs` per `contracts/reputation.md`: `submit_rating(trade_id, score)` — validates 1–5, sends `RateUser` `MostroMessage`. `get_privacy_mode()`, `set_privacy_mode(enabled)`. `get_rating_for_trade(trade_id)`. Errors: `TradeNotComplete`, `PrivacyModeEnabled`, `AlreadyRated`.
 - [x] T095 Implement rate counterpart screen in `lib/features/rate/screens/rate_counterpart_screen.dart`: header "RATE" (uppercase gray). Success indicator: green double-lightning-bolt + "Successful order" text. 5-star `StarRating` widget. "X / 5" display below stars. Submit button (green filled, disabled until `_rating > 0`) + Close button (green outline, skips rating). Route: `/rate_user/:orderId`. Both parties prompted at `Success` (the buyer payout completed, `PurchaseCompleted`); `SettledHoldInvoice` is shown as payout pending and offers no rating yet.

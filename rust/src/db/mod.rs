@@ -1,6 +1,8 @@
 pub mod app_db;
 #[cfg(target_arch = "wasm32")]
 pub mod indexeddb;
+#[cfg(target_arch = "wasm32")]
+pub mod web_lock;
 pub mod schema;
 pub mod seeds;
 #[cfg(not(target_arch = "wasm32"))]
