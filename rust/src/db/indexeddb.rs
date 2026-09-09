@@ -8,9 +8,16 @@
 /// a storage error is returned as `Err`, and the chat pipeline drops the
 /// event rather than treating it as unseen.
 ///
-/// Everything else remains stubbed until the full IndexedDB backend lands
-/// (#233): reads answer "nothing stored" and writes are dropped, so callers
-/// fall back to their defaults instead of failing.
+/// **Trades and trade keys are implemented** (part of #233): without them a
+/// Web client never lists the orders it creates or takes, and cannot sign for
+/// them again after a reload. Each trade is one JSON document keyed by
+/// `TradeInfo::id`, patched with [`crate::db::trade_json`] exactly as the
+/// SQLite backend patches rows with `json_set`. Trade keys map an order id to
+/// its BIP-32 index.
+///
+/// Orders, relays, identity and the outbox remain stubbed until the rest of
+/// #233 lands: reads answer "nothing stored" and writes are dropped, so
+/// callers fall back to their defaults instead of failing.
 use anyhow::{anyhow, Result};
 use indexed_db_futures::prelude::*;
 use web_sys::wasm_bindgen::JsValue;
@@ -18,12 +25,21 @@ use web_sys::wasm_bindgen::JsValue;
 use crate::api::types::{
     ChatMessage, IdentityInfo, OrderInfo, QueuedMessageStatus, RelayInfo, TradeInfo,
 };
-use crate::db::Storage;
+use crate::db::{trade_json, Storage};
 use crate::queue::outbox::QueuedMessage;
 
-const DB_VERSION: u32 = 1;
+/// Bumped when a store is added; `open_db` creates whatever is missing.
+const DB_VERSION: u32 = 2;
 const MESSAGES_STORE: &str = "messages";
 const SETTINGS_STORE: &str = "settings";
+const TRADES_STORE: &str = "trades";
+const TRADE_KEYS_STORE: &str = "trade_keys";
+const ALL_STORES: [&str; 4] = [
+    MESSAGES_STORE,
+    SETTINGS_STORE,
+    TRADES_STORE,
+    TRADE_KEYS_STORE,
+];
 
 /// Map an opaque JS-side error into an `anyhow` error the trait can carry.
 fn js_err(context: &str, e: impl std::fmt::Debug) -> anyhow::Error {
@@ -55,18 +71,15 @@ impl IndexedDbStorage {
     async fn open_db(&self) -> Result<IdbDatabase> {
         let mut req = IdbDatabase::open_u32(&self.db_name, DB_VERSION)
             .map_err(|e| js_err("indexeddb open", e))?;
-        req.set_on_upgrade_needed(Some(
-            |evt: &IdbVersionChangeEvent| -> Result<(), JsValue> {
-                let db = evt.db();
-                if !db.object_store_names().any(|n| n == MESSAGES_STORE) {
-                    db.create_object_store(MESSAGES_STORE)?;
+        req.set_on_upgrade_needed(Some(|evt: &IdbVersionChangeEvent| -> Result<(), JsValue> {
+            let db = evt.db();
+            for store in ALL_STORES {
+                if !db.object_store_names().any(|n| n == store) {
+                    db.create_object_store(store)?;
                 }
-                if !db.object_store_names().any(|n| n == SETTINGS_STORE) {
-                    db.create_object_store(SETTINGS_STORE)?;
-                }
-                Ok(())
-            },
-        ));
+            }
+            Ok(())
+        }));
         req.await.map_err(|e| js_err("indexeddb open await", e))
     }
 
@@ -119,6 +132,88 @@ impl IndexedDbStorage {
             .map_err(|e| js_err("get_all await", e))?;
         Ok(array.iter().filter_map(|v| v.as_string()).collect())
     }
+    /// Removes `key` from `store_name`; an absent key is not an error.
+    async fn delete_key(&self, store_name: &str, key: &str) -> Result<()> {
+        let db = self.open_db().await?;
+        let tx = db
+            .transaction_on_one_with_mode(store_name, IdbTransactionMode::Readwrite)
+            .map_err(|e| js_err("tx open", e))?;
+        let store = tx
+            .object_store(store_name)
+            .map_err(|e| js_err("store open", e))?;
+        store.delete_owned(key).map_err(|e| js_err("delete", e))?;
+        tx.await.into_result().map_err(|e| js_err("tx commit", e))?;
+        Ok(())
+    }
+
+    /// Removes every entry of `store_name`.
+    async fn clear_store(&self, store_name: &str) -> Result<()> {
+        let db = self.open_db().await?;
+        let tx = db
+            .transaction_on_one_with_mode(store_name, IdbTransactionMode::Readwrite)
+            .map_err(|e| js_err("tx open", e))?;
+        let store = tx
+            .object_store(store_name)
+            .map_err(|e| js_err("store open", e))?;
+        store.clear().map_err(|e| js_err("clear", e))?;
+        tx.await.into_result().map_err(|e| js_err("tx commit", e))?;
+        Ok(())
+    }
+
+    /// Every stored trade as a JSON document, newest `started_at` first.
+    /// A document that no longer parses is skipped with a warning, as the
+    /// SQLite backend does, rather than hiding every other trade.
+    async fn trade_documents(&self) -> Result<Vec<serde_json::Value>> {
+        let mut docs: Vec<serde_json::Value> = self
+            .get_all_strings(TRADES_STORE)
+            .await?
+            .iter()
+            .filter_map(|json| match serde_json::from_str(json) {
+                Ok(doc) => Some(doc),
+                Err(e) => {
+                    log::warn!("[db] skipping unreadable trade document: {e}");
+                    None
+                }
+            })
+            .collect();
+        docs.sort_by_key(|doc| std::cmp::Reverse(trade_json::started_at_of(doc)));
+        Ok(docs)
+    }
+
+    /// The stored trade document whose `order.id` is `order_id`.
+    async fn trade_document_by_order_id(
+        &self,
+        order_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(self
+            .trade_documents()
+            .await?
+            .into_iter()
+            .find(|doc| trade_json::order_id_of(doc) == Some(order_id)))
+    }
+
+    /// Loads the trade for `order_id`, applies `patch` and writes it back.
+    /// No-op when no trade matches, like an `UPDATE` touching zero rows.
+    async fn patch_trade_by_order_id(
+        &self,
+        order_id: &str,
+        patch: impl FnOnce(&mut serde_json::Value) -> Result<()>,
+    ) -> Result<()> {
+        let Some(mut doc) = self.trade_document_by_order_id(order_id).await? else {
+            log::warn!(
+                "[db] trade update matched no row for order={}",
+                crate::api::logging::short_id(order_id)
+            );
+            return Ok(());
+        };
+        patch(&mut doc)?;
+        let key = doc
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("trade document without an id"))?
+            .to_owned();
+        self.put_string(TRADES_STORE, &key, &doc.to_string()).await
+    }
 }
 
 impl Storage for IndexedDbStorage {
@@ -134,17 +229,30 @@ impl Storage for IndexedDbStorage {
     async fn list_orders(&self) -> Result<Vec<OrderInfo>> {
         Err(anyhow!("IndexedDB not yet implemented"))
     }
-    async fn save_trade(&self, _trade: &TradeInfo) -> Result<()> {
-        Err(anyhow!("IndexedDB not yet implemented"))
+    async fn save_trade(&self, trade: &TradeInfo) -> Result<()> {
+        let json = serde_json::to_string(trade)?;
+        self.put_string(TRADES_STORE, &trade.id, &json).await
     }
-    async fn get_trade(&self, _id: &str) -> Result<Option<TradeInfo>> {
-        Err(anyhow!("IndexedDB not yet implemented"))
+    async fn get_trade(&self, id: &str) -> Result<Option<TradeInfo>> {
+        Ok(self
+            .get_string(TRADES_STORE, id)
+            .await?
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?)
     }
     async fn list_trades(&self) -> Result<Vec<TradeInfo>> {
-        // Consumed by `resubscribe_active_chats` at startup: no persisted
-        // trades yet on web (tracked in #233), so nothing to resubscribe —
-        // an empty list, not an error.
-        Ok(Vec::new())
+        Ok(self
+            .trade_documents()
+            .await?
+            .into_iter()
+            .filter_map(|doc| match serde_json::from_value::<TradeInfo>(doc) {
+                Ok(trade) => Some(trade),
+                Err(e) => {
+                    log::warn!("[db] skipping trade: deserialization failed: {e}");
+                    None
+                }
+            })
+            .collect())
     }
 
     // ── Chat messages — fully implemented (durable replay dedup, #246) ──────
@@ -220,24 +328,52 @@ impl Storage for IndexedDbStorage {
         Err(anyhow!("IndexedDB not yet implemented"))
     }
 
-    async fn save_trade_key(&self, _order_id: &str, _key_index: u32) -> Result<()> {
-        Ok(()) // no-op: IndexedDB persistence not yet implemented (#233)
+    async fn save_trade_key(&self, order_id: &str, key_index: u32) -> Result<()> {
+        self.put_string(TRADE_KEYS_STORE, order_id, &key_index.to_string())
+            .await
     }
 
-    async fn get_trade_key(&self, _order_id: &str) -> Result<Option<u32>> {
-        Ok(None) // no persisted key: caller will treat absence correctly
+    async fn get_trade_key(&self, order_id: &str) -> Result<Option<u32>> {
+        self.get_string(TRADE_KEYS_STORE, order_id)
+            .await?
+            .map(|value| {
+                value
+                    .parse::<u32>()
+                    .map_err(|e| anyhow!("trade key for {order_id} is not a u32: {e}"))
+            })
+            .transpose()
     }
 
-    async fn get_order_id_by_trade_index(&self, _key_index: u32) -> Result<Option<String>> {
-        Ok(None) // IndexedDB not yet implemented (#233)
+    async fn get_order_id_by_trade_index(&self, key_index: u32) -> Result<Option<String>> {
+        // Reverse lookup over a small store: one entry per trade this
+        // identity has taken part in.
+        let db = self.open_db().await?;
+        let tx = db
+            .transaction_on_one_with_mode(TRADE_KEYS_STORE, IdbTransactionMode::Readonly)
+            .map_err(|e| js_err("tx open", e))?;
+        let store = tx
+            .object_store(TRADE_KEYS_STORE)
+            .map_err(|e| js_err("store open", e))?;
+        let keys = store
+            .get_all_keys()
+            .map_err(|e| js_err("get_all_keys", e))?
+            .await
+            .map_err(|e| js_err("get_all_keys await", e))?;
+        let wanted = key_index.to_string();
+        for key in keys.iter().filter_map(|k| k.as_string()) {
+            if self.get_string(TRADE_KEYS_STORE, &key).await?.as_deref() == Some(wanted.as_str()) {
+                return Ok(Some(key));
+            }
+        }
+        Ok(None)
     }
 
-    async fn delete_trade_key(&self, _order_id: &str) -> Result<()> {
-        Ok(()) // IndexedDB not yet implemented (#233)
+    async fn delete_trade_key(&self, order_id: &str) -> Result<()> {
+        self.delete_key(TRADE_KEYS_STORE, order_id).await
     }
 
     async fn clear_trade_keys(&self) -> Result<()> {
-        Ok(()) // IndexedDB not yet implemented (#233)
+        self.clear_store(TRADE_KEYS_STORE).await
     }
 
     // ── Settings KV — fully implemented (chat cursor + preferences, #246) ───
@@ -251,83 +387,84 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn delete_setting(&self, key: &str) -> Result<()> {
-        let db = self.open_db().await?;
-        let tx = db
-            .transaction_on_one_with_mode(SETTINGS_STORE, IdbTransactionMode::Readwrite)
-            .map_err(|e| js_err("tx open", e))?;
-        let store = tx
-            .object_store(SETTINGS_STORE)
-            .map_err(|e| js_err("store open", e))?;
-        store.delete_owned(key).map_err(|e| js_err("delete", e))?;
-        tx.await.into_result().map_err(|e| js_err("tx commit", e))?;
-        Ok(())
+        self.delete_key(SETTINGS_STORE, key).await
     }
 
     async fn save_active_mostro_pubkey(&self, pubkey: &str) -> Result<()> {
-        self.set_setting(settings_keys_active_pubkey(), pubkey).await
+        self.set_setting(settings_keys_active_pubkey(), pubkey)
+            .await
     }
 
     async fn get_active_mostro_pubkey(&self) -> Result<Option<String>> {
         self.get_setting(settings_keys_active_pubkey()).await
     }
 
-    async fn get_trade_by_order_id(&self, _order_id: &str) -> Result<Option<TradeInfo>> {
-        Ok(None) // no persisted trade: role lookup returns None (#233)
+    async fn get_trade_by_order_id(&self, order_id: &str) -> Result<Option<TradeInfo>> {
+        self.trade_document_by_order_id(order_id)
+            .await?
+            .map(|doc| serde_json::from_value(doc).map_err(Into::into))
+            .transpose()
     }
 
-    async fn delete_trade_by_order_id(&self, _order_id: &str) -> Result<()> {
-        Ok(()) // no persisted trades on web: nothing to delete (#233)
-    }
-
-    async fn update_trade_order_id(
-        &self,
-        _old_order_id: &str,
-        _new_order_id: &str,
-    ) -> Result<()> {
-        log::warn!("update_trade_order_id: IndexedDB backend not implemented — trade order ID will not persist");
+    async fn delete_trade_by_order_id(&self, order_id: &str) -> Result<()> {
+        // `trades.id` is a fresh UUID for takers, so the document is found
+        // through the order id stored inside it. Messages stay untouched.
+        let Some(doc) = self.trade_document_by_order_id(order_id).await? else {
+            return Ok(());
+        };
+        if let Some(id) = doc.get("id").and_then(serde_json::Value::as_str) {
+            self.delete_key(TRADES_STORE, id).await?;
+        }
         Ok(())
+    }
+
+    async fn update_trade_order_id(&self, old_order_id: &str, new_order_id: &str) -> Result<()> {
+        self.patch_trade_by_order_id(old_order_id, |doc| {
+            trade_json::rename_order_id(doc, new_order_id)
+        })
+        .await
     }
 
     async fn update_trade_fields(
         &self,
-        _order_id: &str,
-        _status: Option<crate::api::types::OrderStatus>,
-        _hold_invoice: Option<String>,
-        _amount_sats: Option<u64>,
+        order_id: &str,
+        status: Option<crate::api::types::OrderStatus>,
+        hold_invoice: Option<String>,
+        amount_sats: Option<u64>,
     ) -> Result<()> {
-        log::warn!("update_trade_fields: IndexedDB backend not implemented — trade fields will not persist");
-        Ok(())
+        self.patch_trade_by_order_id(order_id, |doc| {
+            trade_json::apply_fields(doc, status.as_ref(), hold_invoice.as_deref(), amount_sats)
+        })
+        .await
     }
 
     async fn update_trade_peer_reputation(
         &self,
-        _order_id: &str,
-        _rating: f64,
-        _reviews: u32,
-        _days: u32,
+        order_id: &str,
+        rating: f64,
+        reviews: u32,
+        days: u32,
     ) -> Result<()> {
-        log::warn!("update_trade_peer_reputation: IndexedDB backend not implemented — peer reputation will not persist");
-        Ok(())
+        self.patch_trade_by_order_id(order_id, |doc| {
+            trade_json::set_peer_reputation(doc, rating, reviews, days)
+        })
+        .await
     }
 
-    async fn mark_trade_rated(&self, _order_id: &str, _rated_at: i64) -> Result<()> {
-        log::warn!("mark_trade_rated: IndexedDB backend not implemented — rated marker will not persist");
-        Ok(())
+    async fn mark_trade_rated(&self, order_id: &str, rated_at: i64) -> Result<()> {
+        self.patch_trade_by_order_id(order_id, |doc| trade_json::mark_rated(doc, rated_at))
+            .await
     }
 
     async fn update_trade_counterparty(
         &self,
-        _order_id: &str,
-        _counterparty_pubkey: &str,
+        order_id: &str,
+        counterparty_pubkey: &str,
     ) -> Result<()> {
-        // No trades store on web yet (#233): chat identity survives only via
-        // the in-memory session created at reveal time. `debug`, not `warn`
-        // (unlike `mark_trade_rated`, once per trade): this fires for every
-        // qualifying daemon message and every replayed one, so at `warn` it
-        // floods the web log with a line that carries no information after
-        // the first.
-        log::debug!("update_trade_counterparty: IndexedDB backend not implemented — counterparty will not persist");
-        Ok(())
+        self.patch_trade_by_order_id(order_id, |doc| {
+            trade_json::set_counterparty(doc, counterparty_pubkey)
+        })
+        .await
     }
 }
 
