@@ -1618,5 +1618,8 @@
   "settingsEscrowEffectiveMint": "Effective mint: {mint}",
   "@settingsEscrowEffectiveMint": {"description": "Settings — the mint the app is actually acting on, overrides included", "placeholders": {"mint": {"type": "String"}}},
   "settingsEscrowCashuUnavailable": "Cashu cannot run without a mint — set one below.",
-  "@settingsEscrowCashuUnavailable": {"description": "Settings — warning shown when Cashu mode is on but no mint is available, so no Cashu path can run"}
+  "@settingsEscrowCashuUnavailable": {"description": "Settings — warning shown when Cashu mode is on but no mint is available, so no Cashu path can run"},
+  "tradeStatusPayoutPending": "Payout pending",
+  "tradeHeadlinePayoutPending": "Waiting for the buyer payout",
+  "tradeInstructionPayoutPending": "The seller released the escrow. Waiting for the Lightning payment to the buyer to succeed."
 }

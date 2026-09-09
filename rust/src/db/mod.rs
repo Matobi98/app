@@ -1,10 +1,16 @@
 pub mod app_db;
+#[cfg(target_arch = "wasm32")]
+pub mod indexeddb;
+#[cfg(target_arch = "wasm32")]
+pub mod web_lock;
 pub mod schema;
 pub mod seeds;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod sqlite;
-#[cfg(target_arch = "wasm32")]
-pub mod indexeddb;
+/// Used by the IndexedDB backend; compiled everywhere so its unit tests run
+/// natively, where the trait implementation that calls it does not exist.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub mod trade_json;
 
 use anyhow::Result;
 
@@ -131,13 +137,8 @@ pub trait Storage: Send + Sync {
     /// imported identity starts with a fresh trade key counter.
     async fn delete_identity(&self) -> Result<()>;
 
-    async fn save_queued_message(
-        &self,
-        msg: &crate::queue::outbox::QueuedMessage,
-    ) -> Result<()>;
-    async fn list_queued_messages(
-        &self,
-    ) -> Result<Vec<crate::queue::outbox::QueuedMessage>>;
+    async fn save_queued_message(&self, msg: &crate::queue::outbox::QueuedMessage) -> Result<()>;
+    async fn list_queued_messages(&self) -> Result<Vec<crate::queue::outbox::QueuedMessage>>;
     async fn update_queued_message_status(
         &self,
         id: &str,
@@ -205,11 +206,7 @@ pub trait Storage: Send + Sync {
     ///
     /// Loads the trade whose `order.id == old_order_id`, replaces `order.id`
     /// with `new_order_id`, and re-saves it. No-op when no matching trade exists.
-    async fn update_trade_order_id(
-        &self,
-        old_order_id: &str,
-        new_order_id: &str,
-    ) -> Result<()>;
+    async fn update_trade_order_id(&self, old_order_id: &str, new_order_id: &str) -> Result<()>;
 
     /// Update fields on a persisted trade identified by `order.id`.
     ///

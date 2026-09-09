@@ -104,7 +104,8 @@ class AutomationIds {
   static const String orderAddBuy = 'order.add.buy';
   static const String orderAddSell = 'order.add.sell';
   static const String orderCreateCurrency = 'order.create.currency';
-  static const String orderCreateCurrencySearch = 'order.create.currency.search';
+  static const String orderCreateCurrencySearch =
+      'order.create.currency.search';
   static const String orderCreateFiatAmount = 'order.create.fiat_amount';
   static const String orderCreatePaymentMethod = 'order.create.payment_method';
   static const String orderCreatePriceType = 'order.create.price_type';
@@ -153,10 +154,13 @@ class AutomationIds {
   // Buyer invoice (NWC generated or manual) and hold-invoice payment
   static const String invoiceNwcText = 'invoice.nwc.text';
   static const String invoiceManual = 'invoice.manual';
+  static const String invoiceAmount = 'invoice.amount';
+  static const String invoiceOrderId = 'invoice.order_id';
   static const String invoiceText = 'invoice.text';
   static const String invoiceSubmit = 'invoice.submit';
   static const String invoiceCancel = 'invoice.cancel';
   static const String payInvoiceText = 'pay.invoice.text';
+  static const String payOrderId = 'pay.order_id';
   static const String payNwc = 'pay.nwc';
   static const String payCancel = 'pay.cancel';
 }

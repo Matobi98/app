@@ -51,12 +51,13 @@ fails the build when an identifier is declared and attached to nothing.
 
 | Identifier | Value |
 |---|---|
-| `order.status` | The kebab-case name of `TradeStatus`: `loading`, `pending`, `waiting-invoice`, `waiting-payment`, `in-progress`, `active`, `fiat-sent`, `completed`, `cancelled`, `disputed`, `pending-rating`, `rated`. Never the localized pill copy. |
+| `order.status` | The kebab-case name of `TradeStatus`: `loading`, `pending`, `waiting-invoice`, `waiting-payment`, `in-progress`, `active`, `fiat-sent`, `payout-pending`, `completed`, `cancelled`, `disputed`, `pending-rating`, `rated`. Never the localized pill copy. |
 | `order.id` | The full order id, where the visible text is shortened. |
 | `keys.public_key` | The identity's full public key. |
 | `settings.mostro_node.pubkey` | The active daemon's full public key, where the visible subtitle is truncated. |
 | `wallet.connection` | `connected` or `disconnected`. |
 | `pay.invoice.text` | The hold invoice (`bolt11`), which is otherwise only drawn as a QR code or paid directly by the wallet. |
+| `pay.order_id` | The exact order ID shown in the seller invoice screen's app bar, including while its invoice is loading. |
 | `invoice.nwc.text` | The buyer invoice NWC generated, for payment correlation. |
 | `settings.relays.item.<url>` | The relay's URL. |
 
@@ -110,3 +111,52 @@ how they start.
 
 Attaching an identifier changes no behaviour. The entry point, the relay seed
 and the banner apply only to a build that carries the define.
+
+## Linux and Web execution
+
+Web exposes `Semantics.identifier` as `flt-semantics-identifier` in the
+rendered semantics DOM. The test entry point enables semantics from startup.
+Build the Rust core with `scripts/build-web.sh --release` before Flutter Web
+and serve cross-origin isolation headers.
+
+The current Flutter Linux engine does not forward `Semantics.identifier` to
+AT-SPI. Only in an armed Mortsom build, `AutomationId` prefixes its accessible
+name with `[mortsom:<identifier>]`. Flutter can merge parent metadata ahead of
+that name: a native tab exposes `Tab 2 of 2\n[mortsom:order.book.tab.sell]\nSell BTC`.
+The marker therefore starts a line, which is not necessarily the first line
+of the final AT-SPI name. Mortsom recognizes exactly one marker at a line
+boundary and invokes the merged node's public AT-SPI action; it never matches
+an identifier embedded in ordinary prose. An explicit readout follows the
+closing bracket exactly; ordinary controls retain their merged descendant
+labels. Production builds retain their original accessible labels.
+
+Each Linux actor must have its own DBus session, Secret Service and XDG
+directories. XDG isolation alone does not isolate FlutterSecureStorage.
+
+### Buyer payout completion
+
+`payout-pending` is nonterminal: the seller escrow has settled but the buyer payout has not yet been confirmed. Continue observing until the protocol status is `OrderStatus::Success`; only then may the UI expose `pending-rating` or completion. A released escrow alone never authorizes rating or a completed-trade assertion.
+
+
+### Manual buyer invoice readouts
+
+`invoice.amount` exposes the positive unsigned number of sats requested by the daemon, alongside the
+ordinary amount shown on the manual invoice form. `invoice.order_id` exposes the visible order reference on
+that same form. Automation must verify the requested order and amount before generating an invoice, retain
+its exact hash and amount before submission, and verify field readback before pressing submit. The manual
+submission returns to the matching trade detail (`order.id` and `order.status`).
+
+Taking a sell order without a configured Lightning address opens the buyer invoice form directly;
+taking a buy order opens the seller's hold-invoice screen directly. These routes need not expose
+`order.status`. For the desktop manual-wallet checkpoint, automation may normalize the visible
+`invoice.text` form to `Taken` with raw label `waiting-invoice`, or the visible `pay.invoice.text`
+form to `Taken` with raw label `waiting-payment`, only after its `invoice.order_id` or `pay.order_id`
+exactly matches the requested order. A form for another order never proves a state or authorizes payment.
+Automation retains the matching form for the next action rather than reopening it. After buyer submission,
+or after the seller screen automatically observes accepted payment, the app returns to trade detail;
+subsequent state assertions read its normal status. Both invoice screens expose `appbar.back` on their
+ordinary BackButton when navigation can pop; this action never invokes the order-cancellation control.
+
+The release action stays on trade detail while payment finalizes. An early rating notification or direct
+rating route also waits for final success. The historical order-preset selector still categorizes settled
+escrow as a successful preset; auditing that unrelated history surface is a follow-up.
