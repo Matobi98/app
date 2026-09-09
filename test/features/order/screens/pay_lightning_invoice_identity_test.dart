@@ -90,7 +90,7 @@ void main() {
           );
           expect(
             tester.getSemantics(id('appbar.back')),
-            isSemantics(hasTapAction: true),
+            containsSemantics(hasTapAction: true),
           );
           await tester.tap(id('appbar.back'));
           await tester.pumpAndSettle();

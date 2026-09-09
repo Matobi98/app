@@ -54,7 +54,7 @@ void main() {
       );
       expect(
         tester.getSemantics(find.byType(ElevatedButton)),
-        isSemantics(
+        containsSemantics(
           identifier: AutomationIds.tradeRelease,
           label: 'Release',
           hasTapAction: true,
@@ -92,7 +92,7 @@ void main() {
       expect(button.getSemanticsData().label, contains('Release'));
       expect(
         button,
-        isSemantics(
+        containsSemantics(
           identifier: AutomationIds.tradeRelease,
           isEnabled: true,
           hasTapAction: true,
@@ -159,7 +159,7 @@ void main() {
         );
         expect(
           tab,
-          isSemantics(
+          containsSemantics(
             identifier: AutomationIds.orderBookTabSell,
             hasTapAction: true,
             isSelected: false,
@@ -169,7 +169,7 @@ void main() {
         await tester.pumpAndSettle();
         expect(
           tester.getSemantics(semantic(AutomationIds.orderBookTabSell)),
-          isSemantics(isSelected: true),
+          containsSemantics(isSelected: true),
         );
       } finally {
         semantics.dispose();
@@ -227,7 +227,7 @@ void main() {
       }
       expect(
         tester.getSemantics(semantic(AutomationIds.navTrades)),
-        isSemantics(hasTapAction: true),
+        containsSemantics(hasTapAction: true),
       );
       await tester.tap(semantic(AutomationIds.navTrades));
       await tester.pumpAndSettle();

@@ -39,7 +39,7 @@ void main() {
     // the placeholder must not leak into it as if it were a key.
     expect(
       tester.getSemantics(find.byType(PublicKeyCard)),
-      isSemantics(identifier: AutomationIds.keysPublicKey, label: ''),
+      containsSemantics(identifier: AutomationIds.keysPublicKey, label: ''),
     );
   });
 
@@ -50,7 +50,7 @@ void main() {
     // The visible text ellipsizes at the card's width; the readout does not.
     expect(
       tester.getSemantics(find.byType(PublicKeyCard)),
-      isSemantics(identifier: AutomationIds.keysPublicKey, label: key),
+      containsSemantics(identifier: AutomationIds.keysPublicKey, label: key),
     );
   });
 
@@ -63,7 +63,7 @@ void main() {
     expect(find.text(key), findsNothing);
     expect(
       tester.getSemantics(find.byType(PublicKeyCard)),
-      isSemantics(
+      containsSemantics(
         identifier: AutomationIds.keysPublicKey,
         label: replacement,
       ),
