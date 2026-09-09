@@ -8,16 +8,14 @@
 /// a storage error is returned as `Err`, and the chat pipeline drops the
 /// event rather than treating it as unseen.
 ///
-/// **Trades and trade keys are implemented** (part of #233): without them a
-/// Web client never lists the orders it creates or takes, and cannot sign for
-/// them again after a reload. Each trade is one JSON document keyed by
-/// `TradeInfo::id`, patched with [`crate::db::trade_json`] exactly as the
-/// SQLite backend patches rows with `json_set`. Trade keys map an order id to
-/// its BIP-32 index.
-///
-/// Orders, relays, identity and the outbox remain stubbed until the rest of
-/// #233 lands: reads answer "nothing stored" and writes are dropped, so
-/// callers fall back to their defaults instead of failing.
+/// **Every store is implemented** (#233). Each record is one JSON document
+/// keyed the way the SQLite table keys its row: trades by `TradeInfo::id`
+/// (patched with [`crate::db::trade_json`] exactly as SQLite patches rows with
+/// `json_set`), trade keys by order id, orders by id, relays by URL, the
+/// single identity under a fixed key, queued messages by id. Once `init_db`
+/// opens this store on the web, `derive_trade_key` requires identity
+/// persistence to succeed before it hands out a key, so a stub here would
+/// stop every order from being created.
 use anyhow::{anyhow, Result};
 use indexed_db_futures::prelude::*;
 use web_sys::wasm_bindgen::JsValue;
@@ -29,16 +27,26 @@ use crate::db::{trade_json, Storage};
 use crate::queue::outbox::QueuedMessage;
 
 /// Bumped when a store is added; `open_db` creates whatever is missing.
-const DB_VERSION: u32 = 2;
+const DB_VERSION: u32 = 3;
 const MESSAGES_STORE: &str = "messages";
 const SETTINGS_STORE: &str = "settings";
 const TRADES_STORE: &str = "trades";
 const TRADE_KEYS_STORE: &str = "trade_keys";
-const ALL_STORES: [&str; 4] = [
+const ORDERS_STORE: &str = "orders";
+const RELAYS_STORE: &str = "relays";
+const IDENTITY_STORE: &str = "identity";
+const OUTBOX_STORE: &str = "queued_messages";
+/// The single identity document's key, mirroring SQLite's `id = 1` row.
+const IDENTITY_KEY: &str = "1";
+const ALL_STORES: [&str; 8] = [
     MESSAGES_STORE,
     SETTINGS_STORE,
     TRADES_STORE,
     TRADE_KEYS_STORE,
+    ORDERS_STORE,
+    RELAYS_STORE,
+    IDENTITY_STORE,
+    OUTBOX_STORE,
 ];
 
 /// Map an opaque JS-side error into an `anyhow` error the trait can carry.
@@ -217,17 +225,29 @@ impl IndexedDbStorage {
 }
 
 impl Storage for IndexedDbStorage {
-    async fn save_order(&self, _order: &OrderInfo) -> Result<()> {
-        Err(anyhow!("IndexedDB not yet implemented"))
+    async fn save_order(&self, order: &OrderInfo) -> Result<()> {
+        let json = serde_json::to_string(order)?;
+        self.put_string(ORDERS_STORE, &order.id, &json).await
     }
-    async fn get_order(&self, _id: &str) -> Result<Option<OrderInfo>> {
-        Err(anyhow!("IndexedDB not yet implemented"))
+    async fn get_order(&self, id: &str) -> Result<Option<OrderInfo>> {
+        Ok(self
+            .get_string(ORDERS_STORE, id)
+            .await?
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?)
     }
-    async fn delete_order(&self, _id: &str) -> Result<()> {
-        Err(anyhow!("IndexedDB not yet implemented"))
+    async fn delete_order(&self, id: &str) -> Result<()> {
+        self.delete_key(ORDERS_STORE, id).await
     }
     async fn list_orders(&self) -> Result<Vec<OrderInfo>> {
-        Err(anyhow!("IndexedDB not yet implemented"))
+        let mut orders: Vec<OrderInfo> = self
+            .get_all_strings(ORDERS_STORE)
+            .await?
+            .iter()
+            .filter_map(|json| serde_json::from_str(json).ok())
+            .collect();
+        orders.sort_by_key(|o| std::cmp::Reverse(o.created_at));
+        Ok(orders)
     }
     async fn save_trade(&self, trade: &TradeInfo) -> Result<()> {
         let json = serde_json::to_string(trade)?;
@@ -293,39 +313,65 @@ impl Storage for IndexedDbStorage {
         Ok(self.get_string(MESSAGES_STORE, id).await?.is_some())
     }
 
-    async fn save_relay(&self, _relay: &RelayInfo) -> Result<()> {
-        Err(anyhow!("IndexedDB not yet implemented"))
+    async fn save_relay(&self, relay: &RelayInfo) -> Result<()> {
+        let json = serde_json::to_string(relay)?;
+        self.put_string(RELAYS_STORE, &relay.url, &json).await
     }
-    async fn delete_relay(&self, _url: &str) -> Result<()> {
-        Err(anyhow!("IndexedDB not yet implemented"))
+    async fn delete_relay(&self, url: &str) -> Result<()> {
+        self.delete_key(RELAYS_STORE, url).await
     }
     async fn list_relays(&self) -> Result<Vec<RelayInfo>> {
-        Err(anyhow!("IndexedDB not yet implemented"))
+        Ok(self
+            .get_all_strings(RELAYS_STORE)
+            .await?
+            .iter()
+            .filter_map(|json| serde_json::from_str(json).ok())
+            .collect())
     }
-    async fn save_identity(&self, _identity: &IdentityInfo) -> Result<()> {
-        Err(anyhow!("IndexedDB not yet implemented"))
+    async fn save_identity(&self, identity: &IdentityInfo) -> Result<()> {
+        let json = serde_json::to_string(identity)?;
+        self.put_string(IDENTITY_STORE, IDENTITY_KEY, &json).await
     }
     async fn get_identity(&self) -> Result<Option<IdentityInfo>> {
-        Err(anyhow!("IndexedDB not yet implemented"))
+        Ok(self
+            .get_string(IDENTITY_STORE, IDENTITY_KEY)
+            .await?
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?)
     }
     async fn delete_identity(&self) -> Result<()> {
-        Err(anyhow!("IndexedDB not yet implemented"))
+        self.clear_store(IDENTITY_STORE).await
     }
-    async fn save_queued_message(&self, _msg: &QueuedMessage) -> Result<()> {
-        Err(anyhow!("IndexedDB not yet implemented"))
+    async fn save_queued_message(&self, msg: &QueuedMessage) -> Result<()> {
+        let json = serde_json::to_string(msg)?;
+        self.put_string(OUTBOX_STORE, &msg.id, &json).await
     }
     async fn list_queued_messages(&self) -> Result<Vec<QueuedMessage>> {
-        Err(anyhow!("IndexedDB not yet implemented"))
+        // Pending only, oldest first, as the SQLite query selects.
+        let mut pending: Vec<QueuedMessage> = self
+            .get_all_strings(OUTBOX_STORE)
+            .await?
+            .iter()
+            .filter_map(|json| serde_json::from_str::<QueuedMessage>(json).ok())
+            .filter(|m| m.status == QueuedMessageStatus::Pending)
+            .collect();
+        pending.sort_by_key(|m| m.created_at);
+        Ok(pending)
     }
     async fn update_queued_message_status(
         &self,
-        _id: &str,
-        _status: QueuedMessageStatus,
+        id: &str,
+        status: QueuedMessageStatus,
     ) -> Result<()> {
-        Err(anyhow!("IndexedDB not yet implemented"))
+        let Some(json) = self.get_string(OUTBOX_STORE, id).await? else {
+            return Ok(());
+        };
+        let mut msg: QueuedMessage = serde_json::from_str(&json)?;
+        msg.status = status;
+        self.save_queued_message(&msg).await
     }
-    async fn delete_queued_message(&self, _id: &str) -> Result<()> {
-        Err(anyhow!("IndexedDB not yet implemented"))
+    async fn delete_queued_message(&self, id: &str) -> Result<()> {
+        self.delete_key(OUTBOX_STORE, id).await
     }
 
     async fn save_trade_key(&self, order_id: &str, key_index: u32) -> Result<()> {
