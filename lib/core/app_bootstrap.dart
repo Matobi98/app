@@ -27,7 +27,8 @@ import 'package:mostro/src/rust/api/orders.dart' as orders_api;
 import 'package:mostro/src/rust/api/settings.dart' as settings_api;
 import 'package:mostro/src/rust/api/bond.dart' as bond_api;
 import 'package:mostro/src/rust/api/identity.dart' as identity_api;
-import 'package:mostro/src/rust/api/types.dart' show SlashCause, BondSlashedEvent;
+import 'package:mostro/src/rust/api/types.dart'
+    show SlashCause, BondSlashedEvent;
 import 'package:mostro/features/notifications/models/notification_model.dart';
 import 'package:mostro/features/notifications/providers/notifications_provider.dart';
 
@@ -51,7 +52,9 @@ Future<void> bootstrapAndRun({List<String> seedRelays = const []}) async {
       options: DefaultFirebaseOptions.currentPlatform,
     );
   } on UnsupportedError catch (e) {
-    debugPrint('[main] Firebase not configured: $e — push notifications disabled.');
+    debugPrint(
+      '[main] Firebase not configured: $e — push notifications disabled.',
+    );
   }
 
   await RustLib.init();
@@ -108,7 +111,9 @@ Future<void> bootstrapAndRun({List<String> seedRelays = const []}) async {
     if (seedPubkey != null && activeMostroPubkey == defaultMostroPubkey) {
       await settings_api.setActiveMostroNode(pubkey: seedPubkey);
       activeMostroPubkey = await settings_api.getMostroPubkey();
-      debugPrint('[main] Mortsom build: active Mostro node seeded from MOSTRO_PUB_KEY');
+      debugPrint(
+        '[main] Mortsom build: active Mostro node seeded from MOSTRO_PUB_KEY',
+      );
     }
     // Load the escrow-mode overrides before the relay pool starts, so the first
     // capability fetch already resolves against them. Nothing can have written
@@ -141,7 +146,9 @@ Future<void> bootstrapAndRun({List<String> seedRelays = const []}) async {
   try {
     await IdentityService.initialize();
   } catch (e, st) {
-    debugPrint('[main] Identity init failed — secure storage unavailable: $e\n$st');
+    debugPrint(
+      '[main] Identity init failed — secure storage unavailable: $e\n$st',
+    );
   }
 
   // Subscribe to bond-slashed notices BEFORE relay delivery starts, so the
@@ -157,7 +164,9 @@ Future<void> bootstrapAndRun({List<String> seedRelays = const []}) async {
   // Log initial relay state for diagnostics.
   final relays = await nostr_api.getRelays();
   final connState = await nostr_api.getConnectionState();
-  debugPrint('[main] relay pool initialized — state=$connState relays=${relays.map((r) => '${r.url}:${r.status}').join(', ')}');
+  debugPrint(
+    '[main] relay pool initialized — state=$connState relays=${relays.map((r) => '${r.url}:${r.status}').join(', ')}',
+  );
 
   // Watch for connection state changes in background (logs appear in flutter output).
   _watchConnectionState();
@@ -173,9 +182,7 @@ Future<void> bootstrapAndRun({List<String> seedRelays = const []}) async {
       settingsProvider.overrideWith(
         (ref) => SettingsNotifier(prefs: prefs, initial: savedSettings),
       ),
-      nwcProvider.overrideWith(
-        (ref) => NwcNotifier(prefs: prefs),
-      ),
+      nwcProvider.overrideWith((ref) => NwcNotifier(prefs: prefs)),
       mostroPubkeyProvider.overrideWith((ref) => activeMostroPubkey),
     ],
   );
@@ -188,10 +195,9 @@ Future<void> bootstrapAndRun({List<String> seedRelays = const []}) async {
 
   _consumeBondSlashed(bondSlashedStream, container);
 
-  runApp(UncontrolledProviderScope(
-    container: container,
-    child: const MostroApp(),
-  ));
+  runApp(
+    UncontrolledProviderScope(container: container, child: const MostroApp()),
+  );
 }
 
 /// Persists every consumed trade-key index reported by Rust.
@@ -209,7 +215,9 @@ void _mirrorTradeKeyIndex(identity_api.TradeKeyIndexStream stream) {
         debugPrint('[identity] trade-key index stream closed: $e');
         break;
       }
-      debugPrint('[identity] mirroring trade-key index $index to secure storage');
+      debugPrint(
+        '[identity] mirroring trade-key index $index to secure storage',
+      );
       try {
         await IdentityService.saveTradeKeyIndex(index);
       } catch (e, st) {
@@ -228,7 +236,9 @@ void _restoreNwcConnection(String nwcUri, ProviderContainer container) {
   Future.microtask(() async {
     try {
       final info = await nwc_api.connectWallet(nwcUri: nwcUri);
-      container.read(nwcProvider.notifier).setConnected(
+      container
+          .read(nwcProvider.notifier)
+          .setConnected(
             NwcWalletState(
               walletPubkey: info.walletPubkey,
               relayUrls: info.relayUrls,
@@ -236,7 +246,9 @@ void _restoreNwcConnection(String nwcUri, ProviderContainer container) {
               balanceSats: info.balanceSats?.toInt(),
             ),
           );
-      debugPrint('[nwc] wallet restored: ${info.walletName ?? info.walletPubkey}');
+      debugPrint(
+        '[nwc] wallet restored: ${info.walletName ?? info.walletPubkey}',
+      );
     } catch (e) {
       debugPrint('[nwc] wallet restore failed: $e');
     }
@@ -271,7 +283,9 @@ void _consumeBondSlashed(
       }
       try {
         // Only stable data is stored; the copy is localized at render time.
-        await container.read(notificationsProvider.notifier).addIfNew(
+        await container
+            .read(notificationsProvider.notifier)
+            .addIfNew(
               NotificationModel.bondSlashed(
                 id: event.eventId,
                 orderId: event.orderId,
@@ -320,9 +334,13 @@ void _watchConnectionState() {
             Future.delayed(const Duration(seconds: 5), () async {
               try {
                 final orders = await orders_api.getOrders(filters: null);
-                debugPrint('[diag] order cache after 5s: ${orders.length} orders');
+                debugPrint(
+                  '[diag] order cache after 5s: ${orders.length} orders',
+                );
                 if (orders.isNotEmpty) {
-                  debugPrint('[diag] first order: id=${orders.first.id} kind=${orders.first.kind} fiat=${orders.first.fiatCode}');
+                  debugPrint(
+                    '[diag] first order: id=${orders.first.id} kind=${orders.first.kind} fiat=${orders.first.fiatCode}',
+                  );
                 }
               } catch (e) {
                 debugPrint('[diag] order cache poll error: $e');
