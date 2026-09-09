@@ -371,7 +371,8 @@ what rebuilds sessions after one.
 | `PayInvoice`                       | `Payload::PaymentRequest(small_order, bolt11, amt)` | `hold_invoice ← bolt11`, `amount_sats ← amt ?? small_order.amount`, `status → WaitingPayment` |
 | `BuyerTookOrder` / `HoldInvoicePaymentAccepted` | `SmallOrder` with `status = active`      | `status → Active` (routed through `map_core_status` kebab-case). The peer reveal happens in the pre-dispatch capture above, not in this arm. |
 | `FiatSentOk`                       | (status sync)                                       | `status → FiatSent`                                                              |
-| `HoldInvoicePaymentSettled` / `Released` / `PurchaseCompleted` | (status sync)             | `status → SettledHoldInvoice`                                                    |
+| `HoldInvoicePaymentSettled` / `Released` | (status sync)                                 | `status → SettledHoldInvoice`: the seller's escrow settled, the buyer payout is still pending; shown as `payout-pending`, not as completion |
+| `PurchaseCompleted`                | (status sync)                                       | `status → Success`: the buyer payout completed; only now may either party rate |
 | `CooperativeCancelAccepted`        | (status sync)                                       | `status → CooperativelyCanceled`                                                 |
 | `AdminSettled` / `AdminCanceled`   | (status sync)                                       | `status → SettledByAdmin` / `CanceledByAdmin`                                    |
 | `Canceled`                         | (none)                                              | Never-active trade (pending/waiting): row + in-memory session **deleted**; otherwise `status → Canceled` (history kept). See below. |
