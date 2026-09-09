@@ -25,6 +25,21 @@ void main() {
       expect(find.textContaining('loading the engine'), findsNothing);
     });
 
+    testWidgets('answers a deep initial route, not just "/"', (tester) async {
+      // On the web the initial route is the browser's URL, and a startup
+      // failure is usually met on a reload of some deep path. With `home:`
+      // alone that logged "Could not navigate to initial route" before falling
+      // back — noise in the one log a reporter is about to read.
+      await tester.pumpWidget(
+        const MediaQuery(
+          data: MediaQueryData(),
+          child: StartupFailureApp(step: 'loading the engine'),
+        ),
+      );
+      expect(tester.takeException(), isNull);
+      expect(find.text('Mostro could not start'), findsOneWidget);
+    });
+
     testWidgets('renders without any app dependency', (tester) async {
       // No ProviderScope, no AppLocalizations, no theme, no Rust bridge — this
       // pump is the assertion. Any of those could be what failed, so a rescue

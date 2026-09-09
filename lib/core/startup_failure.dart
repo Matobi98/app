@@ -20,36 +20,44 @@ class StartupFailureApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      home: Scaffold(
-        // Hard-coded rather than taken from the app theme: the theme is built
-        // from settings this screen exists to survive the loss of.
-        backgroundColor: const Color(0xFF1D212C),
-        body: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(32),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Text(
-                  'Mostro could not start',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 20,
-                    fontWeight: FontWeight.w600,
-                  ),
+      // Every route resolves here rather than using `home:`. On the web the
+      // initial route comes from the browser's URL, and a startup failure is
+      // most often met on a reload of some deep path — which `home:` alone
+      // answers with "Could not navigate to initial route" in the console
+      // before falling back. Harmless, but this screen exists to make a failed
+      // startup legible; it should not add noise of its own to the one log the
+      // person reporting it is about to read.
+      onGenerateRoute: (_) => MaterialPageRoute<void>(builder: _buildBody),
+    );
+  }
+
+  Widget _buildBody(BuildContext context) {
+    return Scaffold(
+      // Hard-coded rather than taken from the app theme: the theme is built
+      // from settings this screen exists to survive the loss of.
+      backgroundColor: const Color(0xFF1D212C),
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'Mostro could not start',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 20,
+                  fontWeight: FontWeight.w600,
                 ),
-                const SizedBox(height: 12),
-                Text(
-                  'It failed while $step.',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    color: Color(0xFFB0B6C3),
-                    fontSize: 15,
-                  ),
-                ),
-              ],
-            ),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                'It failed while $step.',
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Color(0xFFB0B6C3), fontSize: 15),
+              ),
+            ],
           ),
         ),
       ),
