@@ -13,7 +13,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use wasm_bindgen_futures::JsFuture;
-use web_sys::js_sys::{Function, Promise, Reflect};
+use web_sys::js_sys::{Array, Function, Promise, Reflect};
 use web_sys::wasm_bindgen::closure::Closure;
 use web_sys::wasm_bindgen::{JsCast, JsValue};
 
@@ -53,6 +53,14 @@ fn external_promise() -> (Promise, Function) {
 /// Acquires the exclusive lock `name` for this origin. `None` when the
 /// context has no lock manager or refuses the request, in which case the
 /// caller keeps only its in-process serialisation.
+///
+/// The guard exists before anything is awaited, so a caller dropped while
+/// still waiting for the grant releases the lock the moment it is granted
+/// instead of holding the name for the rest of the page's life. The wait
+/// itself races the grant against the request's own promise: a request the
+/// manager rejects (an inactive document, a security error, an abort)
+/// settles that promise and ends the wait, since a rejection never reaches
+/// the callback.
 pub async fn acquire(name: &str) -> Option<OriginLock> {
     let locks = lock_manager()?;
     let request = Reflect::get(&locks, &JsValue::from_str("request"))
@@ -63,17 +71,24 @@ pub async fn acquire(name: &str) -> Option<OriginLock> {
     // we return to the manager, and the lock lasts until it settles.
     let (granted, grant) = external_promise();
     let (held, release) = external_promise();
+    let lock = OriginLock { release };
     let callback = Closure::once_into_js(move |_lock: JsValue| -> Promise {
         let _ = grant.call0(&JsValue::NULL);
         held
     });
-    if let Err(e) = request.call2(&locks, &JsValue::from_str(name), &callback) {
-        log::warn!("[db] navigator.locks.request({name}) refused: {e:?}");
-        return None;
+    let requested = match request.call2(&locks, &JsValue::from_str(name), &callback) {
+        Ok(promise) => Promise::resolve(&promise),
+        Err(e) => {
+            log::warn!("[db] navigator.locks.request({name}) refused: {e:?}");
+            return None;
+        }
+    };
+    let outcome = Promise::race(&Array::of2(&granted, &requested));
+    match JsFuture::from(outcome).await {
+        Ok(_) => Some(lock),
+        Err(e) => {
+            log::warn!("[db] navigator.locks.request({name}) rejected before grant: {e:?}");
+            None
+        }
     }
-    if let Err(e) = JsFuture::from(granted).await {
-        log::warn!("[db] navigator.locks.request({name}) failed before grant: {e:?}");
-        return None;
-    }
-    Some(OriginLock { release })
 }

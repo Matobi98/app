@@ -3416,14 +3416,28 @@ async fn fetch_public_order_status(order_id: &str) -> Option<crate::api::types::
             return None;
         }
     };
-    // The filter names the daemon as author; a relay is not trusted to have
-    // honoured it, so the author is checked again here.
+    newest_book_status(events, &mostro_pubkey, order_id)
+}
+
+/// The newest status among `events` that the daemon published for exactly
+/// `order_id`. The relay was asked for that author and that order; a relay
+/// is not trusted to have honoured either, so both are checked again here:
+/// a genuine daemon event for another order must not move this trade.
+fn newest_book_status(
+    events: impl IntoIterator<Item = nostr_sdk::prelude::Event>,
+    mostro_pubkey: &nostr_sdk::prelude::PublicKey,
+    order_id: &str,
+) -> Option<crate::api::types::OrderStatus> {
     events
         .into_iter()
-        .filter(|e| e.pubkey == mostro_pubkey)
-        .max_by_key(|e| e.created_at)
-        .and_then(|e| crate::nostr::order_events::parse_order_event(&e, None))
-        .map(|o| o.status)
+        .filter(|e| e.pubkey == *mostro_pubkey)
+        .filter_map(|e| {
+            crate::nostr::order_events::parse_order_event(&e, None)
+                .filter(|order| order.id == order_id)
+                .map(|order| (e.created_at, order.status))
+        })
+        .max_by_key(|(created_at, _)| *created_at)
+        .map(|(_, status)| status)
 }
 
 /// Reconcile trades stuck in waiting states with the daemon's public book.
@@ -6914,6 +6928,59 @@ mod tests {
         for s in [S::InProgress, S::Active, S::Success] {
             assert_eq!(sweep_action(false, &waiting, Some(&s)), SweepAction::Keep);
         }
+    }
+
+    /// A relay is asked for the daemon's event about one order; what comes
+    /// back is checked for both. A genuine daemon event about another order,
+    /// or an event about this order from another key, reports nothing.
+    #[test]
+    fn book_status_needs_the_daemons_event_about_this_very_order() {
+        use crate::api::types::OrderStatus as S;
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
+        let daemon = Keys::generate();
+        let stranger = Keys::generate();
+        let event = |keys: &Keys, id: &str, status: &str, at: u64| {
+            EventBuilder::new(Kind::from(38383u16), "")
+                .tags([
+                    Tag::parse(["d", id]).unwrap(),
+                    Tag::parse(["k", "sell"]).unwrap(),
+                    Tag::parse(["s", status]).unwrap(),
+                    Tag::parse(["f", "USD"]).unwrap(),
+                    Tag::parse(["pm", "cash"]).unwrap(),
+                    Tag::parse(["premium", "0"]).unwrap(),
+                    Tag::parse(["amt", "0"]).unwrap(),
+                    Tag::parse(["fa", "100"]).unwrap(),
+                    Tag::parse(["z", "order"]).unwrap(),
+                ])
+                .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(at))
+                .finalize(keys)
+                .unwrap()
+        };
+        let mine = "308e1272-d5f4-47e6-bd97-3504baea9c23";
+        let other = "9b2d8f7e-1c3a-4e5b-8f6d-0a1b2c3d4e5f";
+        let pk = daemon.public_key();
+        assert_eq!(
+            newest_book_status([event(&daemon, other, "success", 20)], &pk, mine),
+            None,
+            "the daemon's success for another order says nothing about this one"
+        );
+        assert_eq!(
+            newest_book_status([event(&stranger, mine, "success", 20)], &pk, mine),
+            None,
+            "a success from another key is not the daemon's"
+        );
+        assert_eq!(
+            newest_book_status(
+                [
+                    event(&daemon, mine, "in-progress", 10),
+                    event(&daemon, other, "success", 30),
+                    event(&daemon, mine, "success", 20),
+                ],
+                &pk,
+                mine
+            ),
+            Some(S::Success)
+        );
     }
 
     /// The seller learns of the payout only from the public book: a trade
