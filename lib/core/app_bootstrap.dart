@@ -11,6 +11,7 @@ import 'package:mostro/core/storage/app_data_dir.dart'
 import 'package:mostro/core/app.dart';
 import 'package:mostro/core/mostro_defaults.dart';
 import 'package:mostro/core/startup_failure.dart';
+import 'package:mostro/core/startup_sequence.dart';
 import 'package:mostro/core/services/identity_service.dart';
 import 'package:mostro/core/test_environment.dart';
 import 'package:mostro/core/web/bridge_probe.dart';
@@ -45,78 +46,89 @@ import 'package:mostro/features/notifications/providers/notifications_provider.d
 /// defaults gone, an unreachable local relay fails the test instead of
 /// silently succeeding against a public one.
 Future<void> bootstrapAndRun({List<String> seedRelays = const []}) async {
-  try {
-    await _startup(seedRelays: seedRelays);
-  } catch (e, st) {
-    // The failure surface calls runApp too, and that is the whole fix: today an
-    // exception in here means runApp never runs and Flutter paints nothing —
-    // the page is not broken, it is absent, with no message anywhere (#227).
-    debugPrint('[startup] fatal while $_currentStep: $e\n$st');
-    runApp(StartupFailureApp(step: _currentStep));
-  }
-}
-
-/// Names the startup step in progress, so a failure can say where it happened.
-///
-/// A file-level variable rather than a parameter: the only writers are the
-/// steps themselves and the only reader is the guard above.
-String _currentStep = 'starting up';
-
-/// Runs a startup step the app can do without: a failure is recorded and
-/// startup continues, so the app opens degraded rather than not at all.
-///
-/// One helper rather than a try/catch per step, so every degradation prints the
-/// same prefix — grepping `[startup]` lists everything a run gave up on, in
-/// order, which matters when one failure is the cause of the next.
-Future<void> _optional(String name, Future<void> Function() body) async {
-  _currentStep = name;
-  try {
-    await body();
-  } catch (e, st) {
-    debugPrint('[startup] $name failed — continuing without it: $e\n$st');
-  }
-}
-
-Future<void> _startup({List<String> seedRelays = const []}) async {
+  // Outside the guard on purpose: the rescue below paints through runApp, which
+  // needs the binding too. Catching a failure here would only let us try to
+  // render a screen that cannot render, so this one is honestly unguarded.
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Push notifications only — the app trades, chats and settles without them.
-  // Two arms on purpose: the placeholder config is an expected state, not a
-  // failure, and folding both into one message would make every single run log
-  // a "failed" nobody reads by the time it means something.
-  _currentStep = 'setting up notifications';
+  final startup = StartupSequence();
   try {
-    await Firebase.initializeApp(
-      options: DefaultFirebaseOptions.currentPlatform,
-    );
-  } on UnsupportedError catch (e) {
-    debugPrint(
-      '[startup] Firebase not configured — push notifications disabled: $e',
-    );
+    await _startup(startup, seedRelays: seedRelays);
   } catch (e, st) {
-    // A call into a third-party JS SDK: config, network, or the SDK itself.
-    debugPrint(
-      '[startup] setting up notifications failed — continuing without it: $e\n$st',
-    );
+    // The failure surface calls runApp too, and that is the whole fix: without
+    // it an exception here means runApp never runs and Flutter paints nothing —
+    // the page is not broken, it is absent, with no message anywhere.
+    //
+    // #227 is the precedent that motivated this guard, not a case it covers:
+    // that crash fires inside the engine's own CanvasKitRenderer.initialize,
+    // before main() runs, which is why #370 fixed it in web/index.html and
+    // stated that no app-level try/catch could reach it.
+    debugPrint('[startup] fatal while ${startup.currentStep}: $e\n$st');
+    // The screen first: it is what a person is waiting for, and it is the whole
+    // point of this catch. Anything ahead of it that could throw would leave
+    // them with the blank page this exists to replace.
+    runApp(StartupFailureApp(step: startup.currentStep, error: e));
+    // Then CI. No-op off web; on web it hands test/web/smoke/smoke.mjs the
+    // cause, so the run stops with a reason instead of timing out waiting for
+    // a bridge that is never coming.
+    markBridgeFailed(e);
   }
+}
 
-  _currentStep = 'loading the engine';
-  await RustLib.init();
+Future<void> _startup(
+  StartupSequence startup, {
+  List<String> seedRelays = const [],
+}) async {
+  // Push notifications only — the app trades, chats and settles without them.
+  //
+  // The one optional step that handles anything itself: this repo ships a
+  // placeholder Firebase config, so every run throws UnsupportedError here.
+  // That is an expected state, not a failure, and letting it reach the helper
+  // would make every single run log a "failed" nobody reads by the time it
+  // means something. Caught below and reported as what it is; everything else
+  // falls through to the helper.
+  await startup.optional('setting up notifications', () async {
+    try {
+      await Firebase.initializeApp(
+        options: DefaultFirebaseOptions.currentPlatform,
+      );
+    } on UnsupportedError catch (e) {
+      // The placeholder config, which is an expected state rather than a
+      // failure. Swallowed here so it does not reach the helper's generic
+      // "failed" line, which every run would then log for nothing.
+      debugPrint(
+        '[startup] Firebase not configured — push notifications disabled: $e',
+      );
+    }
+    // Anything else — a third-party JS SDK's config, network or internals —
+    // falls through to the helper and is reported as the degradation it is.
+  });
+
+  await startup.required('loading the engine', RustLib.init);
 
   // Pre-read SharedPreferences so providers start with synchronous initial
   // values — eliminates the AsyncValue.loading() race that caused the router
   // to show the home screen before redirecting to /walkthrough on first launch.
-  _currentStep = 'reading your settings';
-  final prefs = await SharedPreferences.getInstance();
-  final firstRunComplete = prefs.getBool(kFirstRunCompleteKey) ?? false;
-  final backupDismissed = prefs.getBool(kBackupReminderDismissedKey) ?? false;
-  final backupActive = prefs.getBool(kBackupReminderActiveKey) ?? false;
-  final backupPending = backupActive && !backupDismissed;
-  final savedSettings = AppSettingsState.fromPrefs(prefs);
+  final (
+    prefs,
+    firstRunComplete,
+    backupPending,
+    savedSettings,
+  ) = await startup.required('reading your settings', () async {
+    final prefs = await SharedPreferences.getInstance();
+    final backupDismissed = prefs.getBool(kBackupReminderDismissedKey) ?? false;
+    final backupActive = prefs.getBool(kBackupReminderActiveKey) ?? false;
+    return (
+      prefs,
+      prefs.getBool(kFirstRunCompleteKey) ?? false,
+      backupActive && !backupDismissed,
+      AppSettingsState.fromPrefs(prefs),
+    );
+  });
 
   // Before any startup work below, so a failure in it is captured at the
   // verbosity the user asked for rather than the default.
-  await _optional('applying your log settings', () async {
+  await startup.optional('applying your log settings', () async {
     await settings_api.setLoggingEnabled(enabled: savedSettings.loggingEnabled);
   });
 
@@ -130,7 +142,7 @@ Future<void> _startup({List<String> seedRelays = const []}) async {
   // arrive, and every Rust caller handles a missing database. Runs on the web
   // too: since #408 that is where web persistence lives, so skipping it there
   // would quietly take out every feature built on top of it.
-  await _optional('opening the local database', () async {
+  await startup.optional('opening the local database', () async {
     final location = databaseLocation(
       isWeb: kIsWeb,
       dataDir: kIsWeb ? null : await appDataDirPath(),
@@ -148,6 +160,9 @@ Future<void> _startup({List<String> seedRelays = const []}) async {
   // end, so its outcome doubles as the web readiness probe CI waits on — see
   // lib/core/web/bridge_probe.dart (no-op off web).
   String activeMostroPubkey = defaultMostroPubkey;
+  // Named here rather than through a helper: the catch below does more than
+  // record the failure — it tells the web bridge probe, and CI reads that.
+  startup.currentStep = 'selecting the Mostro node';
   try {
     await settings_api.rehydrateActiveMostroNode();
     activeMostroPubkey = await settings_api.getMostroPubkey();
@@ -184,6 +199,9 @@ Future<void> _startup({List<String> seedRelays = const []}) async {
   // Guarded like every other optional startup step: if the bridge is broken
   // the mirror is simply absent — the database copy is still the primary
   // record — rather than taking startup down before the UI renders.
+  // Named here rather than through a helper: this block keeps its own handler
+  // and its own log prefix, which the identity work is grouped under.
+  startup.currentStep = 'mirroring trade key indices';
   try {
     _mirrorTradeKeyIndex(await identity_api.onTradeKeyIndexChanged());
   } catch (e) {
@@ -192,6 +210,8 @@ Future<void> _startup({List<String> seedRelays = const []}) async {
 
   // Initialize identity: creates on first launch, reloads on subsequent launches.
   // Must run before Nostr init so the identity key is available for relay auth.
+  // Named here rather than through a helper, for the same reason as above.
+  startup.currentStep = 'loading your identity';
   try {
     await IdentityService.initialize();
   } catch (e, st) {
@@ -204,7 +224,7 @@ Future<void> _startup({List<String> seedRelays = const []}) async {
   // Tokio broadcast channel buffers any notice arriving during startup rather
   // than dropping it (a receiver must exist at send time).
   bond_api.BondSlashedStream? bondSlashedStream;
-  await _optional('subscribing to bond notices', () async {
+  await startup.optional('subscribing to bond notices', () async {
     bondSlashedStream = await bond_api.onBondSlashed();
   });
 
@@ -215,12 +235,12 @@ Future<void> _startup({List<String> seedRelays = const []}) async {
   // connection state, and Settings can switch node or edit the relay list. An
   // app that opens offline can be fixed from inside; one that does not open
   // cannot be fixed at all.
-  await _optional('connecting to the network', () async {
+  await startup.optional('connecting to the network', () async {
     await nostr_api.initialize(relays: seedRelays.isEmpty ? null : seedRelays);
   });
 
   // Log initial relay state for diagnostics.
-  await _optional('reading relay status', () async {
+  await startup.optional('reading relay status', () async {
     final relays = await nostr_api.getRelays();
     final connState = await nostr_api.getConnectionState();
     debugPrint(
@@ -228,35 +248,46 @@ Future<void> _startup({List<String> seedRelays = const []}) async {
     );
   });
 
-  // Watch for connection state changes in background (logs appear in flutter output).
-  _watchConnectionState();
+  // Assembling the container, restoring the wallet and starting the watchers
+  // are one stretch with no natural place to stop. Unlabelled, they ran under
+  // the name of whichever optional step finished last, so a failure here named
+  // a step that had already succeeded (#405 review).
+  //
+  // runApp stays outside the wrapper: the label is still 'building the
+  // interface' when it runs, so it is already covered, and the guard sits above
+  // both either way. Purely so this reads as one statement rather than a
+  // closure with the whole tail inside it.
+  final container = await startup.required('building the interface', () async {
+    // Logs every relay connection state change (debug builds only).
+    _watchConnectionState();
 
-  final container = ProviderContainer(
-    overrides: [
-      firstRunProvider.overrideWith(
-        (ref) => FirstRunNotifier(initialValue: firstRunComplete),
-      ),
-      backupReminderProvider.overrideWith(
-        (ref) => BackupReminderNotifier(initialValue: backupPending),
-      ),
-      settingsProvider.overrideWith(
-        (ref) => SettingsNotifier(prefs: prefs, initial: savedSettings),
-      ),
-      nwcProvider.overrideWith((ref) => NwcNotifier(prefs: prefs)),
-      mostroPubkeyProvider.overrideWith((ref) => activeMostroPubkey),
-    ],
-  );
+    final container = ProviderContainer(
+      overrides: [
+        firstRunProvider.overrideWith(
+          (ref) => FirstRunNotifier(initialValue: firstRunComplete),
+        ),
+        backupReminderProvider.overrideWith(
+          (ref) => BackupReminderNotifier(initialValue: backupPending),
+        ),
+        settingsProvider.overrideWith(
+          (ref) => SettingsNotifier(prefs: prefs, initial: savedSettings),
+        ),
+        nwcProvider.overrideWith((ref) => NwcNotifier(prefs: prefs)),
+        mostroPubkeyProvider.overrideWith((ref) => activeMostroPubkey),
+      ],
+    );
 
-  // Restore NWC wallet connection if a URI was saved from a previous session.
-  final savedNwcUri = prefs.getString(kNwcUriKey);
-  if (savedNwcUri != null) {
-    _restoreNwcConnection(savedNwcUri, container);
-  }
+    // Restore NWC wallet connection if a URI was saved from a previous session.
+    final savedNwcUri = prefs.getString(kNwcUriKey);
+    if (savedNwcUri != null) {
+      _restoreNwcConnection(savedNwcUri, container);
+    }
 
-  final slashed = bondSlashedStream;
-  if (slashed != null) _consumeBondSlashed(slashed, container);
+    final slashed = bondSlashedStream;
+    if (slashed != null) _consumeBondSlashed(slashed, container);
+    return container;
+  });
 
-  _currentStep = 'building the interface';
   runApp(
     UncontrolledProviderScope(container: container, child: const MostroApp()),
   );
