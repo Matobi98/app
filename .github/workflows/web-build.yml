@@ -199,27 +199,6 @@ jobs:
         env:
           BUNDLE_DIR: ${{ github.workspace }}/build/web
         run: BASE_PATH="/${GITHUB_REPOSITORY#*/}/" node smoke.mjs
-
-      # Regression guard for issue #227: an unparseable browser locale (the
-      # POSIX "C" locale, an underscored "en_US", empty) crashed the Flutter
-      # web engine's own bootstrap before runApp, with no error path — an
-      # unrecoverable blank page. Fixed by the locale sanitizer in
-      # web/index.html, which runs before flutter_bootstrap.js and normalizes
-      # navigator.language(s). This reruns the same smoke test forcing an
-      # invalid locale so the fix can't silently regress.
-      #
-      # This step covers "C" only, and does so through Playwright's `locale`
-      # option — the one path where the tag reaches the page as the browser's
-      # own locale rather than as a shadow this repo installed. Kept for that
-      # reason. The other broken tags cannot travel this way (Playwright
-      # normalizes them first) and are covered by the locale matrix below.
-      #
-      # The crash itself only exists on Flutter >= 3.38, where the engine's
-      # parseBrowserLanguages started building the locale through
-      # Intl.Locale (@JS binding) instead of a pure-Dart ui.Locale that
-      # validated nothing. If FLUTTER_VERSION ever moves back below that, or
-      # the engine stops using Intl, this step passes for the wrong reason —
-      # revalidate it against a build without the sanitizer before trusting it.
       # Built once and reused by every negative control below. Copying the
       # built bundle and cutting the sanitizer out of its HTML — rather than
       # building a second time — is what makes the comparison mean something:
@@ -242,6 +221,26 @@ jobs:
             exit 1
           fi
 
+      # Regression guard for issue #227: an unparseable browser locale (the
+      # POSIX "C" locale, an underscored "en_US", empty) crashed the Flutter
+      # web engine's own bootstrap before runApp, with no error path — an
+      # unrecoverable blank page. Fixed by the locale sanitizer in
+      # web/index.html, which runs before flutter_bootstrap.js and normalizes
+      # navigator.language(s). This reruns the same smoke test forcing an
+      # invalid locale so the fix can't silently regress.
+      #
+      # This step covers "C" only, and does so through Playwright's `locale`
+      # option — the one path where the tag reaches the page as the browser's
+      # own locale rather than as a shadow this repo installed. Kept for that
+      # reason. The other broken tags cannot travel this way (Playwright
+      # normalizes them first) and are covered by the locale matrix below.
+      #
+      # The crash itself only exists on Flutter >= 3.38, where the engine's
+      # parseBrowserLanguages started building the locale through
+      # Intl.Locale (@JS binding) instead of a pure-Dart ui.Locale that
+      # validated nothing. If FLUTTER_VERSION ever moves back below that, or
+      # the engine stops using Intl, this step passes for the wrong reason —
+      # revalidate it against a build without the sanitizer before trusting it.
       - name: Smoke test the release bundle under an invalid locale (#227)
         working-directory: test/web/smoke
         env:
@@ -318,8 +317,6 @@ jobs:
       # will never mount), which is the price of the guard being self-validating.
       - name: Locale matrix — every tag the sanitizer claims to handle (#227)
         working-directory: test/web/smoke
-        env:
-          SMOKE_TIMEOUT_MS: "20000"
         run: |
           set -euo pipefail
           control_dir="${RUNNER_TEMP}/web-no-sanitizer"
@@ -340,7 +337,13 @@ jobs:
 
             echo "::group::locale [$label] — without the sanitizer, must fail"
             log="${RUNNER_TEMP}/control-${label//[^A-Za-z0-9]/_}.log"
-            if SMOKE_NAVIGATOR_LANGUAGES="$langs" BUNDLE_DIR="$control_dir" \
+            # Scoped to the control, not the step: this run is expected to die
+            # in engine bootstrap, so it always waits the selector out, and the
+            # default 120s would cost two idle minutes per tag. The positive
+            # run above keeps that default — same reason as the single-tag
+            # control before it, which must not be unified with it either.
+            if SMOKE_TIMEOUT_MS="20000" SMOKE_NAVIGATOR_LANGUAGES="$langs" \
+                 BUNDLE_DIR="$control_dir" \
                  BASE_PATH="$base" node smoke.mjs >"$log" 2>&1; then
               cat "$log"
               echo "::error::locale [$label] passed without the sanitizer —"

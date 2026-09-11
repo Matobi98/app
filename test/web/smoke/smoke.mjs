@@ -184,10 +184,14 @@ async function main() {
     // `!== undefined`, not a truthiness check: SMOKE_NAVIGATOR_LANGUAGES=''
     // is the empty-tag case, one of the broken ones this exists to cover.
     //
-    // `configurable: true` is load-bearing. The sanitizer bails out when either
-    // property is already locked down (#370 review), so a non-configurable
-    // shadow would make it skip the very path under test and the run would pass
-    // for the wrong reason.
+    // `configurable: true` is load-bearing, but not as a false-green guard.
+    // The sanitizer bails out when either property is already locked down
+    // (#370 review), so a non-configurable shadow makes it skip the very path
+    // under test — the engine then gets the raw tag and the positive run
+    // *fails*, with the same `Incorrect locale information provided` a real
+    // regression produces. Measured both ways on `C` and `C,es-AR` (#406
+    // review). What this flag prevents is a red matrix that reads as a broken
+    // sanitizer when it is really a broken harness.
     const forcedLanguages = process.env.SMOKE_NAVIGATOR_LANGUAGES;
     if (forcedLanguages !== undefined) {
       await page.addInitScript((langs) => {
